@@ -15,7 +15,7 @@ use crate::app::gpu::{RemoteTextures, TextureInfo};
 use crate::app::input::RemoteViewport;
 use crate::app::keymap::codes;
 use crate::session::errors::{Failure, FailureKind};
-use crate::session::{CertificateInfo, Ended, Stage};
+use crate::session::{CertificateInfo, Ended, Engine, Rendering, Stage};
 
 /// Height of the strip at the top of the desktop that reveals the session bar.
 pub const EDGE_ZONE: f32 = 4.0;
@@ -385,6 +385,36 @@ fn stage_track(ui: &mut Ui, stages: &[StageState; 4]) {
     }
 }
 
+/// "GPU"/"CPU" badge plus the codec, so you can tell at a glance how the picture is rendered.
+fn render_badge(ui: &mut Ui, rendering: &Rendering, p: &Palette) {
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let (fill, color) = match rendering.engine {
+                Engine::Gpu => (p.accent_soft(), p.accent),
+                Engine::Cpu => (p.raised, p.muted),
+            };
+            widgets::tag(ui, rendering.badge(), fill, color);
+            ui.label(
+                RichText::new(rendering.codec_label())
+                    .font(theme::font_medium(size::SMALL))
+                    .color(p.text),
+            );
+        })
+        .response;
+    response.on_hover_ui(|ui| {
+        ui.label(RichText::new("Rendering").font(theme::font_medium(size::SMALL)));
+        ui.label(rendering.details());
+        if let Some(reason) = &rendering.fallback {
+            ui.label(
+                RichText::new(format!("Video decoding: {reason}"))
+                    .size(size::SMALL)
+                    .color(p.muted),
+            );
+        }
+    });
+}
+
 fn format_rate(bytes: u64) -> String {
     match bytes {
         0..1_000 => format!("{bytes} B"),
@@ -675,12 +705,6 @@ fn bar_contents(
     let history: Vec<f32> = tab.rtt_history.iter().copied().collect();
     let stats = tab.stats;
     widgets::sparkline(ui, &history, vec2(56.0, 16.0), signal.color(&p)).on_hover_ui(|ui| {
-        if !tab.decoder_status.is_empty() {
-            ui.label(&tab.decoder_status);
-        }
-        if let Some(reason) = &tab.decoder_reason {
-            ui.label(format!("Software fallback: {reason}"));
-        }
         ui.label(
             RichText::new("Round-trip time, last minute").font(theme::font_medium(size::SMALL)),
         );
@@ -695,6 +719,10 @@ fn bar_contents(
             .color(p.muted),
         );
     });
+    if let Some(rendering) = &tab.rendering {
+        ui.add_space(4.0);
+        render_badge(ui, rendering, &p);
+    }
 
     ui.add_space(4.0);
     ui.separator();

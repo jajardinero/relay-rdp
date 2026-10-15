@@ -367,7 +367,11 @@ fn main_column(
                 for id in ids {
                     if let Some(host) = profiles.get(*id) {
                         let signal = prober.signal(host.address.trim(), host.port);
-                        host_row(ui, host, signal, state.selected == Some(index), actions);
+                        // A host can appear in both Recent and its group. Keep each row's
+                        // widget/menu IDs stable and distinct as hover controls appear.
+                        ui.push_id((heading, host.id), |ui| {
+                            host_row(ui, host, signal, state.selected == Some(index), actions);
+                        });
                     }
                     index += 1;
                 }
@@ -599,6 +603,10 @@ fn host_row(
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
     let hovered = response.hovered() || ui.rect_contains_pointer(rect);
+    let more_id = ui.make_persistent_id("host-more");
+    // The menu extends beyond the row; keep drawing its anchor and contents when the
+    // pointer leaves the row to enter the menu.
+    let show_actions = hovered || egui::Popup::is_id_open(ui.ctx(), more_id);
     let fill = if selected {
         p.accent_soft()
     } else if hovered {
@@ -624,7 +632,7 @@ fn host_row(
     );
     widgets::signal_bars(&mut glyph_ui, signal).on_hover_text(signal.label());
 
-    let actions_w = if hovered { 176.0 } else { 0.0 };
+    let actions_w = if show_actions { 176.0 } else { 0.0 };
     let address_x = rect.left() + (rect.width() * 0.45).max(260.0);
     let meta_x = rect.right() - 16.0 - actions_w;
 
@@ -711,7 +719,7 @@ fn host_row(
     );
 
     let mut clicked_action = false;
-    if hovered {
+    if show_actions {
         let actions_rect = egui::Rect::from_min_max(
             egui::pos2(rect.right() - actions_w, rect.top()),
             egui::pos2(rect.right() - 10.0, rect.bottom()),
@@ -724,7 +732,7 @@ fn host_row(
         row_ui.spacing_mut().item_spacing.x = 2.0;
 
         let more = widgets::icon_button(&mut row_ui, icon::DOTS_THREE, "More");
-        egui::Popup::menu(&more).show(|ui| {
+        egui::Popup::menu(&more).id(more_id).show(|ui| {
             ui.set_min_width(170.0);
             if ui.button(format!("{}  Duplicate", icon::COPY)).clicked() {
                 actions.push(Action::Duplicate(host.id));
@@ -799,5 +807,114 @@ fn last_used(when: Option<DateTime<Utc>>) -> String {
         local.format("%A").to_string()
     } else {
         local.format("%b %-d").to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Context, Event, Id, Modifiers, PointerButton, Pos2, Rect, Shape, pos2};
+
+    struct MenuFrame {
+        menu: Id,
+        other_menu: Id,
+        more: Pos2,
+        duplicate: Option<Pos2>,
+        actions: Vec<Action>,
+    }
+
+    fn frame(ctx: &Context, host: &HostProfile, events: Vec<Event>) -> MenuFrame {
+        let mut result = MenuFrame {
+            menu: Id::NULL,
+            other_menu: Id::NULL,
+            more: Pos2::ZERO,
+            duplicate: None,
+            actions: Vec::new(),
+        };
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    for heading in [Some("Recent".to_owned()), None] {
+                        ui.push_id((&heading, host.id), |ui| {
+                            let id = ui.make_persistent_id("host-more");
+                            if heading.is_some() {
+                                result.menu = id;
+                                result.more = ui.cursor().min
+                                    + vec2(ui.available_width() - 25.0, ROW_HEIGHT / 2.0);
+                            } else {
+                                result.other_menu = id;
+                            }
+                            host_row(ui, host, Signal::Unknown, false, &mut result.actions);
+                        });
+                    }
+                });
+            },
+        );
+        result.duplicate = output.shapes.iter().find_map(|shape| match &shape.shape {
+            Shape::Text(text) if text.galley.text().contains("Duplicate") => {
+                Some(text.pos + vec2(30.0, 5.0))
+            }
+            _ => None,
+        });
+        output.textures_delta.clear(); // Headless interaction test has no GPU texture upload.
+        result
+    }
+
+    fn pointer_button(pos: Pos2, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn more_menu_stays_visible_when_hovering_and_selecting_an_option() {
+        let ctx = Context::default();
+        theme::install_fonts(&ctx);
+        let host = HostProfile::new("example.test", 3389);
+        let initial = frame(&ctx, &host, vec![]);
+        assert_ne!(initial.menu, initial.other_menu);
+        let more = initial.more;
+        frame(&ctx, &host, vec![Event::PointerMoved(more)]);
+        frame(&ctx, &host, vec![pointer_button(more, true)]);
+        frame(&ctx, &host, vec![pointer_button(more, false)]);
+        let opened = frame(&ctx, &host, vec![]);
+        assert!(egui::Popup::is_id_open(&ctx, opened.menu));
+        assert!(!egui::Popup::is_id_open(&ctx, opened.other_menu));
+        let option = opened
+            .duplicate
+            .expect("Duplicate option should be visible");
+        assert!(option.y > more.y + ROW_HEIGHT / 2.0);
+        for _ in 0..3 {
+            let hovered = frame(&ctx, &host, vec![Event::PointerMoved(option)]);
+            assert!(
+                hovered.duplicate.is_some(),
+                "menu disappeared when leaving the row"
+            );
+        }
+        frame(&ctx, &host, vec![pointer_button(option, true)]);
+        let selected = frame(&ctx, &host, vec![pointer_button(option, false)]);
+        assert!(matches!(selected.actions.as_slice(), [Action::Duplicate(id)] if *id == host.id));
+        assert!(!egui::Popup::is_id_open(&ctx, selected.menu));
+
+        // Reopening and clicking outside still dismisses the menu.
+        frame(&ctx, &host, vec![Event::PointerMoved(more)]);
+        frame(&ctx, &host, vec![pointer_button(more, true)]);
+        frame(&ctx, &host, vec![pointer_button(more, false)]);
+        let outside = pos2(20.0, 400.0);
+        frame(
+            &ctx,
+            &host,
+            vec![Event::PointerMoved(outside), pointer_button(outside, true)],
+        );
+        let closed = frame(&ctx, &host, vec![pointer_button(outside, false)]);
+        assert!(!egui::Popup::is_id_open(&ctx, closed.menu));
     }
 }

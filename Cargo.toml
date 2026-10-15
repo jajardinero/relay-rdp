@@ -100,4 +100,8 @@ tokio = { version = "1", features = ["full"] }
 [patch.crates-io]
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 
+# ClearCodec and Progressive decoding fixes for what Windows sends (see RELAY-PATCH.md in each).
+ironrdp-pdu = { path = "vendor/ironrdp-pdu" }
+ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
+
 ironrdp-egfx = { path = "vendor/ironrdp-egfx" }

@@ -161,11 +161,92 @@ pub enum Ended {
     Failed(Failure),
 }
 
+/// Where the remote picture is decoded and drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    Gpu,
+    Cpu,
+}
+
+/// What the server's pictures arrive as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    H264,
+    /// H.264 4:4:4 (AVC444): full color resolution.
+    H264Full,
+    /// The graphics pipeline's lossless and progressive codecs (no H.264).
+    Lossless,
+    /// Classic RemoteFX/bitmap updates, outside the graphics pipeline.
+    RemoteFx,
+}
+
+/// How the session is rendering, shown on the session bar. Derived from what actually
+/// produced the latest picture, so it stays truthful when the server picks something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendering {
+    pub engine: Engine,
+    pub codec: Codec,
+    /// Why hardware decoding (or H.264) isn't in use, if it was wanted.
+    pub fallback: Option<String>,
+}
+
+impl Rendering {
+    /// Graphics pipeline: `hardware` means VA-API decoding with GPU surfaces and composition.
+    /// `video` is the latest H.264 flavour decoded, if any.
+    pub fn for_pipeline(hardware: bool, video: Option<Codec>, fallback: Option<String>) -> Self {
+        Self {
+            engine: if hardware { Engine::Gpu } else { Engine::Cpu },
+            codec: video.unwrap_or(Codec::Lossless),
+            fallback,
+        }
+    }
+
+    pub fn legacy() -> Self {
+        Self {
+            engine: Engine::Cpu,
+            codec: Codec::RemoteFx,
+            fallback: None,
+        }
+    }
+
+    pub fn badge(&self) -> &'static str {
+        match self.engine {
+            Engine::Gpu => "GPU",
+            Engine::Cpu => "CPU",
+        }
+    }
+
+    pub fn codec_label(&self) -> &'static str {
+        match self.codec {
+            Codec::H264 => "H.264",
+            Codec::H264Full => "H.264 4:4:4",
+            Codec::Lossless => "Lossless",
+            Codec::RemoteFx => "RemoteFX",
+        }
+    }
+
+    pub fn details(&self) -> &'static str {
+        match (self.engine, self.codec) {
+            (Engine::Gpu, Codec::H264) => "H.264 decoded by VA-API; the picture stays on the GPU.",
+            (Engine::Gpu, Codec::H264Full) => {
+                "H.264 4:4:4 decoded by VA-API with full color detail; the picture stays on the GPU."
+            }
+            (Engine::Cpu, Codec::H264Full) => {
+                "H.264 4:4:4 decoded by OpenH264 on the CPU, with full color detail."
+            }
+            (Engine::Gpu, _) => {
+                "Drawn on the GPU. Hardware H.264 decoding starts when the server sends video."
+            }
+            (Engine::Cpu, Codec::H264) => "H.264 decoded by OpenH264 on the CPU.",
+            (Engine::Cpu, Codec::Lossless) => "Lossless graphics codecs, decoded on the CPU.",
+            (Engine::Cpu, Codec::RemoteFx) => "Classic RemoteFX updates, decoded on the CPU.",
+        }
+    }
+}
+
 pub enum SessionEvent {
-    DecoderStatus {
-        name: String,
-        reason: Option<String>,
-    },
+    /// The session's rendering changed (sent before the first picture goes live).
+    Rendering(Rendering),
     StageStarted(Stage),
     StageCompleted(Stage, Duration),
     Certificate(CertificatePrompt),
@@ -308,6 +389,28 @@ impl Drop for SessionHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendering_labels() {
+        let gpu = Rendering::for_pipeline(true, Some(Codec::H264), None);
+        assert_eq!((gpu.badge(), gpu.codec_label()), ("GPU", "H.264"));
+        let ready = Rendering::for_pipeline(true, None, None);
+        assert_eq!((ready.badge(), ready.codec_label()), ("GPU", "Lossless"));
+        let software = Rendering::for_pipeline(false, Some(Codec::H264), Some("no VA-API".into()));
+        assert_eq!((software.badge(), software.codec_label()), ("CPU", "H.264"));
+        assert_eq!(software.fallback.as_deref(), Some("no VA-API"));
+        let lossless = Rendering::for_pipeline(false, None, None);
+        assert_eq!(
+            (lossless.engine, lossless.codec),
+            (Engine::Cpu, Codec::Lossless)
+        );
+        let full = Rendering::for_pipeline(true, Some(Codec::H264Full), None);
+        assert_eq!((full.badge(), full.codec_label()), ("GPU", "H.264 4:4:4"));
+        assert!(full.details().contains("4:4:4"));
+        let legacy = Rendering::legacy();
+        assert_eq!((legacy.badge(), legacy.codec_label()), ("CPU", "RemoteFX"));
+        assert!(legacy.details().contains("RemoteFX"));
+    }
 
     #[test]
     fn desktop_request_is_clamped_and_even() {

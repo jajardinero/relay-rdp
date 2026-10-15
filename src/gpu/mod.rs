@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use wgpu::util::DeviceExt;
 
 use crate::session::framebuffer::Rect;
+use crate::session::gfx::avc444::Layout;
 use crate::session::gfx::vaapi::HardwareFrame;
 
 pub struct GpuImage {
@@ -27,7 +28,22 @@ pub struct GpuContext {
     pub render_node: String,
     pending: Mutex<VecDeque<wgpu::SubmissionIndex>>,
     conversion: wgpu::RenderPipeline,
+    avc444: Avc444Pipelines,
     failure: Arc<Mutex<Option<String>>>,
+}
+
+struct Avc444Pipelines {
+    layout: wgpu::BindGroupLayout,
+    main: wgpu::RenderPipeline,
+    auxiliary: wgpu::RenderPipeline,
+    convert: wgpu::RenderPipeline,
+}
+
+/// A surface's 4:4:4 picture on the GPU (r = Y, g = U, b = V), plus the color matrix of the
+/// latest main view.
+pub struct Store444 {
+    pub image: Arc<GpuImage>,
+    color: [[f32; 4]; 4],
 }
 
 /// Enable foreign queue ownership transfers in addition to wgpu's DMA-BUF
@@ -214,12 +230,14 @@ impl GpuContext {
             multiview_mask: None,
             cache: None,
         });
+        let avc444 = Avc444Pipelines::new(&device);
         Self {
             device,
             queue,
             render_node,
             pending: Mutex::new(VecDeque::new()),
             conversion,
+            avc444,
             failure,
         }
     }
@@ -514,6 +532,259 @@ impl GpuContext {
     }
 }
 
+impl Avc444Pipelines {
+    fn new(device: &wgpu::Device) -> Self {
+        let texture = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("AVC444"),
+            entries: &[
+                texture(0),
+                texture(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("AVC444"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("AVC444"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("yuv444.wgsl").into()),
+        });
+        let pipeline = |entry: &str, write_mask| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vertex"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        Self {
+            main: pipeline("main_view", wgpu::ColorWrites::ALL),
+            // The auxiliary view never touches luma.
+            auxiliary: pipeline(
+                "auxiliary_view",
+                wgpu::ColorWrites::GREEN | wgpu::ColorWrites::BLUE,
+            ),
+            convert: pipeline("convert", wgpu::ColorWrites::ALL),
+            layout,
+        }
+    }
+}
+
+impl GpuContext {
+    /// A new 4:4:4 store, black with neutral chroma.
+    pub fn store_444(&self, width: u32, height: u32) -> anyhow::Result<Store444> {
+        let image = self.image(width, height);
+        self.clear(&image, [0, 128, 128, 255])?;
+        Ok(Store444 {
+            image,
+            color: color_parameters(1, true, 0),
+        })
+    }
+
+    fn uniform_444(&self, layout: [f32; 4], color: &[[f32; 4]; 4]) -> wgpu::Buffer {
+        let rows = [layout, color[0], color[1], color[2]];
+        let bytes: Vec<u8> = rows
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_ne_bytes())
+            .collect();
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("AVC444 parameters"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+    }
+
+    /// Writes one decoded view into `store` within `rects` (picture coordinates). `auxiliary`
+    /// selects the chroma view and its layout; `None` is the main (luma) view.
+    pub fn apply_view(
+        &self,
+        frame: HardwareFrame,
+        store: &mut Store444,
+        rects: &[Rect],
+        auxiliary: Option<Layout>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            matches!(frame.desc.colorspace, 1 | 2 | 4 | 5 | 6 | 7 | 9),
+            "unsupported H.264 color matrix"
+        );
+        if auxiliary.is_none() {
+            store.color = color_parameters(frame.desc.colorspace, frame.desc.full_range != 0, 0);
+        }
+        let imported = import::import(self, &frame)?;
+        let v2 = if auxiliary == Some(Layout::V2) {
+            1.0
+        } else {
+            0.0
+        };
+        let uniform = self.uniform_444([0.0, 0.0, store.image.width as f32, v2], &store.color);
+        let views = [
+            imported.planes[0].create_view(&Default::default()),
+            imported.planes[1].create_view(&Default::default()),
+        ];
+        let bind = self.bind_444(&views[0], &views[1], &uniform);
+        let target = store.image.texture.create_view(&Default::default());
+        let pipeline = if auxiliary.is_some() {
+            &self.avc444.auxiliary
+        } else {
+            &self.avc444.main
+        };
+        let bounds = (
+            frame.desc.width.min(store.image.width),
+            frame.desc.height.min(store.image.height),
+        );
+        let resources = Arc::new((frame, imported));
+        let mut acquire = self.encoder();
+        resources.1.acquire(&mut acquire);
+        self.submit(acquire, Arc::clone(&resources))?;
+        let mut encoder = self.encoder();
+        Self::draw_rects(
+            &mut encoder,
+            &target,
+            pipeline,
+            &bind,
+            rects,
+            (0, 0),
+            bounds,
+        );
+        self.submit(encoder, Arc::clone(&resources))?;
+        let mut release = self.encoder();
+        resources.1.release(&mut release);
+        self.submit(release, resources)
+    }
+
+    /// Converts `rects` of the store to RGB into `target`, with the picture origin at (x, y).
+    pub fn render_444(
+        &self,
+        store: &Store444,
+        rects: &[Rect],
+        target: &GpuImage,
+        x: u32,
+        y: u32,
+    ) -> anyhow::Result<()> {
+        let uniform = self.uniform_444([x as f32, y as f32, 0.0, 0.0], &store.color);
+        let source = store.image.texture.create_view(&Default::default());
+        let bind = self.bind_444(&source, &source, &uniform);
+        let view = target.texture.create_view(&Default::default());
+        let bounds = (
+            target.width.min(x + store.image.width),
+            target.height.min(y + store.image.height),
+        );
+        let mut encoder = self.encoder();
+        Self::draw_rects(
+            &mut encoder,
+            &view,
+            &self.avc444.convert,
+            &bind,
+            rects,
+            (x, y),
+            bounds,
+        );
+        self.submit(encoder, (uniform, Arc::clone(&store.image)))
+    }
+
+    fn bind_444(
+        &self,
+        first: &wgpu::TextureView,
+        second: &wgpu::TextureView,
+        uniform: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("AVC444"),
+            layout: &self.avc444.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(first),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(second),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// One full-target triangle per rect, scissored to the rect (offset, clipped to `bounds`).
+    fn draw_rects(
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        pipeline: &wgpu::RenderPipeline,
+        bind: &wgpu::BindGroup,
+        rects: &[Rect],
+        offset: (u32, u32),
+        bounds: (u32, u32),
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("AVC444"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        for rect in rects {
+            let moved = Rect::new(rect.x + offset.0, rect.y + offset.1, rect.w, rect.h);
+            if let Some(r) = moved.clip(bounds.0, bounds.1) {
+                pass.set_scissor_rect(r.x, r.y, r.w, r.h);
+                pass.draw(0..3, 0..1);
+            }
+        }
+    }
+}
+
 /// FFmpeg's AVColorSpace and AVChromaLocation values. Unspecified RDP streams
 /// use BT.709 full range; explicit stream metadata always takes precedence.
 fn color_parameters(space: i32, full: bool, chroma: i32) -> [[f32; 4]; 4] {
@@ -591,7 +862,7 @@ pub(crate) mod tests {
     }
 
     /// Test-only GPU readback. The production decoding path never maps pixels.
-    fn read(context: &GpuContext, image: &GpuImage) -> Vec<u8> {
+    pub(crate) fn read(context: &GpuContext, image: &GpuImage) -> Vec<u8> {
         let stride = (image.width * 4).div_ceil(256) * 256;
         let buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -794,6 +1065,89 @@ pub(crate) mod tests {
                 wall.as_secs_f64() * 1000.0 / count,
                 cpu.as_secs_f64() * 1000.0 / count
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires VA-API H.264 decoding, Vulkan DMA-BUF import, and system OpenH264"]
+    fn hardware_avc444_matches_software() {
+        use crate::session::gfx::avc444::tests::{picture, split};
+        use crate::session::gfx::avc444::{Planes, Yuv444};
+        use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, UsageType};
+        use openh264::formats::{YUVBuffer, YUVSource as _};
+        let context = context().unwrap();
+        // SAFETY: matches the ABI used by the application's software decoder.
+        let api = || unsafe {
+            openh264::OpenH264API::from_blob_path_unchecked("/usr/lib/libopenh264.so.8").unwrap()
+        };
+        for layout in [Layout::V1, Layout::V2] {
+            for (w, h) in [(64usize, 64usize), (98, 82)] {
+                // One stream carries both views, as in RDP.
+                let config = EncoderConfig::new()
+                    .usage_type(UsageType::ScreenContentRealTime)
+                    .bitrate(BitRate::from_bps(24_000_000))
+                    .max_frame_rate(FrameRate::from_hz(60.0))
+                    .skip_frames(false);
+                let mut encoder = Encoder::with_api_config(api(), config).unwrap();
+                let mut hardware = vaapi::Decoder::new(&context.render_node).unwrap();
+                let mut software = openh264::decoder::Decoder::with_api_config(
+                    api(),
+                    openh264::decoder::DecoderConfig::new(),
+                )
+                .unwrap();
+                let views = split(w, h, &picture(w, h), layout);
+                let (pw, ph) = (views.y_stride, views.main[0].len() / views.y_stride);
+                let whole = Rect::new(0, 0, w as u32, h as u32);
+                let mut store = context.store_444(w as u32, h as u32).unwrap();
+                let mut reference = Yuv444::new(w, h);
+                // A second round makes each view a predicted picture.
+                for _ in 0..2 {
+                    for (planes, auxiliary) in [(&views.main, None), (&views.aux, Some(layout))] {
+                        let yuv = YUVBuffer::from_vec(planes.concat(), pw, ph);
+                        let bytes = encoder.encode(&yuv).unwrap().to_vec();
+                        let frame = hardware.decode(&bytes).unwrap().expect("low-delay picture");
+                        let decoded = software.decode(&bytes).unwrap().expect("software picture");
+                        let (y_stride, uv_stride, _) = decoded.strides();
+                        let planes = Planes {
+                            y: decoded.y(),
+                            u: decoded.u(),
+                            v: decoded.v(),
+                            y_stride,
+                            uv_stride,
+                        };
+                        match auxiliary {
+                            None => reference.apply_luma(&planes, whole),
+                            Some(layout) => reference.apply_chroma(&planes, whole, layout),
+                        }
+                        context
+                            .apply_view(frame, &mut store, &[whole], auxiliary)
+                            .unwrap();
+                    }
+                }
+                // Draw at an offset, as onto a surface.
+                let (ox, oy) = (6, 4);
+                let target = context.image(w as u32 + ox, h as u32 + oy);
+                context
+                    .render_444(&store, &[whole], &target, ox, oy)
+                    .unwrap();
+                let actual = read(&context, &target);
+                let mut expected = Vec::new();
+                reference.to_rgba(whole, &mut expected).unwrap();
+                let stride = w + ox as usize;
+                for y in 0..h {
+                    for x in 0..w {
+                        let a = &actual[((y + oy as usize) * stride + x + ox as usize) * 4..][..4];
+                        let e = &expected[(y * w + x) * 4..][..4];
+                        for channel in 0..3 {
+                            assert!(
+                                (i32::from(a[channel]) - i32::from(e[channel])).abs() <= 2,
+                                "{layout:?} {w}x{h} at ({x}, {y}): GPU {a:?} vs CPU {e:?}"
+                            );
+                        }
+                        assert_eq!(a[3], 255);
+                    }
+                }
+            }
         }
     }
 

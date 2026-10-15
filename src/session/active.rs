@@ -19,9 +19,9 @@ use tokio::time::Instant as TokioInstant;
 use super::clipboard::ClipboardWorker;
 use super::connect::{self, Channels, Connection};
 use super::framebuffer::Rect;
-use super::gfx::GfxShared;
+use super::gfx::{GfxFailure, GfxShared};
 use super::{
-    ConnectParams, DesktopRequest, Ended, EventSink, Failure, PointerUpdate, SessionCmd,
+    ConnectParams, DesktopRequest, Ended, EventSink, Failure, PointerUpdate, Rendering, SessionCmd,
     SessionEvent, SharedFrame, Stage, Stats, netinfo,
 };
 use crate::store::profiles::GraphicsMode;
@@ -44,7 +44,7 @@ enum Exit {
     Lost(Failure),
     Failed(Failure),
     /// The graphics pipeline hit something it can't decode; reconnect with legacy graphics.
-    GraphicsFallback(String),
+    GraphicsFallback(GfxFailure),
 }
 
 pub(super) async fn run_session(
@@ -120,8 +120,13 @@ pub(super) async fn run_session(
         };
 
         let failure = match exit {
-            Exit::GraphicsFallback(reason) => {
-                if hardware && gfx.as_ref().is_some_and(|g| g.hardware_active()) {
+            Exit::GraphicsFallback(GfxFailure {
+                reason,
+                hardware: hardware_failure,
+            }) => {
+                // Codec errors (ClearCodec, Progressive...) aren't the GPU's fault, so they don't
+                // turn off hardware decoding.
+                if hardware && hardware_failure {
                     hardware = false;
                     hardware_reason = Some(reason.clone());
                     tracing::warn!(%reason, "hardware decoding failed; reconnecting with OpenH264");
@@ -290,6 +295,7 @@ impl<'a> ActiveSession<'a> {
         let mut outgoing: Vec<u8> = Vec::with_capacity(4096);
         let mut damaged: SmallVec<[Rect; 8]> = SmallVec::new();
         let mut gfx_presented = 0u64;
+        let mut last_rendering: Option<Rendering> = None;
         let mut tick_count = 0u64;
 
         loop {
@@ -400,8 +406,8 @@ impl<'a> ActiveSession<'a> {
             let outputs = match outputs {
                 Ok(outputs) => outputs,
                 Err(e) => {
-                    if let Some(reason) = self.gfx.as_ref().and_then(|g| g.take_failure()) {
-                        return Exit::GraphicsFallback(reason);
+                    if let Some(failure) = self.gfx.as_ref().and_then(|g| g.take_failure()) {
+                        return Exit::GraphicsFallback(failure);
                     }
                     let failure = Failure::from_session(&e, port);
                     tracing::warn!(detail = %failure.detail, "session error");
@@ -491,15 +497,21 @@ impl<'a> ActiveSession<'a> {
             // Pictures arrive either as legacy updates (decoded into `image`) or through the
             // graphics pipeline, which composites straight into the shared frame.
             let mut pictured = false;
+            let mut rendering = None;
             if let Some(gfx) = &self.gfx {
-                if let Some(reason) = gfx.take_failure() {
-                    return Exit::GraphicsFallback(reason);
+                if let Some(failure) = gfx.take_failure() {
+                    return Exit::GraphicsFallback(failure);
                 }
                 let presented = gfx.presented();
                 pictured = presented != gfx_presented;
                 gfx_presented = presented;
+                if pictured {
+                    rendering = Some(gfx.rendering());
+                }
             }
             if !damaged.is_empty() {
+                // Legacy updates: Compatible mode, or the server didn't take up the pipeline.
+                rendering.get_or_insert_with(Rendering::legacy);
                 let mut shared = self.frame.lock();
                 for rect in damaged.drain(..) {
                     shared.blit_rgba(image.data(), image.stride(), rect);
@@ -509,6 +521,13 @@ impl<'a> ActiveSession<'a> {
                 if self.frame.request_wake() {
                     self.events.wake();
                 }
+            }
+            if let Some(rendering) = rendering
+                && last_rendering.as_ref() != Some(&rendering)
+            {
+                tracing::debug!(?rendering, "rendering");
+                last_rendering = Some(rendering.clone());
+                self.events.send(SessionEvent::Rendering(rendering));
             }
             if pictured {
                 counters.updates += 1;

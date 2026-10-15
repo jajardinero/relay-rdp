@@ -6,9 +6,11 @@
 //! follows client-requested resolution changes.
 //!
 //! With `--gfx`, the picture is H.264-encoded (OpenH264, from the system library) and streamed
-//! over the graphics pipeline, as Windows does, instead of RemoteFX updates.
+//! over the graphics pipeline, as Windows does, instead of RemoteFX updates. `--gfx444` streams
+//! H.264 4:4:4 (AVC444 v1: a main and an auxiliary view per frame) to clients that accept it, as
+//! Windows does with its AVC 444 policy enabled, and H.264 4:2:0 to the others.
 //!
-//!     cargo run --example test_server -- [--port 3390] [--user test] [--pass test] [--gfx]
+//!     cargo run --example test_server -- [--port 3390] [--user test] [--pass test] [--gfx | --gfx444]
 
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::Arc;
@@ -347,16 +349,107 @@ impl GfxServerFactory for GfxFactory {
     }
 }
 
-fn make_encoder() -> anyhow::Result<Encoder> {
+fn make_encoder(full: bool) -> anyhow::Result<Encoder> {
     // SAFETY: the system library is OpenH264 2.6, the ABI the bindings target.
     let api =
         unsafe { openh264::OpenH264API::from_blob_path_unchecked("/usr/lib/libopenh264.so.8")? };
     let config = EncoderConfig::new()
-        .vui(VuiConfig::bt601())
         .usage_type(UsageType::ScreenContentRealTime)
-        .bitrate(BitRate::from_bps(12_000_000))
         .max_frame_rate(FrameRate::from_hz(60.0));
+    let config = if full {
+        // Both views of a frame go through this one encoder, so it must never skip a picture.
+        // AVC444 has no colour metadata; the protocol's default is full-range BT.709.
+        config
+            .vui(VuiConfig::bt709_full())
+            .bitrate(BitRate::from_bps(24_000_000))
+            .skip_frames(false)
+    } else {
+        config
+            .vui(VuiConfig::bt601())
+            .bitrate(BitRate::from_bps(12_000_000))
+    };
     Ok(Encoder::with_api_config(api, config)?)
+}
+
+/// The two 4:2:0 pictures of AVC444 v1 (MS-RDPEGFX 3.3.8.3.2), each `width`×`height` (multiples
+/// of 16), from `w`×`h` BGRA pixels with `stride` bytes per row.
+struct Avc444Views {
+    main: YUVBuffer,
+    auxiliary: YUVBuffer,
+}
+
+fn avc444_views(
+    bgra: &[u8],
+    stride: usize,
+    (w, h): (usize, usize),
+    (width, height): (usize, usize),
+) -> Avc444Views {
+    // Full-range BT.709, the inverse of the client's conversion.
+    let mut yuv = [vec![0u8; w * h], vec![128u8; w * h], vec![128u8; w * h]];
+    for y in 0..h {
+        for x in 0..w {
+            let p = &bgra[y * stride + x * 4..][..3];
+            let (b, g, r) = (f32::from(p[0]), f32::from(p[1]), f32::from(p[2]));
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let i = y * w + x;
+            yuv[0][i] = luma.round().clamp(0.0, 255.0) as u8;
+            yuv[1][i] = ((b - luma) / 1.8556 + 128.0).round().clamp(0.0, 255.0) as u8;
+            yuv[2][i] = ((r - luma) / 1.5748 + 128.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    let (luma_size, chroma_size) = (width * height, width * height / 4);
+    let mut main = vec![0u8; luma_size];
+    main.resize(luma_size + 2 * chroma_size, 128);
+    let mut auxiliary = main.clone();
+    let half = width / 2;
+    {
+        let (main_y, main_uv) = main.split_at_mut(luma_size);
+        let (main_u, main_v) = main_uv.split_at_mut(chroma_size);
+        for y in 0..h {
+            main_y[y * width..y * width + w].copy_from_slice(&yuv[0][y * w..(y + 1) * w]);
+        }
+        // The main view carries each 2×2 block's average chroma.
+        for by in 0..h.div_ceil(2) {
+            for bx in 0..w.div_ceil(2) {
+                for (plane, out) in [(&yuv[1], &mut *main_u), (&yuv[2], &mut *main_v)] {
+                    let (mut sum, mut n) = (0u32, 0u32);
+                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let (x, y) = (2 * bx + dx, 2 * by + dy);
+                        if x < w && y < h {
+                            sum += u32::from(plane[y * w + x]);
+                            n += 1;
+                        }
+                    }
+                    out[by * half + bx] = ((sum + n / 2) / n) as u8;
+                }
+            }
+        }
+    }
+    {
+        // The auxiliary view carries the rest: odd rows' chroma in alternating 8-row U and V
+        // bands of its luma, and odd columns of even rows in its chroma planes.
+        let (aux_y, aux_uv) = auxiliary.split_at_mut(luma_size);
+        let (aux_u, aux_v) = aux_uv.split_at_mut(chroma_size);
+        for y in 0..h {
+            for x in 0..w {
+                let (u, v) = (yuv[1][y * w + x], yuv[2][y * w + x]);
+                if y % 2 == 1 {
+                    let k = (y - 1) / 2;
+                    let row = 16 * (k / 8) + k % 8;
+                    aux_y[row * width + x] = u;
+                    aux_y[(row + 8) * width + x] = v;
+                } else if x % 2 == 1 {
+                    aux_u[(y / 2) * half + x / 2] = u;
+                    aux_v[(y / 2) * half + x / 2] = v;
+                }
+            }
+        }
+    }
+    Avc444Views {
+        main: YUVBuffer::from_vec(main, width, height),
+        auxiliary: YUVBuffer::from_vec(auxiliary, width, height),
+    }
 }
 
 /// Annex B (start codes) to AVC (4-byte big-endian lengths), the framing RDP uses.
@@ -374,8 +467,8 @@ fn annex_b_to_avc(annex_b: &[u8]) -> Vec<u8> {
     out
 }
 
-async fn stream_gfx(factory: GfxFactory, handler: Handler) -> anyhow::Result<()> {
-    let mut encoder: Option<(Encoder, u16, u16)> = None;
+async fn stream_gfx(factory: GfxFactory, handler: Handler, full: bool) -> anyhow::Result<()> {
+    let mut encoder: Option<(Encoder, u16, u16, bool)> = None;
     let mut surface: Option<(u16, u16, u16)> = None;
     let mut previous_server: Option<GfxServerHandle> = None;
     let started = Instant::now();
@@ -405,6 +498,7 @@ async fn stream_gfx(factory: GfxFactory, handler: Handler) -> anyhow::Result<()>
             continue;
         }
         let (w, h) = (scene.width & !1, scene.height & !1);
+        let full = full && server.supports_avc444();
 
         if surface.is_none_or(|(_, sw, sh)| (sw, sh) != (w, h)) {
             if let Some((id, _, _)) = surface.take() {
@@ -419,14 +513,15 @@ async fn stream_gfx(factory: GfxFactory, handler: Handler) -> anyhow::Result<()>
             // A new surface (new client or new size) must start with a keyframe carrying the
             // parameter sets, so start a fresh encoder.
             encoder = None;
-            println!("gfx: streaming {w}x{h} as H.264");
+            let format = if full { "H.264 4:4:4" } else { "H.264" };
+            println!("gfx: streaming {w}x{h} as {format}");
             handler.gfx_streaming.store(true, Ordering::Release);
         }
         if encoder
             .as_ref()
-            .is_none_or(|(_, ew, eh)| (*ew, *eh) != (w, h))
+            .is_none_or(|(_, ew, eh, ef)| (*ew, *eh, *ef) != (w, h, full))
         {
-            encoder = Some((make_encoder()?, w, h));
+            encoder = Some((make_encoder(full)?, w, h, full));
         }
 
         // Never encode a frame that can't be sent: dropping an encoded frame breaks the
@@ -436,13 +531,7 @@ async fn stream_gfx(factory: GfxFactory, handler: Handler) -> anyhow::Result<()>
         }
         scene.tick();
         scene.dirty.clear();
-        let yuv = YUVBuffer::from_rgb8_source(BgraSliceU8::new(
-            &scene.pixels[..usize::from(w) * usize::from(h) * 4],
-            (usize::from(w), usize::from(h)),
-        ));
-        let (enc, _, _) = encoder.as_mut().expect("just created");
-        let bitstream = enc.encode(&yuv)?.to_vec();
-        let avc = annex_b_to_avc(&bitstream);
+        let (enc, _, _, _) = encoder.as_mut().expect("just created");
         let region = Avc420Region {
             left: 0,
             top: 0,
@@ -453,7 +542,24 @@ async fn stream_gfx(factory: GfxFactory, handler: Handler) -> anyhow::Result<()>
         };
         let (id, _, _) = surface.expect("surface ready");
         let ts = started.elapsed().as_millis() as u32;
-        if server.send_avc420_frame(id, &avc, &[region], ts).is_none() {
+        let regions = [region];
+        let sent = if full {
+            let (uw, uh) = (usize::from(w), usize::from(h));
+            let padded = (uw.div_ceil(16) * 16, uh.div_ceil(16) * 16);
+            let stride = usize::from(scene.width) * 4;
+            let views = avc444_views(&scene.pixels, stride, (uw, uh), padded);
+            let main = annex_b_to_avc(&enc.encode(&views.main)?.to_vec());
+            let auxiliary = annex_b_to_avc(&enc.encode(&views.auxiliary)?.to_vec());
+            server.send_avc444_frame(id, &main, &regions, Some(&auxiliary), Some(&regions), ts)
+        } else {
+            let yuv = YUVBuffer::from_rgb8_source(BgraSliceU8::new(
+                &scene.pixels[..usize::from(w) * usize::from(h) * 4],
+                (usize::from(w), usize::from(h)),
+            ));
+            let avc = annex_b_to_avc(&enc.encode(&yuv)?.to_vec());
+            server.send_avc420_frame(id, &avc, &regions, ts)
+        };
+        if sent.is_none() {
             enc.force_intra_frame();
             continue;
         }
@@ -504,13 +610,12 @@ async fn main() -> anyhow::Result<()> {
         gfx_streaming: Arc::new(AtomicBool::new(false)),
     };
 
-    let gfx = std::env::args()
-        .any(|a| a == "--gfx")
-        .then(GfxFactory::default);
+    let full = std::env::args().any(|a| a == "--gfx444");
+    let gfx = (full || std::env::args().any(|a| a == "--gfx")).then(GfxFactory::default);
     if let Some(factory) = &gfx {
         let (factory, handler) = (factory.clone(), handler.clone());
         tokio::spawn(async move {
-            if let Err(e) = stream_gfx(factory, handler).await {
+            if let Err(e) = stream_gfx(factory, handler, full).await {
                 eprintln!("gfx streaming stopped: {e:#}");
             }
         });

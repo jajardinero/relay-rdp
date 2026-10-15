@@ -57,6 +57,15 @@ impl Rect {
         )
     }
 
+    /// The overlap of two rectangles; `None` if they don't overlap.
+    pub fn intersect(self, other: Rect) -> Option<Rect> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        (x < right && y < bottom).then(|| Rect::new(x, y, right - x, bottom - y))
+    }
+
     /// Clips to `width` x `height`; `None` if nothing remains.
     pub fn clip(self, width: u32, height: u32) -> Option<Rect> {
         let right = self.right().min(width);

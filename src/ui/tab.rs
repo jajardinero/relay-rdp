@@ -16,7 +16,7 @@ use crate::app::input::WheelAccumulator;
 use crate::app::keymap::codes;
 use crate::session::errors::FailureKind;
 use crate::session::{
-    CertificatePrompt, ConnectParams, DesktopRequest, Ended, PointerUpdate, SessionCmd,
+    CertificatePrompt, ConnectParams, DesktopRequest, Ended, PointerUpdate, Rendering, SessionCmd,
     SessionEvent, SessionHandle, Stage, Stats,
 };
 use crate::store::known_hosts::KnownHosts;
@@ -68,8 +68,8 @@ pub struct SessionTab {
     pub remote_size: Option<(u16, u16)>,
     pub cursor: PointerUpdate,
     pub stats: Stats,
-    pub decoder_status: String,
-    pub decoder_reason: Option<String>,
+    /// How the picture is rendered, for the session bar label.
+    pub rendering: Option<Rendering>,
     pub rtt_history: VecDeque<f32>,
     pub last_request: Option<DesktopRequest>,
     /// Was the session ever live? Decides between the connect track and the "disconnected" card.
@@ -117,8 +117,7 @@ impl SessionTab {
             remote_size: None,
             cursor: PointerUpdate::Default,
             stats: Stats::default(),
-            decoder_status: String::new(),
-            decoder_reason: None,
+            rendering: None,
             rtt_history: VecDeque::with_capacity(RTT_HISTORY),
             last_request: Some(desktop),
             was_live: false,
@@ -141,8 +140,7 @@ impl SessionTab {
         let handle = spawn(&self.profile, &self.password, desktop, cx)?;
         self.handle = handle;
         self.phase = Phase::Connecting;
-        self.decoder_status.clear();
-        self.decoder_reason = None;
+        self.rendering = None;
         self.stages = [StageState::Pending; 4];
         self.cert_prompt = None;
         self.remote_size = None;
@@ -171,10 +169,7 @@ impl SessionTab {
 
     pub fn handle_event(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::DecoderStatus { name, reason } => {
-                self.decoder_status = name;
-                self.decoder_reason = reason;
-            }
+            SessionEvent::Rendering(rendering) => self.rendering = Some(rendering),
             SessionEvent::StageStarted(stage) => {
                 self.stages[stage_index(stage)] = StageState::Active(Instant::now());
             }

@@ -82,11 +82,61 @@ If hardware setup is unavailable, Relay uses OpenH264. If an active hardware
 stream fails, Relay reconnects with hardware disabled for that session, obtaining
 a fresh keyframe. Persistent software graphics failures retain the existing
 compatible-graphics recovery. Sharp Text and Compatible modes retain their
-codec preferences. AVC444 and hardware backends other than VA-API are not
-implemented.
+codec preferences. Hardware backends other than VA-API are not implemented.
 
-Hover over the session's statistics sparkline to see the selected decoder and
-any software fallback reason. The same information is recorded in Relay's logs.
+### Full color (H.264 4:4:4)
+
+The **Full color (H.264 4:4:4)** graphics mode (host editor → **Experience**)
+asks the server for AVC444, which keeps full colour detail in video regions, so
+coloured text and thin lines don't blur or fringe. It uses more bandwidth and
+about twice the decoding work. Windows only sends AVC444 when the group policy
+**Prioritize H.264/AVC 444 graphics mode for Remote Desktop Connections** is
+enabled on the server. Otherwise it sends ordinary H.264, which this mode also
+handles. The other modes are unchanged.
+
+Each AVC444 frame carries two H.264 pictures: a main view (brightness and
+averaged colour) and an auxiliary view (the remaining colour samples, in the v1
+or v2 layout). Both go through the surface's one decoder into a full-resolution
+4:4:4 picture, which is converted to RGB. With hardware decoding, this all runs
+in GPU shaders on the decoded VA-API frames; otherwise OpenH264 and the CPU do
+it.
+
+The session bar shows how the picture is rendered: a **GPU** or **CPU** badge,
+followed by the codec in use (**H.264**, **H.264 4:4:4**, **Lossless** for the
+graphics pipeline's other codecs, or **RemoteFX** for classic updates). The
+label follows what the server actually sends, so it changes if the server falls
+back to RemoteFX or sends ordinary H.264 in Full color mode.
+Hover over it for details and any software fallback reason. The same information
+is recorded in Relay's logs.
+
+Enabling hardware decoding advertises support; the server still chooses the
+codec. If it selects V8 graphics or disables AVC, its ClearCodec/RemoteFX bitmap
+updates decode on the CPU. Relay records this separately from a VA-API failure
+and can still compose those bitmap updates on the GPU. A **GPU / H.264** or
+**GPU / H.264 4:4:4** label confirms actual hardware video decoding. To diagnose
+Windows Server or Windows 11 sessions, compare the advertised and confirmed
+graphics capabilities in the logs. Check the host's **Experience → Graphics**
+mode and the server's RDP encoding policies if H.264 is not selected.
+
+For a direct Windows RDP connection, the server's
+`Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational` event log records
+the negotiated graphics capabilities (event 162) and hardware encoder selection
+(event 170). This read-only PowerShell query also includes recent warnings and
+errors, useful when a server disconnects during graphics negotiation:
+
+```powershell
+Get-WinEvent -FilterHashtable @{
+    LogName = 'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational'
+    StartTime = (Get-Date).AddMinutes(-20)
+} | Where-Object { $_.Id -in 162,170 -or $_.Level -le 3 } |
+    Select-Object -First 12 TimeCreated,Id,Message | Format-List
+```
+
+Server encoding and client decoding are separate: Windows can encode H.264 on
+its CPU while Relay decodes it on the GPU. Windows hardware encoding requires
+a compatible encoder and server configuration; it is not required for Relay's
+hardware decoder. See [Microsoft's encoding diagnostics](https://learn.microsoft.com/en-us/azure/virtual-desktop/graphics-enable-gpu-acceleration#verify-gpu-accelerated-frame-encoding)
+and [RDP encoding policies](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-terminalserver#ts_server_avc444_mode_preferred).
 
 ## Validation
 
@@ -108,8 +158,17 @@ cargo build --example test_server
 cargo test --bin relay -- --ignored --nocapture --test-threads=1
 ```
 
+To try a session by hand, run the local test server (user and password `test`)
+with `--gfx` for H.264 or `--gfx444` for H.264 4:4:4, and connect to
+`127.0.0.1:3390`:
+
+```sh
+cargo run --example test_server -- --gfx444
+```
+
 These tests compare GPU composition against a CPU reference, compare hardware
-video output against software decoding at aligned and unaligned resolutions,
+video output (4:2:0 and 4:4:4) against software decoding at aligned and
+unaligned resolutions, stream 4:4:4 to hardware and software sessions,
 check descriptor cleanup across decoder resets, and exercise concurrent RDP
 connections, dynamic resizing, enabled/disabled preferences, unavailable hardware,
 and recovery after an injected hardware failure. A synthetic 1080p test also
@@ -134,7 +193,7 @@ Use `--offline` when all Cargo dependencies are already cached. Use
 
 The build uses the locked dependency versions, runs the normal tests in release
 mode, and validates the desktop entry. Hardware tests remain opt-in. Its source
-snapshot includes both vendored IronRDP patches and excludes Git metadata,
+snapshot includes the vendored IronRDP patches and excludes Git metadata,
 private configuration, build caches, and generated packages.
 The helper defaults to two compilation jobs to bound release-build memory use;
 set `CARGO_BUILD_JOBS` to override this.

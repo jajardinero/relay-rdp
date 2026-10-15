@@ -229,6 +229,21 @@ pub fn text_input(ui: &mut Ui, value: &mut String, hint: &str, password: bool) -
     )
 }
 
+/// A small rounded chip with a short label, e.g. "GPU".
+pub fn tag(ui: &mut Ui, text: &str, fill: Color32, color: Color32) -> Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), theme::font_medium(11.0), color);
+    let size = galley.size() + vec2(10.0, 4.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, color);
+    }
+    response
+}
+
 /// Muted heading for a group of rows.
 pub fn section_label(ui: &mut Ui, text: &str) {
     let p = Palette::of(ui);

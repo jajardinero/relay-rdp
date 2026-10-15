@@ -147,14 +147,22 @@ pub enum GraphicsMode {
     SharpText,
     /// Legacy RemoteFX/bitmap updates; works with every server.
     Compatible,
+    /// H.264 4:4:4 (AVC444) when the server offers it, otherwise as Auto.
+    FullColor,
 }
 
 impl GraphicsMode {
-    pub const ALL: [Self; 3] = [Self::Auto, Self::SharpText, Self::Compatible];
+    pub const ALL: [Self; 4] = [
+        Self::Auto,
+        Self::FullColor,
+        Self::SharpText,
+        Self::Compatible,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "Balanced (H.264)",
+            Self::FullColor => "Full color (H.264 4:4:4)",
             Self::SharpText => "Sharp text",
             Self::Compatible => "Compatible",
         }
@@ -163,9 +171,17 @@ impl GraphicsMode {
     pub fn description(self) -> &'static str {
         match self {
             Self::Auto => "Smooth video and fast scrolling with low bandwidth.",
+            Self::FullColor => {
+                "Full color detail in video and text. Needs the server's AVC 444 policy; uses more bandwidth."
+            }
             Self::SharpText => "Lossless text and UI. Uses more bandwidth for video.",
             Self::Compatible => "Classic RemoteFX updates for older servers.",
         }
+    }
+
+    /// Whether this mode decodes H.264.
+    pub fn uses_h264(self) -> bool {
+        matches!(self, Self::Auto | Self::FullColor)
     }
 }
 
