@@ -22,8 +22,8 @@ use ironrdp_egfx::decode::H264Decoder;
 use ironrdp_egfx::pdu::{
     Avc420BitmapStream, Avc444BitmapStream, CacheToSurfacePdu, CapabilitiesV8Flags,
     CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, Codec2Type,
-    DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, GfxPdu, SolidFillPdu,
-    SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface1Pdu, WireToSurface2Pdu,
+    DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, GfxPdu, MapSurfaceToScaledOutputPdu,
+    SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface1Pdu, WireToSurface2Pdu,
 };
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::image_processing::PixelFormat;
@@ -90,13 +90,14 @@ fn graphics_capabilities(mode: GraphicsMode) -> Vec<CapabilitySet> {
     // Preserve the working Windows advertisement order: preferred video
     // versions first, followed by the V8 compatibility fallback.
     let mut caps = Vec::new();
+    // Surfaces are composed 1:1, so ask V10.7 servers to map them with plain
+    // MapSurfaceToOutput rather than MapSurfaceToScaledOutput.
+    let unscaled = CapabilitiesV107Flags::SCALEDMAP_DISABLE;
     match mode {
         GraphicsMode::Auto => {}
-        GraphicsMode::FullColor => caps.push(CapabilitySet::V10_7 {
-            flags: CapabilitiesV107Flags::empty(),
-        }),
+        GraphicsMode::FullColor => caps.push(CapabilitySet::V10_7 { flags: unscaled }),
         GraphicsMode::SharpText | GraphicsMode::Compatible => caps.push(CapabilitySet::V10_7 {
-            flags: CapabilitiesV107Flags::AVC_DISABLED,
+            flags: unscaled | CapabilitiesV107Flags::AVC_DISABLED,
         }),
     }
     if mode.uses_h264() {
@@ -509,6 +510,19 @@ impl GraphicsPipelineHandler for Handler {
             surface.origin = Some((origin_x, origin_y));
             surface.mark_all_damaged();
         }
+    }
+
+    /// Servers that ignore SCALEDMAP_DISABLE still get their surface shown, unscaled.
+    fn on_map_surface_to_scaled_output(&mut self, pdu: &MapSurfaceToScaledOutputPdu) {
+        tracing::debug!(
+            surface = pdu.surface_id,
+            x = pdu.output_origin_x,
+            y = pdu.output_origin_y,
+            width = pdu.target_width,
+            height = pdu.target_height,
+            "surface mapped to scaled output"
+        );
+        self.on_surface_mapped(pdu.surface_id, pdu.output_origin_x, pdu.output_origin_y);
     }
 
     fn on_bitmap_updated(&mut self, update: &BitmapUpdate) {
@@ -1319,13 +1333,16 @@ mod tests {
         assert!(matches!(full[2], CapabilitySet::V8 { .. }));
         assert!(matches!(full[1], CapabilitySet::V8_1 { .. }));
         assert!(matches!(full[0], CapabilitySet::V10_7 { flags }
-            if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED)));
+            if flags == CapabilitiesV107Flags::SCALEDMAP_DISABLE));
         for mode in [GraphicsMode::SharpText, GraphicsMode::Compatible] {
             let caps = graphics_capabilities(mode);
             assert_eq!(caps.len(), 2);
             assert!(matches!(caps[1], CapabilitySet::V8 { .. }));
+            // Without SCALEDMAP_DISABLE, Windows maps V10.7 surfaces with a PDU that
+            // used to leave the screen blank.
             assert!(matches!(caps[0], CapabilitySet::V10_7 { flags }
-                if flags.contains(CapabilitiesV107Flags::AVC_DISABLED)));
+                if flags == CapabilitiesV107Flags::AVC_DISABLED
+                    | CapabilitiesV107Flags::SCALEDMAP_DISABLE));
         }
     }
 
