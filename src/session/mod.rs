@@ -14,6 +14,7 @@ pub(crate) mod gfx;
 #[cfg(test)]
 mod integration_tests;
 mod netinfo;
+mod tls;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

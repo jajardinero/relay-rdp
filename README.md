@@ -7,7 +7,8 @@ and XWayland are not supported.
 
 Use the Rust toolchain in `rust-toolchain.toml`, a C compiler, and `pkg-config`.
 Install the system libraries and development headers for FFmpeg (`libavcodec`
-and `libavutil`), VA-API (`libva` and `libva-drm`), Wayland, xkbcommon, and ALSA.
+and `libavutil`), VA-API (`libva` and `libva-drm`), Wayland, xkbcommon, ALSA,
+and OpenSSL.
 The native decoder bridge compiles against the installed FFmpeg headers; it does
 not depend on handwritten Rust layouts for FFmpeg's versioned structures.
 
@@ -40,6 +41,13 @@ editor so you can review and save it. Relay reads the address, user name,
 domain, display, connection speed, visual effects, audio, clipboard and
 load-balancing settings, and lists any setting it can't use yet, such as RD
 Gateway or RemoteApp.
+
+Relay prefers rustls for TLS. If the TLS handshake fails because a server
+requires compatibility ciphers, it retries once with OpenSSL over a fresh RDP
+connection. This adds TLS 1.2 ECDHE-RSA AES-CBC/SHA-2 support; TLS 1.0 and 1.1
+remain disabled. Both backends use the same certificate approval and saved
+fingerprint checks before sign-in. The chosen backend, TLS version, and cipher
+are recorded in Relay's logs.
 
 Each host has a **Quality** setting under **Experience**: Best (office network),
 Balanced (home broadband or VPN) or Low bandwidth (mobile or slow links). It tells

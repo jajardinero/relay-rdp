@@ -55,6 +55,8 @@ dark-light = "3"
 keyring = "4"
 libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+openssl = "0.10"
+tokio-openssl = "0.6"
 openh264 = { version = "0.9", default-features = false, features = ["libloading"] }
 ironrdp-egfx = "0.3"
 ironrdp-cliprdr = "0.7"

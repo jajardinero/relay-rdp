@@ -60,6 +60,15 @@ impl Failure {
         )
     }
 
+    pub fn tls(e: &io::Error) -> Self {
+        Self::new(
+            FailureKind::Security,
+            "Couldn't establish a secure connection",
+            Some("The computer must support TLS 1.2 or newer and a compatible encryption suite."),
+            error_chain(e),
+        )
+    }
+
     pub fn dns(host: &str, e: &io::Error) -> Self {
         Self::new(
             FailureKind::Network,
