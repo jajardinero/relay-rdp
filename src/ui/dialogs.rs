@@ -305,7 +305,7 @@ fn settings_dialog(ui: &mut Ui, settings: &mut AppSettings) -> Outcome {
         ui,
         "Hardware video decoding",
         Some(
-            "Use the GPU for H.264 video. Falls back automatically. Applies to new connections and reconnects.",
+            "Use the GPU for H.264 video and to draw the desktop. Falls back automatically. Applies to new connections and reconnects.",
         ),
         |ui| {
             widgets::toggle(ui, &mut settings.hardware_video_decoding);

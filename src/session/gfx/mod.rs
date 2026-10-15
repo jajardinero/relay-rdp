@@ -128,6 +128,7 @@ pub struct GfxShared {
     fallback: Mutex<Option<String>>,
 }
 
+/// GPU surfaces and composition, plus VA-API decoding in the H.264 modes.
 struct HardwarePipeline {
     context: Arc<GpuContext>,
     error: Arc<Mutex<Option<String>>>,
@@ -165,18 +166,24 @@ impl GfxShared {
         previous_reason: Option<String>,
     ) -> Arc<Self> {
         let mut reason = previous_reason;
-        let gpu = if hardware && mode.uses_h264() {
+        let gpu = if hardware {
+            // Lossless-only sessions just draw on the GPU; the H.264 modes need VA-API too.
             match context
-                .ok_or_else(|| anyhow::anyhow!("Vulkan/VA-API interop unavailable"))
+                .ok_or_else(|| anyhow::anyhow!("GPU unavailable"))
                 .and_then(|context| {
-                    vaapi::Decoder::new(&context.render_node).map(|decoder| (context, decoder))
+                    let decoder = if mode.uses_h264() {
+                        Some(vaapi::Decoder::new(context.render_node()?)?)
+                    } else {
+                        None
+                    };
+                    Ok((context, decoder))
                 }) {
-                Ok((context, decoder)) => Some(HardwarePipeline {
+                Ok((context, spare)) => Some(HardwarePipeline {
                     context,
                     error: Arc::new(Mutex::new(None)),
                     output: None,
                     decoders: HashMap::new(),
-                    spare: Some(decoder),
+                    spare,
                     stores: HashMap::new(),
                     annex_b: Vec::new(),
                     announced: false,
@@ -189,12 +196,11 @@ impl GfxShared {
         } else {
             None
         };
-        let name = if gpu.is_some() {
-            "VA-API (waiting for H.264)"
-        } else if mode.uses_h264() {
-            "Software (OpenH264)"
-        } else {
-            "Software (RDP graphics)"
+        let name = match (gpu.is_some(), mode.uses_h264()) {
+            (true, true) => "VA-API (waiting for H.264)",
+            (true, false) => "Software (RDP graphics), drawn on the GPU",
+            (false, true) => "Software (OpenH264)",
+            (false, false) => "Software (RDP graphics)",
         };
         tracing::info!(decoder = name, ?reason, "video decoder selected");
         Arc::new(Self {
@@ -307,38 +313,28 @@ impl GfxShared {
 
     fn present(&self, state: &mut GfxState) {
         if let Some(gpu) = &mut state.gpu {
-            let Some(output) = &gpu.output else { return };
-            let mut encoder = gpu.context.encoder();
-            let mut any = false;
-            for surface in state.surfaces.values_mut() {
-                let rects = surface.damage.take();
-                let (Some((ox, oy)), Some(source)) = (surface.origin, &surface.gpu) else {
-                    continue;
-                };
-                for rect in rects {
-                    GpuContext::copy(
-                        &mut encoder,
-                        &source.image,
-                        rect,
-                        output,
-                        ox + rect.x,
-                        oy + rect.y,
-                    );
-                    any = true;
+            let mut updated = None;
+            if let Some(output) = &gpu.output {
+                for surface in state.surfaces.values_mut() {
+                    let rects = surface.damage.take();
+                    let (Some((ox, oy)), Some(source)) = (surface.origin, &surface.gpu) else {
+                        continue;
+                    };
+                    for rect in rects {
+                        gpu.context
+                            .copy(&source.image, rect, output, ox + rect.x, oy + rect.y);
+                        updated = Some(output);
+                    }
                 }
             }
-            if any {
-                match gpu.context.submit(encoder, ()) {
-                    Ok(()) => {
-                        self.frame.lock().publish_gpu(Arc::clone(output));
-                        self.presented.fetch_add(1, Ordering::AcqRel);
-                        if self.frame.request_wake() {
-                            self.events.wake();
-                        }
-                    }
-                    Err(error) => {
-                        gpu.error.lock().get_or_insert_with(|| error.to_string());
-                    }
+            // Everything the frame drew goes to the GPU in one submission.
+            if let Err(error) = gpu.context.flush() {
+                gpu.error.lock().get_or_insert_with(|| error.to_string());
+            } else if let Some(output) = updated {
+                self.frame.lock().publish_gpu(Arc::clone(output));
+                self.presented.fetch_add(1, Ordering::AcqRel);
+                if self.frame.request_wake() {
+                    self.events.wake();
                 }
             }
             return;
@@ -389,7 +385,7 @@ struct Handler(Arc<GfxShared>);
 impl GraphicsPipelineHandler for Handler {
     fn handles_avc420(&self) -> bool {
         let state = self.0.state.lock();
-        state.gpu.is_some() || state.soft.is_some()
+        self.0.mode.uses_h264() && (state.gpu.is_some() || state.soft.is_some())
     }
 
     fn on_avc420(
@@ -456,9 +452,7 @@ impl GraphicsPipelineHandler for Handler {
             gpu.stores.clear();
             gpu.annex_b.clear();
             let output = gpu.context.image(width, height);
-            if let Err(error) = gpu.context.clear(&output, [0, 0, 0, 255]) {
-                gpu.error.lock().get_or_insert_with(|| error.to_string());
-            }
+            gpu.context.clear(&output, [0, 0, 0, 255]);
             gpu.output = Some(output);
         }
         state.progressive.reset();
@@ -549,11 +543,10 @@ impl GraphicsPipelineHandler for Handler {
     fn on_solid_fill(&mut self, pdu: &SolidFillPdu) {
         let c = &pdu.fill_pixel;
         let rgba = [c.r, c.g, c.b, 0xFF];
+        let rects: Vec<Rect> = pdu.rectangles.iter().filter_map(rect).collect();
         let mut state = self.0.state.lock();
         if let Some(surface) = state.surfaces.get_mut(&pdu.surface_id) {
-            for r in pdu.rectangles.iter().filter_map(rect) {
-                surface.fill(r, rgba);
-            }
+            surface.fill_rects(&rects, rgba);
         }
     }
 
@@ -561,17 +554,40 @@ impl GraphicsPipelineHandler for Handler {
         let Some(src_rect) = rect(&pdu.source_rectangle) else {
             return;
         };
+        let points: Vec<(u32, u32)> = pdu
+            .destination_points
+            .iter()
+            .map(|p| (u32::from(p.x), u32::from(p.y)))
+            .collect();
         let mut state = self.0.state.lock();
-        let Some(snapshot) = state
-            .surfaces
-            .get(&pdu.source_surface_id)
-            .and_then(|s| s.snapshot(src_rect))
-        else {
+        let surfaces = &mut state.surfaces;
+        if pdu.source_surface_id == pdu.destination_surface_id {
+            if let Some(surface) = surfaces.get_mut(&pdu.source_surface_id) {
+                surface.copy_within(src_rect, &points);
+            }
+            return;
+        }
+        let Some(source) = surfaces.get(&pdu.source_surface_id) else {
             return;
         };
-        if let Some(dest) = state.surfaces.get_mut(&pdu.destination_surface_id) {
-            for point in &pdu.destination_points {
-                dest.copy_from(&snapshot, u32::from(point.x), u32::from(point.y));
+        let Some(src_rect) = src_rect.clip(source.width, source.height) else {
+            return;
+        };
+        // Writing another surface can't disturb the source, so GPU surfaces copy directly.
+        if let Some(image) = source.gpu.as_ref().map(|gpu| Arc::clone(&gpu.image)) {
+            if let Some(dest) = surfaces.get_mut(&pdu.destination_surface_id) {
+                for (x, y) in points {
+                    dest.copy_gpu(&image, src_rect, x, y);
+                }
+            }
+            return;
+        }
+        let Some(snapshot) = source.snapshot(src_rect) else {
+            return;
+        };
+        if let Some(dest) = surfaces.get_mut(&pdu.destination_surface_id) {
+            for (x, y) in points {
+                dest.copy_from(&snapshot, x, y);
             }
         }
     }
@@ -809,7 +825,7 @@ impl Handler {
             if let std::collections::hash_map::Entry::Vacant(entry) = decoders.entry(surface_id) {
                 entry.insert(match spare.take() {
                     Some(decoder) => decoder,
-                    None => vaapi::Decoder::new(&context.render_node)?,
+                    None => vaapi::Decoder::new(context.render_node()?)?,
                 });
             }
             let decoder = decoders.get_mut(&surface_id).expect("just inserted");
@@ -817,7 +833,7 @@ impl Handler {
                 .get(&surface_id)
                 .is_none_or(|s| (s.image.width, s.image.height) != (dest.w, dest.h))
             {
-                stores.insert(surface_id, context.store_444(dest.w, dest.h)?);
+                stores.insert(surface_id, context.store_444(dest.w, dest.h));
             }
             let store = stores.get_mut(&surface_id).expect("just inserted");
             for (stream, view) in views {
@@ -841,7 +857,7 @@ impl Handler {
                 .gpu
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("surface has no GPU image"))?;
-            context.render_444(store, &updated, &target.image, dest.x, dest.y)?;
+            context.render_444(store, &updated, &target.image, dest.x, dest.y);
             for r in &updated {
                 let placed = Rect::new(dest.x + r.x, dest.y + r.y, r.w, r.h);
                 if let Some(placed) = placed.clip(surface.width, surface.height) {
@@ -891,7 +907,7 @@ impl Handler {
         if let std::collections::hash_map::Entry::Vacant(entry) = gpu.decoders.entry(surface_id) {
             entry.insert(match gpu.spare.take() {
                 Some(decoder) => decoder,
-                None => vaapi::Decoder::new(&gpu.context.render_node)?,
+                None => vaapi::Decoder::new(gpu.context.render_node()?)?,
             });
         }
         let decoder = gpu.decoders.get_mut(&surface_id).expect("just inserted");
@@ -910,7 +926,8 @@ impl Handler {
         surface.copy_gpu(&image, Rect::new(0, 0, dest.w, dest.h), dest.x, dest.y);
         if !gpu.announced {
             gpu.announced = true;
-            tracing::info!(node = %gpu.context.render_node, "VA-API H.264 decoding active; frames remain on GPU");
+            let node = gpu.context.render_node.as_deref().unwrap_or_default();
+            tracing::info!(node, "VA-API H.264 decoding active; frames remain on GPU");
             self.0.note_h264(false);
         }
         Ok(())

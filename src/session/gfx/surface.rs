@@ -25,6 +25,29 @@ impl SrcFormat {
             _ => 4,
         }
     }
+
+    /// Converts one row of pixels to RGBA with the alpha the surface expects.
+    fn convert_row(self, dst: &mut [u8], src: &[u8]) {
+        match self {
+            SrcFormat::Rgba => dst.copy_from_slice(src),
+            SrcFormat::Rgbx => {
+                dst.copy_from_slice(src);
+                for alpha in dst.iter_mut().skip(3).step_by(4) {
+                    *alpha = 0xFF;
+                }
+            }
+            SrcFormat::Bgra => {
+                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    d.copy_from_slice(&[s[2], s[1], s[0], 0xFF]);
+                }
+            }
+            SrcFormat::Rgb => {
+                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+                    d.copy_from_slice(&[s[0], s[1], s[2], 0xFF]);
+                }
+            }
+        }
+    }
 }
 
 pub struct GpuSurface {
@@ -74,16 +97,24 @@ impl Surface {
         error: Arc<Mutex<Option<String>>>,
     ) -> Self {
         let image = context.image(width, height);
-        let gpu = GpuSurface {
-            context,
-            image,
-            error,
-        };
-        gpu.record(gpu.context.clear(&gpu.image, [0, 0, 0, 255]));
+        context.clear(&image, [0, 0, 0, 255]);
+        Self::with_image(image, context, error)
+    }
+
+    /// A GPU surface showing `image`, whose pixels are undefined until written.
+    fn with_image(
+        image: Arc<GpuImage>,
+        context: Arc<GpuContext>,
+        error: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         Self {
-            gpu: Some(gpu),
-            width,
-            height,
+            width: image.width,
+            height: image.height,
+            gpu: Some(GpuSurface {
+                context,
+                image,
+                error,
+            }),
             data: Vec::new(),
             origin: None,
             damage: DirtyRegion::default(),
@@ -94,9 +125,9 @@ impl Surface {
     pub fn snapshot(&self, rect: Rect) -> Option<Surface> {
         let rect = rect.clip(self.width, self.height)?;
         if let Some(gpu) = &self.gpu {
-            let mut result = Self::new_gpu(
-                rect.w,
-                rect.h,
+            // The copy overwrites every pixel, so the image needs no clear.
+            let mut result = Self::with_image(
+                gpu.context.image(rect.w, rect.h),
                 Arc::clone(&gpu.context),
                 Arc::clone(&gpu.error),
             );
@@ -130,11 +161,30 @@ impl Surface {
 
     pub fn copy_gpu(&mut self, src: &GpuImage, rect: Rect, x: u32, y: u32) {
         let Some(gpu) = &self.gpu else { return };
-        let mut encoder = gpu.context.encoder();
-        GpuContext::copy(&mut encoder, src, rect, &gpu.image, x, y);
-        gpu.record(gpu.context.submit(encoder, ()));
+        gpu.context.copy(src, rect, &gpu.image, x, y);
         if let Some(rect) = Rect::new(x, y, rect.w, rect.h).clip(self.width, self.height) {
             self.damage.add(rect);
+        }
+    }
+
+    /// Copies `rect` to each of `points`, all from the pixels as they were before the call.
+    pub fn copy_within(&mut self, rect: Rect, points: &[(u32, u32)]) {
+        let Some(gpu) = &self.gpu else {
+            if let Some(snapshot) = self.snapshot(rect) {
+                for &(x, y) in points {
+                    self.copy_from(&snapshot, x, y);
+                }
+            }
+            return;
+        };
+        let Some(rect) = rect.clip(self.width, self.height) else {
+            return;
+        };
+        gpu.context.copy_within(&gpu.image, rect, points);
+        for &(x, y) in points {
+            if let Some(placed) = Rect::new(x, y, rect.w, rect.h).clip(self.width, self.height) {
+                self.damage.add(placed);
+            }
         }
     }
 
@@ -142,77 +192,65 @@ impl Surface {
         self.width as usize * 4
     }
 
+    #[cfg(test)]
     pub fn fill(&mut self, rect: Rect, rgba: [u8; 4]) {
-        let Some(rect) = rect.clip(self.width, self.height) else {
-            return;
-        };
-        if let Some(gpu) = &self.gpu {
-            gpu.record(gpu.context.fill(&gpu.image, rect, rgba));
-            self.damage.add(rect);
-            return;
-        }
-        let stride = self.stride();
-        for y in rect.y..rect.y + rect.h {
-            let start = y as usize * stride + rect.x as usize * 4;
-            for px in self.data[start..start + rect.w as usize * 4].chunks_exact_mut(4) {
-                px.copy_from_slice(&rgba);
-            }
-        }
-        self.damage.add(rect);
+        self.fill_rects(&[rect], rgba);
     }
 
-    /// Writes a `rect.w` x `rect.h` image (rows `src_stride` bytes apart) at `rect`.
+    pub fn fill_rects(&mut self, rects: &[Rect], rgba: [u8; 4]) {
+        let rects: Vec<Rect> = rects
+            .iter()
+            .filter_map(|r| r.clip(self.width, self.height))
+            .collect();
+        if let Some(gpu) = &self.gpu {
+            gpu.context.fill(&gpu.image, &rects, rgba);
+        } else {
+            let stride = self.stride();
+            for rect in &rects {
+                for y in rect.y..rect.y + rect.h {
+                    let start = y as usize * stride + rect.x as usize * 4;
+                    for px in self.data[start..start + rect.w as usize * 4].chunks_exact_mut(4) {
+                        px.copy_from_slice(&rgba);
+                    }
+                }
+            }
+        }
+        for rect in rects {
+            self.damage.add(rect);
+        }
+    }
+
+    /// Writes a `rect.w` x `rect.h` image (rows `src_stride` bytes apart) at `rect`. Only
+    /// complete rows of `src` are written.
     pub fn write(&mut self, rect: Rect, src: &[u8], src_stride: usize, format: SrcFormat) {
         let Some(clipped) = rect.clip(self.width, self.height) else {
             return;
         };
-        if let Some(gpu) = &self.gpu {
-            let mut normalized = Self::new(clipped.w, clipped.h);
-            normalized.write(
-                Rect::new(0, 0, clipped.w, clipped.h),
-                src,
-                src_stride,
-                format,
-            );
-            gpu.record(
-                gpu.context
-                    .upload(&gpu.image, clipped, &normalized.data, clipped.w * 4),
-            );
-            self.damage.add(clipped);
+        let row_bytes = clipped.w as usize * format.bytes_per_pixel();
+        let rows = (0..clipped.h as usize)
+            .take_while(|row| row * src_stride + row_bytes <= src.len())
+            .count();
+        if rows == 0 {
             return;
         }
-        let stride = self.stride();
-        let bpp = format.bytes_per_pixel();
-        let width = clipped.w as usize;
-
-        for row in 0..clipped.h as usize {
-            let src_start = row * src_stride;
-            let Some(src_row) = src.get(src_start..src_start + width * bpp) else {
-                break;
-            };
-            let dst_start = (clipped.y as usize + row) * stride + clipped.x as usize * 4;
-            let dst_row = &mut self.data[dst_start..dst_start + width * 4];
-            match format {
-                SrcFormat::Rgba => dst_row.copy_from_slice(src_row),
-                SrcFormat::Rgbx => {
-                    dst_row.copy_from_slice(src_row);
-                    for alpha in dst_row.iter_mut().skip(3).step_by(4) {
-                        *alpha = 0xFF;
-                    }
-                }
-                SrcFormat::Bgra => {
-                    for (d, s) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
-                        d.copy_from_slice(&[s[2], s[1], s[0], 0xFF]);
-                    }
-                }
-                SrcFormat::Rgb => {
-                    for (d, s) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(3)) {
-                        d.copy_from_slice(&[s[0], s[1], s[2], 0xFF]);
-                    }
-                }
+        let written = Rect::new(clipped.x, clipped.y, clipped.w, rows as u32);
+        let source = |row: usize| &src[row * src_stride..][..row_bytes];
+        if let Some(gpu) = &self.gpu {
+            // Converted straight into the GPU's staging memory.
+            gpu.record(gpu.context.upload(&gpu.image, written, |row, pixels| {
+                format.convert_row(pixels, source(row))
+            }));
+        } else {
+            let stride = self.stride();
+            for row in 0..rows {
+                let start = (written.y as usize + row) * stride + written.x as usize * 4;
+                format.convert_row(
+                    &mut self.data[start..][..written.w as usize * 4],
+                    source(row),
+                );
             }
         }
-        self.damage.add(clipped);
+        self.damage.add(written);
     }
 
     /// Copies `rect` out as tightly packed RGBA.
@@ -260,6 +298,51 @@ mod tests {
         assert_eq!(pixel(&s, 0, 0), [30, 20, 10, 255]);
         assert_eq!(pixel(&s, 1, 0), [10, 20, 30, 255]);
         assert_eq!(pixel(&s, 2, 0), [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn write_skips_incomplete_source_rows() {
+        let mut s = Surface::new(4, 4);
+        // Two complete 2-pixel rows and part of a third.
+        s.write(Rect::new(1, 1, 2, 3), &[7; 20], 8, SrcFormat::Rgba);
+        assert_eq!(pixel(&s, 2, 2), [7, 7, 7, 7]);
+        assert_eq!(pixel(&s, 1, 3), [0, 0, 0, 255]);
+        assert_eq!(s.damage.take(), vec![Rect::new(1, 1, 2, 2)]);
+        s.write(Rect::new(0, 0, 2, 2), &[7; 7], 8, SrcFormat::Rgba);
+        assert!(s.damage.take().is_empty());
+    }
+
+    #[test]
+    fn copy_within_reads_pixels_before_the_copy() {
+        let mut s = Surface::new(6, 1);
+        for x in 0..3 {
+            s.fill(Rect::new(x, 0, 1, 1), [x as u8 + 1, 0, 0, 255]);
+        }
+        s.damage.take();
+        // The second copy overlaps the first one's destination, but still copies 1, 2, 3.
+        s.copy_within(Rect::new(0, 0, 3, 1), &[(1, 0), (3, 0)]);
+        let reds: Vec<u8> = (0..6).map(|x| pixel(&s, x, 0)[0]).collect();
+        assert_eq!(reds, [1, 1, 2, 1, 2, 3]);
+    }
+
+    #[test]
+    fn fill_rects_clips_each_rect() {
+        let mut s = Surface::new(4, 4);
+        s.fill_rects(
+            &[
+                Rect::new(0, 0, 1, 1),
+                Rect::new(3, 3, 5, 5),
+                Rect::new(9, 9, 1, 1),
+            ],
+            [5, 6, 7, 255],
+        );
+        assert_eq!(pixel(&s, 0, 0), [5, 6, 7, 255]);
+        assert_eq!(pixel(&s, 3, 3), [5, 6, 7, 255]);
+        assert_eq!(pixel(&s, 1, 1), [0, 0, 0, 255]);
+        assert_eq!(
+            s.damage.take(),
+            vec![Rect::new(0, 0, 1, 1), Rect::new(3, 3, 1, 1)]
+        );
     }
 
     #[test]

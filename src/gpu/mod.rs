@@ -3,6 +3,7 @@
 mod import;
 
 use std::collections::VecDeque;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,18 +19,40 @@ use crate::session::gfx::vaapi::HardwareFrame;
 
 pub struct GpuImage {
     pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
     pub width: u32,
     pub height: u32,
 }
 
+/// Staging memory is allocated in chunks of this size (a 1080p frame of tiles is about 8 MiB).
+const STAGING_CHUNK: u64 = 8 << 20;
+/// A batch that has staged this much upload data is submitted without waiting for the frame end.
+const MAX_BATCH_BYTES: u64 = 64 << 20;
+
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    pub render_node: String,
+    /// The VA-API render node for this adapter; none when decoded frames can't be imported.
+    pub render_node: Option<String>,
     pending: Mutex<VecDeque<wgpu::SubmissionIndex>>,
+    batch: Mutex<Batch>,
+    /// Staging area for copies within one image, which wgpu can't do directly.
+    scratch: Mutex<Option<Arc<GpuImage>>>,
     conversion: wgpu::RenderPipeline,
+    fill: wgpu::RenderPipeline,
     avc444: Avc444Pipelines,
     failure: Arc<Mutex<Option<String>>>,
+}
+
+/// Commands recorded since the last submission. Surface operations append here; the session
+/// submits once per RDP frame, and any other submission sends the batch first to keep order.
+struct Batch {
+    encoder: Option<wgpu::CommandEncoder>,
+    belt: wgpu::util::StagingBelt,
+    /// Upload bytes staged in this batch.
+    staged: u64,
+    /// One converted row on its way to staging memory, which is write-only.
+    line: Vec<u8>,
 }
 
 struct Avc444Pipelines {
@@ -133,60 +156,77 @@ async fn open_device(adapter: &wgpu::Adapter) -> anyhow::Result<(wgpu::Device, w
     Ok((device, queue))
 }
 
+/// The VA-API render node matching the device's adapter, when VA-API frames can be imported.
+fn interop_node(device: &wgpu::Device) -> anyhow::Result<String> {
+    ensure!(
+        device
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF),
+        "Vulkan DMA-BUF import is unavailable on this adapter"
+    );
+    // SAFETY: only querying physical-device properties and extension names.
+    unsafe {
+        let hal = device
+            .as_hal::<wgpu_hal::api::Vulkan>()
+            .context("Vulkan renderer required")?;
+        ensure!(
+            hal.enabled_device_extensions()
+                .contains(&ash::ext::queue_family_foreign::NAME),
+            "Vulkan foreign queue ownership is unavailable"
+        );
+        let instance = hal.shared_instance().raw_instance();
+        let extensions =
+            instance.enumerate_device_extension_properties(hal.raw_physical_device())?;
+        ensure!(
+            extensions
+                .iter()
+                .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
+                    == ash::ext::physical_device_drm::NAME),
+            "Vulkan driver cannot identify its DRM device"
+        );
+        let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+        instance.get_physical_device_properties2(hal.raw_physical_device(), &mut props);
+        ensure!(drm.has_render != 0, "Vulkan adapter has no DRM render node");
+        let expected = libc::makedev(drm.render_major as u32, drm.render_minor as u32);
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::read_dir("/dev/dri")
+            .context("No DRM render devices available")?
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry.file_name().to_string_lossy().starts_with("renderD")
+                    && entry.metadata().is_ok_and(|m| m.rdev() == expected)
+            })
+            .context("No matching VA-API render node for the Vulkan adapter")?
+            .path()
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
 impl GpuContext {
-    pub fn new(state: &RenderState) -> anyhow::Result<Arc<Self>> {
+    pub fn new(state: &RenderState) -> Arc<Self> {
         Self::from_device(state.device.clone(), state.queue.clone())
     }
 
-    fn from_device(device: wgpu::Device, queue: wgpu::Queue) -> anyhow::Result<Arc<Self>> {
-        ensure!(
-            device
-                .features()
-                .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF),
-            "Vulkan DMA-BUF import is unavailable on this adapter"
-        );
-        // SAFETY: only querying physical-device properties and extension names.
-        let node = unsafe {
-            let hal = device
-                .as_hal::<wgpu_hal::api::Vulkan>()
-                .context("Vulkan renderer required")?;
-            ensure!(
-                hal.enabled_device_extensions()
-                    .contains(&ash::ext::queue_family_foreign::NAME),
-                "Vulkan foreign queue ownership is unavailable"
-            );
-            let instance = hal.shared_instance().raw_instance();
-            let extensions =
-                instance.enumerate_device_extension_properties(hal.raw_physical_device())?;
-            ensure!(
-                extensions
-                    .iter()
-                    .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
-                        == ash::ext::physical_device_drm::NAME),
-                "Vulkan driver cannot identify its DRM device"
-            );
-            let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
-            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
-            instance.get_physical_device_properties2(hal.raw_physical_device(), &mut props);
-            ensure!(drm.has_render != 0, "Vulkan adapter has no DRM render node");
-            let expected = libc::makedev(drm.render_major as u32, drm.render_minor as u32);
-            use std::os::unix::fs::MetadataExt;
-            std::fs::read_dir("/dev/dri")
-                .context("No DRM render devices available")?
-                .filter_map(Result::ok)
-                .find(|entry| {
-                    entry.file_name().to_string_lossy().starts_with("renderD")
-                        && entry.metadata().is_ok_and(|m| m.rdev() == expected)
-                })
-                .context("No matching VA-API render node for the Vulkan adapter")?
-                .path()
-                .to_string_lossy()
-                .into_owned()
-        };
-        Ok(Arc::new(Self::with_device(device, queue, node)))
+    /// Drawing needs only the device; VA-API decoding also needs DMA-BUF interop.
+    fn from_device(device: wgpu::Device, queue: wgpu::Queue) -> Arc<Self> {
+        let render_node = interop_node(&device)
+            .inspect_err(|error| {
+                tracing::info!(%error, "hardware decoding unavailable; the GPU still draws")
+            })
+            .ok();
+        Arc::new(Self::with_device(device, queue, render_node))
     }
 
-    fn with_device(device: wgpu::Device, queue: wgpu::Queue, render_node: String) -> Self {
+    /// The render node for VA-API decoding, if decoded frames can be shared with this device.
+    pub fn render_node(&self) -> anyhow::Result<&str> {
+        self.render_node
+            .as_deref()
+            .context("Vulkan/VA-API interop unavailable")
+    }
+
+    fn with_device(device: wgpu::Device, queue: wgpu::Queue, render_node: Option<String>) -> Self {
         let failure = Arc::new(Mutex::new(None));
         let error_sink = Arc::clone(&failure);
         device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
@@ -230,13 +270,59 @@ impl GpuContext {
             multiview_mask: None,
             cache: None,
         });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Solid fill"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fill.wgsl").into()),
+        });
+        let constant = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Constant,
+            dst_factor: wgpu::BlendFactor::Zero,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let fill = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Solid fill"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState {
+                        color: constant,
+                        alpha: constant,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let avc444 = Avc444Pipelines::new(&device);
+        let belt = wgpu::util::StagingBelt::new(device.clone(), STAGING_CHUNK);
         Self {
             device,
             queue,
             render_node,
             pending: Mutex::new(VecDeque::new()),
+            batch: Mutex::new(Batch {
+                encoder: None,
+                belt,
+                staged: 0,
+                line: Vec::new(),
+            }),
+            scratch: Mutex::new(None),
             conversion,
+            fill,
             avc444,
             failure,
         }
@@ -261,6 +347,7 @@ impl GpuContext {
             view_formats: &[],
         });
         Arc::new(GpuImage {
+            view: texture.create_view(&Default::default()),
             texture,
             width,
             height,
@@ -274,11 +361,43 @@ impl GpuContext {
             })
     }
 
-    /// Keep at most three compositor submissions in flight. Polling here also
-    /// retires video surfaces while the tab is hidden or the UI is idle.
+    /// Submits `encoder` after everything recorded so far. Keeps at most three
+    /// submissions in flight. Polling here also retires video surfaces while
+    /// the tab is hidden or the UI is idle.
     pub fn submit(
         &self,
         encoder: wgpu::CommandEncoder,
+        hold: impl Send + 'static,
+    ) -> anyhow::Result<()> {
+        let mut batch = self.batch.lock();
+        let recorded = Self::finish_batch(&mut batch);
+        self.submit_buffers(recorded.into_iter().chain([encoder.finish()]), hold)
+    }
+
+    /// Submits everything recorded so far, if anything.
+    pub fn flush(&self) -> anyhow::Result<()> {
+        let mut batch = self.batch.lock();
+        self.flush_batch(&mut batch)
+    }
+
+    fn flush_batch(&self, batch: &mut Batch) -> anyhow::Result<()> {
+        match Self::finish_batch(batch) {
+            Some(buffer) => self.submit_buffers([buffer], ()),
+            None => Ok(()),
+        }
+    }
+
+    /// Ends the batch; the caller submits the result while still holding the batch lock.
+    fn finish_batch(batch: &mut Batch) -> Option<wgpu::CommandBuffer> {
+        let encoder = batch.encoder.take()?;
+        batch.belt.finish_and_recall_on_submit(&encoder);
+        batch.staged = 0;
+        Some(encoder.finish())
+    }
+
+    fn submit_buffers(
+        &self,
+        buffers: impl IntoIterator<Item = wgpu::CommandBuffer>,
         hold: impl Send + 'static,
     ) -> anyhow::Result<()> {
         if let Some(reason) = self.failure.lock().clone() {
@@ -291,7 +410,7 @@ impl GpuContext {
                 timeout: Some(Duration::from_secs(5)),
             })?;
         }
-        let index = self.queue.submit([encoder.finish()]);
+        let index = self.queue.submit(buffers);
         self.queue.on_submitted_work_done(move || drop(hold));
         pending.push_back(index);
         self.device.poll(wgpu::PollType::Poll)?;
@@ -301,7 +420,45 @@ impl GpuContext {
         Ok(())
     }
 
-    pub fn copy(
+    /// Records commands into the current batch.
+    fn record<R>(&self, commands: impl FnOnce(&mut wgpu::CommandEncoder) -> R) -> R {
+        let mut batch = self.batch.lock();
+        commands(batch.encoder.get_or_insert_with(|| self.encoder()))
+    }
+
+    /// Records a copy of `rect` from `src` to (x, y) in `dst`, clipped to both images.
+    pub fn copy(&self, src: &GpuImage, rect: Rect, dst: &GpuImage, x: u32, y: u32) {
+        self.record(|encoder| Self::encode_copy(encoder, src, rect, dst, x, y));
+    }
+
+    /// Records copies of `rect` to each of `points` in the same image, all reading the
+    /// original pixels (overlapping copies included).
+    pub fn copy_within(&self, image: &GpuImage, rect: Rect, points: &[(u32, u32)]) {
+        let Some(rect) = rect.clip(image.width, image.height) else {
+            return;
+        };
+        let scratch = {
+            let mut scratch = self.scratch.lock();
+            match &*scratch {
+                Some(s) if s.width >= rect.w && s.height >= rect.h => Arc::clone(s),
+                old => {
+                    let (w, h) = old.as_ref().map_or((rect.w, rect.h), |s| {
+                        (s.width.max(rect.w), s.height.max(rect.h))
+                    });
+                    Arc::clone(scratch.insert(self.image(w, h)))
+                }
+            }
+        };
+        self.record(|encoder| {
+            Self::encode_copy(encoder, image, rect, &scratch, 0, 0);
+            for &(x, y) in points {
+                let staged = Rect::new(0, 0, rect.w, rect.h);
+                Self::encode_copy(encoder, &scratch, staged, image, x, y);
+            }
+        });
+    }
+
+    fn encode_copy(
         encoder: &mut wgpu::CommandEncoder,
         src: &GpuImage,
         rect: Rect,
@@ -345,77 +502,100 @@ impl GpuContext {
         );
     }
 
-    pub fn clear(&self, image: &GpuImage, rgba: [u8; 4]) -> anyhow::Result<()> {
-        let view = image.texture.create_view(&Default::default());
-        let mut encoder = self.encoder();
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+    pub fn clear(&self, image: &GpuImage, rgba: [u8; 4]) {
+        self.fill(image, &[Rect::new(0, 0, image.width, image.height)], rgba);
+    }
+
+    /// Records solid fills of `rects`, in one render pass.
+    pub fn fill(&self, image: &GpuImage, rects: &[Rect], rgba: [u8; 4]) {
+        if rects.is_empty() {
+            return;
+        }
+        let [r, g, b, a] = rgba.map(|c| f64::from(c) / 255.0);
+        let color = wgpu::Color { r, g, b, a };
+        let whole = rects
+            .iter()
+            .any(|r| r.x == 0 && r.y == 0 && r.w >= image.width && r.h >= image.height);
+        let load = if whole {
+            wgpu::LoadOp::Clear(color)
+        } else {
+            wgpu::LoadOp::Load
+        };
+        self.record(|encoder| {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("RDP solid fill"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &image.view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(rgba[0]) / 255.0,
-                            g: f64::from(rgba[1]) / 255.0,
-                            b: f64::from(rgba[2]) / 255.0,
-                            a: f64::from(rgba[3]) / 255.0,
-                        }),
+                        load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 ..Default::default()
             });
-        }
-        self.submit(encoder, ())
-    }
-
-    pub fn fill(&self, image: &GpuImage, rect: Rect, rgba: [u8; 4]) -> anyhow::Result<()> {
-        let Some(rect) = rect.clip(image.width, image.height) else {
-            return Ok(());
-        };
-        if rect.x == 0 && rect.y == 0 && rect.w == image.width && rect.h == image.height {
-            return self.clear(image, rgba);
-        }
-        // A 1x1 clear texture can be rendered only with a scissor. A render pass
-        // with a small attachment view cannot clear a subrect, so use a tiny
-        // uploaded solid tile and repeated GPU copies.
-        let tile_w = rect.w.min(64);
-        let tile_h = rect.h.min(64);
-        let tile = self.image(tile_w, tile_h);
-        self.upload(
-            &tile,
-            Rect::new(0, 0, tile_w, tile_h),
-            &rgba.repeat((tile_w * tile_h) as usize),
-            tile_w * 4,
-        )?;
-        let mut encoder = self.encoder();
-        for y in (0..rect.h).step_by(tile_h as usize) {
-            for x in (0..rect.w).step_by(tile_w as usize) {
-                Self::copy(
-                    &mut encoder,
-                    &tile,
-                    Rect::new(0, 0, tile_w.min(rect.w - x), tile_h.min(rect.h - y)),
-                    image,
-                    rect.x + x,
-                    rect.y + y,
-                );
+            if whole {
+                return;
             }
-        }
-        self.submit(encoder, tile)
+            pass.set_pipeline(&self.fill);
+            pass.set_blend_constant(color);
+            for rect in rects
+                .iter()
+                .filter_map(|r| r.clip(image.width, image.height))
+            {
+                pass.set_scissor_rect(rect.x, rect.y, rect.w, rect.h);
+                pass.draw(0..3, 0..1);
+            }
+        });
     }
 
+    /// Records an upload of `rect` (clipped to the image). `row(i, pixels)` fills row `i` of
+    /// the clipped rect as RGBA; rows go from there into staging memory with one copy each.
     pub fn upload(
         &self,
         image: &GpuImage,
         rect: Rect,
-        bytes: &[u8],
-        stride: u32,
+        mut row: impl FnMut(usize, &mut [u8]),
     ) -> anyhow::Result<()> {
         let Some(rect) = rect.clip(image.width, image.height) else {
             return Ok(());
         };
-        self.queue.write_texture(
+        let row_bytes = rect.w as usize * 4;
+        let pitch = (rect.w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let size = u64::from(pitch) * u64::from(rect.h);
+        let mut batch = self.batch.lock();
+        let Batch {
+            encoder,
+            belt,
+            staged,
+            line,
+        } = &mut *batch;
+        let encoder = encoder.get_or_insert_with(|| self.encoder());
+        let slice = belt.allocate(
+            NonZeroU64::new(size).expect("clipped rects are not empty"),
+            NonZeroU64::new(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT.into()).expect("non-zero"),
+        );
+        {
+            let mut staging = slice.get_mapped_range_mut()?;
+            line.resize(row_bytes, 0);
+            for i in 0..rect.h as usize {
+                row(i, line);
+                let start = i * pitch as usize;
+                staging
+                    .slice(start..start + row_bytes)
+                    .copy_from_slice(line);
+            }
+        }
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: slice.buffer(),
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: slice.offset(),
+                    bytes_per_row: Some(pitch),
+                    rows_per_image: None,
+                },
+            },
             wgpu::TexelCopyTextureInfo {
                 texture: &image.texture,
                 mip_level: 0,
@@ -426,19 +606,17 @@ impl GpuContext {
                 },
                 aspect: wgpu::TextureAspect::All,
             },
-            bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(stride),
-                rows_per_image: None,
-            },
             wgpu::Extent3d {
                 width: rect.w,
                 height: rect.h,
                 depth_or_array_layers: 1,
             },
         );
-        self.submit(self.encoder(), ())
+        *staged += size;
+        if *staged >= MAX_BATCH_BYTES {
+            self.flush_batch(&mut batch)?;
+        }
+        Ok(())
     }
 
     pub fn convert(&self, frame: HardwareFrame) -> anyhow::Result<Arc<GpuImage>> {
@@ -498,7 +676,6 @@ impl GpuContext {
                 },
             ],
         });
-        let view = output.texture.create_view(&Default::default());
         let resources = Arc::new((frame, imported));
         // wgpu 30 forbids mixing raw and safe commands in one encoder. Keep
         // acquire, conversion, and release in separate ordered submissions.
@@ -510,7 +687,7 @@ impl GpuContext {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("H.264 GPU color conversion"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &output.view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -612,13 +789,13 @@ impl Avc444Pipelines {
 
 impl GpuContext {
     /// A new 4:4:4 store, black with neutral chroma.
-    pub fn store_444(&self, width: u32, height: u32) -> anyhow::Result<Store444> {
+    pub fn store_444(&self, width: u32, height: u32) -> Store444 {
         let image = self.image(width, height);
-        self.clear(&image, [0, 128, 128, 255])?;
-        Ok(Store444 {
+        self.clear(&image, [0, 128, 128, 255]);
+        Store444 {
             image,
             color: color_parameters(1, true, 0),
-        })
+        }
     }
 
     fn uniform_444(&self, layout: [f32; 4], color: &[[f32; 4]; 4]) -> wgpu::Buffer {
@@ -664,7 +841,6 @@ impl GpuContext {
             imported.planes[1].create_view(&Default::default()),
         ];
         let bind = self.bind_444(&views[0], &views[1], &uniform);
-        let target = store.image.texture.create_view(&Default::default());
         let pipeline = if auxiliary.is_some() {
             &self.avc444.auxiliary
         } else {
@@ -681,7 +857,7 @@ impl GpuContext {
         let mut encoder = self.encoder();
         Self::draw_rects(
             &mut encoder,
-            &target,
+            &store.image.view,
             pipeline,
             &bind,
             rects,
@@ -694,34 +870,26 @@ impl GpuContext {
         self.submit(release, resources)
     }
 
-    /// Converts `rects` of the store to RGB into `target`, with the picture origin at (x, y).
-    pub fn render_444(
-        &self,
-        store: &Store444,
-        rects: &[Rect],
-        target: &GpuImage,
-        x: u32,
-        y: u32,
-    ) -> anyhow::Result<()> {
+    /// Records the conversion of `rects` of the store to RGB into `target`, with the picture
+    /// origin at (x, y).
+    pub fn render_444(&self, store: &Store444, rects: &[Rect], target: &GpuImage, x: u32, y: u32) {
         let uniform = self.uniform_444([x as f32, y as f32, 0.0, 0.0], &store.color);
-        let source = store.image.texture.create_view(&Default::default());
-        let bind = self.bind_444(&source, &source, &uniform);
-        let view = target.texture.create_view(&Default::default());
+        let bind = self.bind_444(&store.image.view, &store.image.view, &uniform);
         let bounds = (
             target.width.min(x + store.image.width),
             target.height.min(y + store.image.height),
         );
-        let mut encoder = self.encoder();
-        Self::draw_rects(
-            &mut encoder,
-            &view,
-            &self.avc444.convert,
-            &bind,
-            rects,
-            (x, y),
-            bounds,
-        );
-        self.submit(encoder, (uniform, Arc::clone(&store.image)))
+        self.record(|encoder| {
+            Self::draw_rects(
+                encoder,
+                &target.view,
+                &self.avc444.convert,
+                &bind,
+                rects,
+                (x, y),
+                bounds,
+            );
+        });
     }
 
     fn bind_444(
@@ -858,7 +1026,7 @@ pub(crate) mod tests {
             ..Default::default()
         }))?;
         let (device, queue) = pollster::block_on(open_device(&adapter))?;
-        GpuContext::from_device(device, queue)
+        Ok(GpuContext::from_device(device, queue))
     }
 
     /// Test-only GPU readback. The production decoding path never maps pixels.
@@ -929,8 +1097,12 @@ pub(crate) mod tests {
         let context = context().unwrap();
         let error = Arc::new(Mutex::new(None));
         let mut gpu = Surface::new_gpu(32, 24, context.clone(), error.clone());
+        let mut gpu_other = Surface::new_gpu(16, 12, context.clone(), error.clone());
         let mut cpu = Surface::new(32, 24);
-        for surface in [&mut cpu, &mut gpu] {
+        let mut cpu_other = Surface::new(16, 12);
+        let gradient: Vec<u8> = (0..16 * 12 * 4).map(|i| i as u8).collect();
+        // Every operation lands in one batch, so this also checks that they keep their order.
+        for (surface, other) in [(&mut cpu, &mut cpu_other), (&mut gpu, &mut gpu_other)] {
             surface.fill(Rect::new(0, 0, 32, 24), [30, 40, 50, 255]);
             surface.fill(Rect::new(3, 4, 10, 8), [200, 100, 50, 255]);
             surface.write(
@@ -943,25 +1115,123 @@ pub(crate) mod tests {
             surface.copy_from(&snapshot, 5, 6); // Overlapping surface copy.
             let cached = surface.snapshot(Rect::new(5, 6, 10, 8)).unwrap();
             surface.fill(Rect::new(5, 6, 10, 8), [0, 0, 0, 255]);
+            // Uploads after a snapshot must not reach it.
+            surface.write(
+                Rect::new(5, 6, 3, 3),
+                &[1, 2, 3].repeat(9),
+                9,
+                SrcFormat::Rgb,
+            );
             surface.copy_from(&cached, 22, 20); // Clipped cache restoration.
+            let corners = [Rect::new(0, 0, 2, 2), Rect::new(30, 0, 5, 3)];
+            surface.fill_rects(&corners, [7, 8, 9, 255]);
+            // Overlapping copies within the surface all read the original pixels.
+            surface.copy_within(Rect::new(4, 5, 9, 7), &[(6, 6), (2, 3), (25, 18)]);
+            // A truncated source writes only its complete rows.
+            let short = [90, 80, 70, 255].repeat(7);
+            surface.write(Rect::new(1, 15, 3, 4), &short, 12, SrcFormat::Rgba);
+            // Copies from another surface.
+            other.write(Rect::new(0, 0, 16, 12), &gradient, 64, SrcFormat::Rgbx);
+            let source = Rect::new(4, 3, 12, 9);
+            match &other.gpu {
+                Some(image) => surface.copy_gpu(&Arc::clone(&image.image), source, 20, 1),
+                None => surface.copy_from(&other.snapshot(source).unwrap(), 20, 1),
+            }
         }
         assert_eq!(read(&context, &gpu.gpu.as_ref().unwrap().image), cpu.data);
         assert!(error.lock().is_none(), "{:?}", error.lock());
         // Resize/output publication uses a fresh texture rather than a stale ID.
         let output = context.image(64, 48);
-        context.clear(&output, [0, 0, 0, 255]).unwrap();
-        let mut encoder = context.encoder();
-        GpuContext::copy(
-            &mut encoder,
-            &gpu.gpu.as_ref().unwrap().image,
-            Rect::new(0, 0, 32, 24),
-            &output,
-            8,
-            8,
-        );
-        context.submit(encoder, ()).unwrap();
+        context.clear(&output, [0, 0, 0, 255]);
+        let image = &gpu.gpu.as_ref().unwrap().image;
+        context.copy(image, Rect::new(0, 0, 32, 24), &output, 8, 8);
         let result = read(&context, &output);
         assert_eq!(&result[(8 * 64 + 8) * 4..(8 * 64 + 9) * 4], &cpu.data[..4]);
+    }
+
+    fn thread_cpu() -> Duration {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: valid output pointer and a supported Linux clock.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+    }
+
+    /// A busy 1080p lossless frame: a full progressive refresh, glyphs, fills, a scroll and
+    /// cache traffic, then composition onto the output.
+    #[test]
+    #[ignore = "requires a Vulkan GPU; reports lossless composition cost per frame"]
+    fn gpu_lossless_frame_throughput() {
+        let context = context().unwrap();
+        let error = Arc::new(Mutex::new(None));
+        let (width, height) = (1920, 1080);
+        let mut surface = Surface::new_gpu(width, height, context.clone(), error.clone());
+        let output = context.image(width, height);
+        let tile: Vec<u8> = (0..64 * 64 * 4).map(|i| (i * 7) as u8).collect();
+        let glyph: Vec<u8> = (0..8 * 16 * 4).map(|i| (i * 13) as u8).collect();
+        let frame = |surface: &mut Surface| {
+            for ty in 0..height.div_ceil(64) {
+                for tx in 0..width / 64 {
+                    surface.write(
+                        Rect::new(tx * 64, ty * 64, 64, 64),
+                        &tile,
+                        64 * 4,
+                        SrcFormat::Rgba,
+                    );
+                }
+            }
+            for i in 0..300 {
+                let (x, y) = ((i * 37) % (width - 8), (i * 53) % (height - 16));
+                surface.write(Rect::new(x, y, 8, 16), &glyph, 8 * 4, SrcFormat::Bgra);
+            }
+            for i in 0..100 {
+                let (x, y) = ((i * 71) % (width - 40), (i * 29) % (height - 20));
+                surface.fill(Rect::new(x, y, 40, 20), [i as u8, 50, 90, 255]);
+            }
+            surface.copy_within(Rect::new(0, 40, width, 1000), &[(0, 0)]);
+            for i in 0..30 {
+                let cached = surface
+                    .snapshot(Rect::new((i * 61) % (width - 64), 100, 64, 64))
+                    .unwrap();
+                surface.copy_from(&cached, (i * 97) % (width - 64), 700);
+            }
+            let image = &surface.gpu.as_ref().unwrap().image;
+            for rect in surface.damage.take() {
+                context.copy(image, rect, &output, rect.x, rect.y);
+            }
+            context.flush().unwrap();
+        };
+        let (frames, warmup) = (100, 5);
+        let mut wall = Vec::new();
+        let mut cpu = Vec::new();
+        for n in 0..frames + warmup {
+            let begin_cpu = thread_cpu();
+            let begin = std::time::Instant::now();
+            frame(&mut surface);
+            context
+                .device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            if n >= warmup {
+                wall.push(begin.elapsed());
+                cpu.push(thread_cpu() - begin_cpu);
+            }
+        }
+        assert!(error.lock().is_none(), "{:?}", error.lock());
+        let median = |times: &mut Vec<Duration>| {
+            times.sort();
+            times[times.len() / 2].as_secs_f64() * 1000.0
+        };
+        eprintln!(
+            "1080p lossless frame (median): {:.3} ms elapsed, {:.3} ms session-thread CPU",
+            median(&mut wall),
+            median(&mut cpu),
+        );
     }
 
     #[test]
@@ -973,18 +1243,6 @@ pub(crate) mod tests {
             // SAFETY: pinned system OpenH264 ABI.
             unsafe { openh264::OpenH264API::from_blob_path_unchecked("/usr/lib/libopenh264.so.8") }
                 .unwrap()
-        }
-        fn thread_cpu() -> Duration {
-            let mut time = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            // SAFETY: valid output pointer and a supported Linux clock.
-            assert_eq!(
-                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
-                0
-            );
-            Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
         }
         let context = context().unwrap();
         let (width, height) = (1920, 1080);
@@ -1014,7 +1272,7 @@ pub(crate) mod tests {
                     .to_vec(),
             );
         }
-        let mut hardware = vaapi::Decoder::new(&context.render_node).unwrap();
+        let mut hardware = vaapi::Decoder::new(context.render_node().unwrap()).unwrap();
         let mut software = openh264::decoder::Decoder::with_api_config(
             api(),
             openh264::decoder::DecoderConfig::new(),
@@ -1039,10 +1297,12 @@ pub(crate) mod tests {
                             .upload(
                                 &software_image,
                                 Rect::new(0, 0, width as u32, height as u32),
-                                &rgba,
-                                width as u32 * 4,
+                                |row, line| {
+                                    line.copy_from_slice(&rgba[row * width * 4..][..width * 4])
+                                },
                             )
                             .unwrap();
+                        context.flush().unwrap();
                     }
                     context
                         .device
@@ -1089,7 +1349,7 @@ pub(crate) mod tests {
                     .max_frame_rate(FrameRate::from_hz(60.0))
                     .skip_frames(false);
                 let mut encoder = Encoder::with_api_config(api(), config).unwrap();
-                let mut hardware = vaapi::Decoder::new(&context.render_node).unwrap();
+                let mut hardware = vaapi::Decoder::new(context.render_node().unwrap()).unwrap();
                 let mut software = openh264::decoder::Decoder::with_api_config(
                     api(),
                     openh264::decoder::DecoderConfig::new(),
@@ -1098,7 +1358,7 @@ pub(crate) mod tests {
                 let views = split(w, h, &picture(w, h), layout);
                 let (pw, ph) = (views.y_stride, views.main[0].len() / views.y_stride);
                 let whole = Rect::new(0, 0, w as u32, h as u32);
-                let mut store = context.store_444(w as u32, h as u32).unwrap();
+                let mut store = context.store_444(w as u32, h as u32);
                 let mut reference = Yuv444::new(w, h);
                 // A second round makes each view a predicted picture.
                 for _ in 0..2 {
@@ -1127,9 +1387,7 @@ pub(crate) mod tests {
                 // Draw at an offset, as onto a surface.
                 let (ox, oy) = (6, 4);
                 let target = context.image(w as u32 + ox, h as u32 + oy);
-                context
-                    .render_444(&store, &[whole], &target, ox, oy)
-                    .unwrap();
+                context.render_444(&store, &[whole], &target, ox, oy);
                 let actual = read(&context, &target);
                 let mut expected = Vec::new();
                 reference.to_rgba(whole, &mut expected).unwrap();
@@ -1157,7 +1415,7 @@ pub(crate) mod tests {
         use openh264::encoder::{Encoder, EncoderConfig, VuiConfig};
         use openh264::formats::YUVBuffer;
         let context = context().unwrap();
-        eprintln!("Testing GPU decoder on {}", context.render_node);
+        eprintln!("Testing GPU decoder on {}", context.render_node().unwrap());
         // SAFETY: matches the ABI used by the application's software decoder.
         let api =
             unsafe { openh264::OpenH264API::from_blob_path_unchecked("/usr/lib/libopenh264.so.8") }
@@ -1166,7 +1424,7 @@ pub(crate) mod tests {
             Encoder::with_api_config(api, EncoderConfig::new().vui(VuiConfig::bt601())).unwrap();
         let initial_fds = std::fs::read_dir("/proc/self/fd").unwrap().count();
         for (width, height) in [(64, 64), (98, 82), (64, 64)] {
-            let mut decoder = vaapi::Decoder::new(&context.render_node).unwrap();
+            let mut decoder = vaapi::Decoder::new(context.render_node().unwrap()).unwrap();
             // SAFETY: same known system ABI as the encoder above.
             let api = unsafe {
                 openh264::OpenH264API::from_blob_path_unchecked("/usr/lib/libopenh264.so.8")

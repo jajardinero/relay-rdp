@@ -79,8 +79,15 @@ H.264 → FFmpeg / VA-API → DMA-BUF planes → Vulkan import
 
 Decoded video stays on the GPU. Solid fills, overlapping surface copies, bitmap
 caches, and composition also run on the GPU. Other RDP codecs can upload decoded
-bitmap regions into the same GPU surfaces. Final desktop updates are submitted
-at the end of each RDP frame, with bounded outstanding GPU work.
+bitmap regions into the same GPU surfaces. Everything an RDP frame draws is
+recorded and submitted to the GPU once, at the end of the frame, with bounded
+outstanding GPU work.
+
+The **Sharp Text** mode, which never uses H.264, also draws on the GPU while
+hardware video decoding is enabled. Its lossless codecs decode on the CPU, and
+the decoded regions go straight into GPU surfaces. This needs only the Vulkan
+device, not VA-API. If GPU drawing fails, Relay reconnects and draws that session
+on the CPU.
 
 Stream color metadata controls conversion. When unspecified, AVC420 uses the
 protocol's full-range BT.709 defaults. Filtering is clamped to the visible
@@ -90,7 +97,8 @@ If hardware setup is unavailable, Relay uses OpenH264. If an active hardware
 stream fails, Relay reconnects with hardware disabled for that session, obtaining
 a fresh keyframe. Persistent software graphics failures retain the existing
 compatible-graphics recovery. Sharp Text and Compatible modes retain their
-codec preferences. Hardware backends other than VA-API are not implemented.
+codec preferences; Compatible mode's classic updates always decode on the CPU.
+Hardware backends other than VA-API are not implemented.
 
 ### Full color (H.264 4:4:4)
 

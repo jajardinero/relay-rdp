@@ -268,7 +268,7 @@ fn wayland_rdp_sessions_resize_and_toggle() {
     let unavailable_server = Server::start();
     let mut unavailable_gpu = crate::gpu::tests::context().unwrap();
     Arc::get_mut(&mut unavailable_gpu).unwrap().render_node =
-        "/dev/dri/relay-unavailable-device".to_owned();
+        Some("/dev/dri/relay-unavailable-device".to_owned());
     let mut params = make_params(unavailable_server.port, true);
     params.gpu = Some(unavailable_gpu);
     let unavailable = SessionHandle::spawn(params, proxy.clone()).unwrap();

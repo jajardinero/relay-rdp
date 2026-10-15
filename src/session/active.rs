@@ -129,11 +129,17 @@ pub(super) async fn run_session(
                 if hardware && hardware_failure {
                     hardware = false;
                     hardware_reason = Some(reason.clone());
-                    tracing::warn!(%reason, "hardware decoding failed; reconnecting with OpenH264");
+                    let message = if graphics.uses_h264() {
+                        tracing::warn!(%reason, "hardware decoding failed; reconnecting with OpenH264");
+                        "Switching to software video decoding"
+                    } else {
+                        tracing::warn!(%reason, "GPU drawing failed; reconnecting with CPU drawing");
+                        "Switching to software rendering"
+                    };
                     events.send(SessionEvent::Reconnecting {
                         attempt: 1,
                         retry_in: Duration::ZERO,
-                        reason: "Switching to software video decoding".to_owned(),
+                        reason: message.to_owned(),
                     });
                     continue;
                 }

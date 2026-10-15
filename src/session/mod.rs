@@ -192,8 +192,8 @@ pub struct Rendering {
 }
 
 impl Rendering {
-    /// Graphics pipeline: `hardware` means VA-API decoding with GPU surfaces and composition.
-    /// `video` is the latest H.264 flavour decoded, if any.
+    /// Graphics pipeline: `hardware` means GPU surfaces and composition (with VA-API decoding
+    /// for H.264). `video` is the latest H.264 flavour decoded, if any.
     pub fn for_pipeline(hardware: bool, video: Option<Codec>, fallback: Option<String>) -> Self {
         Self {
             engine: if hardware { Engine::Gpu } else { Engine::Cpu },
@@ -236,7 +236,7 @@ impl Rendering {
                 "H.264 4:4:4 decoded by OpenH264 on the CPU, with full color detail."
             }
             (Engine::Gpu, _) => {
-                "Drawn on the GPU. Hardware H.264 decoding starts when the server sends video."
+                "Lossless graphics codecs, decoded on the CPU and drawn on the GPU."
             }
             (Engine::Cpu, Codec::H264) => "H.264 decoded by OpenH264 on the CPU.",
             (Engine::Cpu, Codec::Lossless) => "Lossless graphics codecs, decoded on the CPU.",
