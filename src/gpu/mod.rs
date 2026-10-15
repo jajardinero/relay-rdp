@@ -28,6 +28,10 @@ pub struct GpuImage {
 const STAGING_CHUNK: u64 = 8 << 20;
 /// A batch that has staged this much upload data is submitted without waiting for the frame end.
 const MAX_BATCH_BYTES: u64 = 64 << 20;
+/// Uploads this large are copied into the image; smaller ones are drawn as quads.
+const DIRECT_UPLOAD_BYTES: usize = 1 << 20;
+/// Pending quads are drawn once their pixels reach this size.
+const MAX_QUAD_BYTES: usize = 16 << 20;
 
 pub struct GpuContext {
     pub device: wgpu::Device,
@@ -39,7 +43,7 @@ pub struct GpuContext {
     /// Staging area for copies within one image, which wgpu can't do directly.
     scratch: Mutex<Option<Arc<GpuImage>>>,
     conversion: wgpu::RenderPipeline,
-    fill: wgpu::RenderPipeline,
+    quads: wgpu::RenderPipeline,
     avc444: Avc444Pipelines,
     failure: Arc<Mutex<Option<String>>>,
 }
@@ -53,7 +57,25 @@ struct Batch {
     staged: u64,
     /// One converted row on its way to staging memory, which is write-only.
     line: Vec<u8>,
+    pending: Quads,
 }
+
+/// Fills and small uploads waiting to be drawn into one image, as instanced quads in a single
+/// render pass. Unlike copies into the same image, draws need no barrier between them.
+#[derive(Default)]
+struct Quads {
+    target: Option<Arc<GpuImage>>,
+    /// x, y, width, height, kind, and a packed RGBA color (fills) or the first word of the
+    /// quad's pixels (uploads); see `quads.wgsl`.
+    items: Vec<[u32; 8]>,
+    /// Uploaded pixels as RGBA, rows packed.
+    pixels: Vec<u8>,
+    /// The buffer the shaders read, reused while it is big enough.
+    storage: Option<(wgpu::Buffer, wgpu::BindGroup)>,
+}
+
+const FILL: u32 = 0;
+const PIXELS: u32 = 1;
 
 struct Avc444Pipelines {
     layout: wgpu::BindGroupLayout,
@@ -205,8 +227,18 @@ fn interop_node(device: &wgpu::Device) -> anyhow::Result<String> {
 }
 
 impl GpuContext {
-    pub fn new(state: &RenderState) -> Arc<Self> {
-        Self::from_device(state.device.clone(), state.queue.clone())
+    pub fn new(state: &RenderState) -> Option<Arc<Self>> {
+        let storage = wgpu::DownlevelFlags::VERTEX_STORAGE | wgpu::DownlevelFlags::FRAGMENT_STORAGE;
+        if !state
+            .adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(storage)
+        {
+            tracing::info!("GPU drawing unavailable: shaders cannot read storage buffers");
+            return None;
+        }
+        Some(Self::from_device(state.device.clone(), state.queue.clone()))
     }
 
     /// Drawing needs only the device; VA-API decoding also needs DMA-BUF interop.
@@ -271,16 +303,11 @@ impl GpuContext {
             cache: None,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Solid fill"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("fill.wgsl").into()),
+            label: Some("RDP quads"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("quads.wgsl").into()),
         });
-        let constant = wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::Constant,
-            dst_factor: wgpu::BlendFactor::Zero,
-            operation: wgpu::BlendOperation::Add,
-        };
-        let fill = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Solid fill"),
+        let quads = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("RDP quads"),
             layout: None,
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -293,10 +320,7 @@ impl GpuContext {
                 entry_point: Some("fragment"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState {
-                        color: constant,
-                        alpha: constant,
-                    }),
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -319,10 +343,11 @@ impl GpuContext {
                 belt,
                 staged: 0,
                 line: Vec::new(),
+                pending: Quads::default(),
             }),
             scratch: Mutex::new(None),
             conversion,
-            fill,
+            quads,
             avc444,
             failure,
         }
@@ -370,7 +395,7 @@ impl GpuContext {
         hold: impl Send + 'static,
     ) -> anyhow::Result<()> {
         let mut batch = self.batch.lock();
-        let recorded = Self::finish_batch(&mut batch);
+        let recorded = self.finish_batch(&mut batch);
         self.submit_buffers(recorded.into_iter().chain([encoder.finish()]), hold)
     }
 
@@ -381,14 +406,15 @@ impl GpuContext {
     }
 
     fn flush_batch(&self, batch: &mut Batch) -> anyhow::Result<()> {
-        match Self::finish_batch(batch) {
+        match self.finish_batch(batch) {
             Some(buffer) => self.submit_buffers([buffer], ()),
             None => Ok(()),
         }
     }
 
     /// Ends the batch; the caller submits the result while still holding the batch lock.
-    fn finish_batch(batch: &mut Batch) -> Option<wgpu::CommandBuffer> {
+    fn finish_batch(&self, batch: &mut Batch) -> Option<wgpu::CommandBuffer> {
+        self.draw_quads(batch);
         let encoder = batch.encoder.take()?;
         batch.belt.finish_and_recall_on_submit(&encoder);
         batch.staged = 0;
@@ -420,10 +446,122 @@ impl GpuContext {
         Ok(())
     }
 
-    /// Records commands into the current batch.
+    /// Records commands into the current batch, after the pending quads.
     fn record<R>(&self, commands: impl FnOnce(&mut wgpu::CommandEncoder) -> R) -> R {
         let mut batch = self.batch.lock();
+        self.draw_quads(&mut batch);
         commands(batch.encoder.get_or_insert_with(|| self.encoder()))
+    }
+
+    /// The pending quads, for drawing into `image`; quads pending for another image are
+    /// drawn first.
+    fn quads_for<'a>(&self, batch: &'a mut Batch, image: &Arc<GpuImage>) -> &'a mut Quads {
+        if batch
+            .pending
+            .target
+            .as_ref()
+            .is_some_and(|target| !Arc::ptr_eq(target, image))
+        {
+            self.draw_quads(batch);
+        }
+        batch
+            .pending
+            .target
+            .get_or_insert_with(|| Arc::clone(image));
+        &mut batch.pending
+    }
+
+    /// Records the pending quads as one render pass. Their data reaches the GPU in one copy.
+    fn draw_quads(&self, batch: &mut Batch) {
+        let Batch {
+            encoder,
+            belt,
+            staged,
+            pending,
+            ..
+        } = batch;
+        let Some(target) = pending.target.take() else {
+            return;
+        };
+        let count = pending.items.len() as u32;
+        let first_pixel = 4 + count * 8;
+        let words: Vec<u8> = [target.width, target.height, first_pixel, 0]
+            .iter()
+            .chain(pending.items.iter().flatten())
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let size = (words.len() + pending.pixels.len()) as u64;
+        if pending
+            .storage
+            .as_ref()
+            .is_none_or(|(buffer, _)| buffer.size() < size)
+        {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("RDP quads"),
+                size: size.next_power_of_two().max(1 << 20),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RDP quads"),
+                layout: &self.quads.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            pending.storage = Some((buffer, bind));
+        }
+        let (buffer, bind) = pending.storage.as_ref().expect("just ensured");
+        let slice = belt.allocate(
+            NonZeroU64::new(size).expect("the header is not empty"),
+            NonZeroU64::new(wgpu::COPY_BUFFER_ALIGNMENT).expect("non-zero"),
+        );
+        match slice.get_mapped_range_mut() {
+            Ok(mut staging) => {
+                staging.slice(..words.len()).copy_from_slice(&words);
+                if !pending.pixels.is_empty() {
+                    staging
+                        .slice(words.len()..)
+                        .copy_from_slice(&pending.pixels);
+                }
+            }
+            Err(error) => {
+                self.failure.lock().get_or_insert_with(|| error.to_string());
+            }
+        }
+        let encoder = encoder.get_or_insert_with(|| self.encoder());
+        encoder.copy_buffer_to_buffer(slice.buffer(), slice.offset(), buffer, 0, size);
+        // A first fill covering the whole image becomes the pass's clear.
+        let clear = pending
+            .items
+            .first()
+            .filter(|q| q[4] == FILL && q[..4] == [0, 0, target.width, target.height])
+            .map(|q| {
+                let [r, g, b, a] = q[5].to_le_bytes().map(|c| f64::from(c) / 255.0);
+                wgpu::Color { r, g, b, a }
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("RDP quads"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: clear.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.quads);
+            pass.set_bind_group(0, bind, &[]);
+            pass.draw(0..6, u32::from(clear.is_some())..count);
+        }
+        *staged += size;
+        pending.items.clear();
+        pending.pixels.clear();
     }
 
     /// Records a copy of `rect` from `src` to (x, y) in `dst`, clipped to both images.
@@ -502,59 +640,34 @@ impl GpuContext {
         );
     }
 
-    pub fn clear(&self, image: &GpuImage, rgba: [u8; 4]) {
+    pub fn clear(&self, image: &Arc<GpuImage>, rgba: [u8; 4]) {
         self.fill(image, &[Rect::new(0, 0, image.width, image.height)], rgba);
     }
 
-    /// Records solid fills of `rects`, in one render pass.
-    pub fn fill(&self, image: &GpuImage, rects: &[Rect], rgba: [u8; 4]) {
+    /// Records solid fills of `rects`.
+    pub fn fill(&self, image: &Arc<GpuImage>, rects: &[Rect], rgba: [u8; 4]) {
+        let rects: Vec<Rect> = rects
+            .iter()
+            .filter_map(|r| r.clip(image.width, image.height))
+            .collect();
         if rects.is_empty() {
             return;
         }
-        let [r, g, b, a] = rgba.map(|c| f64::from(c) / 255.0);
-        let color = wgpu::Color { r, g, b, a };
-        let whole = rects
-            .iter()
-            .any(|r| r.x == 0 && r.y == 0 && r.w >= image.width && r.h >= image.height);
-        let load = if whole {
-            wgpu::LoadOp::Clear(color)
-        } else {
-            wgpu::LoadOp::Load
-        };
-        self.record(|encoder| {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("RDP solid fill"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &image.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            if whole {
-                return;
-            }
-            pass.set_pipeline(&self.fill);
-            pass.set_blend_constant(color);
-            for rect in rects
+        let color = u32::from_le_bytes(rgba);
+        let mut batch = self.batch.lock();
+        let quads = self.quads_for(&mut batch, image);
+        quads.items.extend(
+            rects
                 .iter()
-                .filter_map(|r| r.clip(image.width, image.height))
-            {
-                pass.set_scissor_rect(rect.x, rect.y, rect.w, rect.h);
-                pass.draw(0..3, 0..1);
-            }
-        });
+                .map(|r| [r.x, r.y, r.w, r.h, FILL, color, 0, 0]),
+        );
     }
 
     /// Records an upload of `rect` (clipped to the image). `row(i, pixels)` fills row `i` of
-    /// the clipped rect as RGBA; rows go from there into staging memory with one copy each.
+    /// the clipped rect as RGBA.
     pub fn upload(
         &self,
-        image: &GpuImage,
+        image: &Arc<GpuImage>,
         rect: Rect,
         mut row: impl FnMut(usize, &mut [u8]),
     ) -> anyhow::Result<()> {
@@ -562,15 +675,53 @@ impl GpuContext {
             return Ok(());
         };
         let row_bytes = rect.w as usize * 4;
+        let bytes = row_bytes * rect.h as usize;
+        let mut batch = self.batch.lock();
+        if bytes >= DIRECT_UPLOAD_BYTES {
+            self.draw_quads(&mut batch);
+            self.copy_upload(&mut batch, image, rect, row)?;
+        } else {
+            let quads = self.quads_for(&mut batch, image);
+            let start = quads.pixels.len();
+            quads.pixels.resize(start + bytes, 0);
+            for (i, line) in quads.pixels[start..]
+                .chunks_exact_mut(row_bytes)
+                .enumerate()
+            {
+                row(i, line);
+            }
+            let first = (start / 4) as u32;
+            quads
+                .items
+                .push([rect.x, rect.y, rect.w, rect.h, PIXELS, first, 0, 0]);
+            if quads.pixels.len() >= MAX_QUAD_BYTES {
+                self.draw_quads(&mut batch);
+            }
+        }
+        if batch.staged >= MAX_BATCH_BYTES {
+            self.flush_batch(&mut batch)?;
+        }
+        Ok(())
+    }
+
+    /// Records a copy of `rect`'s pixels into the image, through staging memory.
+    fn copy_upload(
+        &self,
+        batch: &mut Batch,
+        image: &GpuImage,
+        rect: Rect,
+        mut row: impl FnMut(usize, &mut [u8]),
+    ) -> anyhow::Result<()> {
+        let row_bytes = rect.w as usize * 4;
         let pitch = (rect.w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let size = u64::from(pitch) * u64::from(rect.h);
-        let mut batch = self.batch.lock();
         let Batch {
             encoder,
             belt,
             staged,
             line,
-        } = &mut *batch;
+            ..
+        } = batch;
         let encoder = encoder.get_or_insert_with(|| self.encoder());
         let slice = belt.allocate(
             NonZeroU64::new(size).expect("clipped rects are not empty"),
@@ -613,9 +764,6 @@ impl GpuContext {
             },
         );
         *staged += size;
-        if *staged >= MAX_BATCH_BYTES {
-            self.flush_batch(&mut batch)?;
-        }
         Ok(())
     }
 
@@ -1147,6 +1295,39 @@ pub(crate) mod tests {
         context.copy(image, Rect::new(0, 0, 32, 24), &output, 8, 8);
         let result = read(&context, &output);
         assert_eq!(&result[(8 * 64 + 8) * 4..(8 * 64 + 9) * 4], &cpu.data[..4]);
+    }
+
+    /// Large uploads are copied in, small ones and fills are drawn; both keep their order.
+    #[test]
+    #[ignore = "requires a Vulkan GPU and access to /dev/dri"]
+    fn gpu_large_uploads_keep_order_with_quads() {
+        let context = context().unwrap();
+        let error = Arc::new(Mutex::new(None));
+        let (w, h) = (640, 480);
+        assert!(w as usize * h as usize * 4 >= DIRECT_UPLOAD_BYTES);
+        let mut gpu = Surface::new_gpu(w, h, context.clone(), error.clone());
+        let mut cpu = Surface::new(w, h);
+        let picture: Vec<u8> = (0..w * h * 4).map(|i| (i % 251) as u8).collect();
+        for surface in [&mut cpu, &mut gpu] {
+            surface.fill(Rect::new(10, 10, 100, 100), [1, 2, 3, 255]);
+            surface.write(
+                Rect::new(0, 0, w, h),
+                &picture,
+                w as usize * 4,
+                SrcFormat::Rgbx,
+            );
+            surface.write(Rect::new(5, 5, 4, 4), &[9; 64], 16, SrcFormat::Rgba);
+            surface.fill(Rect::new(600, 400, 100, 100), [4, 5, 6, 255]);
+            surface.write(
+                Rect::new(0, 100, w, h - 100),
+                &picture,
+                w as usize * 4,
+                SrcFormat::Bgra,
+            );
+            surface.fill(Rect::new(1, 1, 1, 1), [7, 8, 9, 255]);
+        }
+        assert_eq!(read(&context, &gpu.gpu.as_ref().unwrap().image), cpu.data);
+        assert!(error.lock().is_none(), "{:?}", error.lock());
     }
 
     fn thread_cpu() -> Duration {

@@ -127,7 +127,7 @@ impl App {
         ));
         pollster::block_on(painter.set_window(ViewportId::ROOT, Some(Arc::clone(&window))))?;
         if let Some(rs) = painter.render_state() {
-            self.ui.gpu = Some(crate::gpu::GpuContext::new(&rs));
+            self.ui.gpu = crate::gpu::GpuContext::new(&rs);
             let info = rs.adapter.get_info();
             tracing::info!(adapter = %info.name, backend = ?info.backend, "graphics ready");
         }
