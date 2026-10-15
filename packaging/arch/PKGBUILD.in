@@ -1,0 +1,79 @@
+# Maintainer: Jerome Jardinero
+# Local-source recipe. Generate PKGBUILD with scripts/package-arch.sh.
+pkgname=relay
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Native Wayland RDP client with GPU video decoding'
+arch=('x86_64')
+license=('MIT OR Apache-2.0' 'OFL-1.1')
+depends=(
+  'alsa-lib'
+  'ffmpeg'
+  'glibc'
+  'hicolor-icon-theme'
+  'libgcc'
+  'libglvnd'
+  'libva'
+  'libxkbcommon'
+  'openh264'
+  'vulkan-icd-loader'
+  'wayland'
+  'zlib'
+  'libavcodec.so'
+  'libavutil.so'
+  'libva.so'
+  'libopenh264.so=8-64'
+)
+makedepends=('cargo' 'pkgconf')
+checkdepends=('desktop-file-utils')
+optdepends=(
+  'vulkan-driver: Vulkan rendering and GPU frame import'
+  'libva-driver: hardware H.264 video decoding'
+  'org.freedesktop.secrets: saving connection passwords in a keyring'
+)
+# Cargo.toml already enables thin LTO. Avoid a second native LTO setting and
+# avoid generating a separate debug package on hosts that enable one globally.
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('@SOURCE_SHA256@')
+
+prepare() {
+  cd "$srcdir/$pkgname-$pkgver"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
+  cargo build --release --frozen --bin relay
+}
+
+check() {
+  cd "$srcdir/$pkgname-$pkgver"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
+  cargo test --release --frozen --bin relay
+  desktop-file-validate packaging/arch/relay.desktop
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
+  install -Dm755 "$CARGO_TARGET_DIR/release/relay" "$pkgdir/usr/bin/relay"
+  install -Dm644 packaging/arch/relay.desktop "$pkgdir/usr/share/applications/relay.desktop"
+  install -Dm644 packaging/arch/relay.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/relay.svg"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/relay/README.md"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/relay/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/relay/LICENSE-APACHE"
+  install -Dm644 assets/fonts/OFL.txt "$pkgdir/usr/share/licenses/relay/fonts-OFL.txt"
+  local crate file
+  for crate in ironrdp-connector ironrdp-egfx; do
+    for file in LICENSE-MIT LICENSE-APACHE; do
+      install -Dm644 "vendor/$crate/$file" "$pkgdir/usr/share/licenses/relay/$crate/$file"
+    done
+    if [[ -f "vendor/$crate/THIRD_PARTY_NOTICES" ]]; then
+      install -Dm644 "vendor/$crate/THIRD_PARTY_NOTICES" \
+        "$pkgdir/usr/share/licenses/relay/$crate/THIRD_PARTY_NOTICES"
+    fi
+  done
+}

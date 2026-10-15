@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Relay
+GenericName=Remote Desktop Client
+Comment=Connect to remote Windows desktops over RDP on Wayland
+Exec=relay
+Icon=relay
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=RDP;Remote;Desktop;Windows;Wayland;

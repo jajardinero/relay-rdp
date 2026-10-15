@@ -1,0 +1,102 @@
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "A fast, reliable remote desktop (RDP) client for Linux"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# RDP protocol stack (IronRDP). Versions are pinned to one coherent release set.
+ironrdp-connector = "0.10"
+ironrdp-session = "0.11"
+ironrdp-tokio = { version = "0.10", features = ["reqwest"] }
+ironrdp-tls = { version = "0.2", features = ["rustls-ring"] }
+ironrdp-pdu = "0.9"
+ironrdp-core = "0.2"
+ironrdp-graphics = "0.9"
+ironrdp-input = "0.7"
+ironrdp-svc = "0.8"
+ironrdp-dvc = "0.8"
+ironrdp-displaycontrol = "0.8"
+
+# UI
+egui = "0.36"
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links", "wayland"] }
+egui-wgpu = { version = "0.36", features = ["winit", "wayland"] }
+winit = { version = "0.30.13", default-features = false, features = ["wayland", "wayland-dlopen", "rwh_06"] }
+egui-phosphor = "0.14"
+pollster = "1"
+
+ash = "0.38"
+wgpu-hal = { version = "30", features = ["vulkan"] }
+
+# Runtime & utilities
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+socket2 = { version = "0.6", features = ["all"] }
+smallvec = "1.15"
+parking_lot = "0.12"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+directories = "6"
+sha2 = "0.10"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+gethostname = "1"
+zeroize = "1"
+dark-light = "3"
+keyring = "4"
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+openh264 = { version = "0.9", default-features = false, features = ["libloading"] }
+ironrdp-egfx = "0.3"
+ironrdp-cliprdr = "0.7"
+ironrdp-rdpsnd = "0.9"
+ironrdp-rdpsnd-native = { version = "0.7", default-features = false }
+ironrdp-rdpdr = "0.7"
+ironrdp-rdpdr-native = "0.7"
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control", "image-data"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+raw-window-handle = "0.6"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+ironrdp-rdpfile = "0.1"
+ironrdp-propertyset = "0.1"
+rfd = "0.17"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[profile.dev]
+opt-level = 1
+
+# Codecs (RemoteFX, H.264, ClearCodec, TLS) are unusably slow unoptimised, so
+# dependencies are always built with full optimisation, even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[dev-dependencies]
+async-trait = "0.1"
+ironrdp-server = { version = "0.13", features = ["helper", "egfx"] }
+rcgen = "0.14.10"
+tokio = { version = "1", features = ["full"] }
+
+# Backport of upstream IronRDP's `support_dyn_vc_gfx_protocol` connector option, required for the
+# graphics pipeline (H.264). Drop once an ironrdp-connector release includes it.
+[patch.crates-io]
+ironrdp-connector = { path = "vendor/ironrdp-connector" }
+
+ironrdp-egfx = { path = "vendor/ironrdp-egfx" }

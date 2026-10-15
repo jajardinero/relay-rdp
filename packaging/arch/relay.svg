@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Relay</title>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#151a26"/>
+  <g fill="none" stroke="#6ea8fe" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="23" y="28" width="82" height="57" rx="7"/>
+    <path d="M64 85v15m-17 0h34M43 56h42m-10-10 10 10-10 10"/>
+  </g>
+</svg>
