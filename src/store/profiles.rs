@@ -169,8 +169,56 @@ impl GraphicsMode {
     }
 }
 
+/// How good a link the server should assume. The server tunes video quality, frame rate and
+/// effects to it; picking one in the editor also sets the visual-effect toggles.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Quality {
+    /// LAN or office network.
+    #[default]
+    Best,
+    /// Home broadband or VPN.
+    Balanced,
+    /// Mobile hotspots and slow links.
+    LowBandwidth,
+}
+
+impl Quality {
+    pub const ALL: [Self; 3] = [Self::Best, Self::Balanced, Self::LowBandwidth];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Best => "Best",
+            Self::Balanced => "Balanced",
+            Self::LowBandwidth => "Low bandwidth",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Best => "Office network or LAN. Full visual effects.",
+            Self::Balanced => "Home broadband or VPN. Skips effects that cost bandwidth.",
+            Self::LowBandwidth => "Mobile or slow links. Fewer effects and lighter video.",
+        }
+    }
+
+    /// Sets the visual-effect toggles to suit this preset.
+    pub fn apply_visuals(self, experience: &mut ExperienceSettings) {
+        let (wallpaper, animations, font_smoothing) = match self {
+            Self::Best => (true, true, true),
+            Self::Balanced => (false, true, true),
+            Self::LowBandwidth => (false, false, false),
+        };
+        experience.wallpaper = wallpaper;
+        experience.animations = animations;
+        experience.font_smoothing = font_smoothing;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExperienceSettings {
+    #[serde(default)]
+    pub quality: Quality,
     #[serde(default)]
     pub graphics: GraphicsMode,
     #[serde(default)]
@@ -184,6 +232,7 @@ pub struct ExperienceSettings {
 impl Default for ExperienceSettings {
     fn default() -> Self {
         Self {
+            quality: Quality::default(),
             graphics: GraphicsMode::default(),
             wallpaper: false,
             animations: true,
@@ -412,6 +461,7 @@ mod tests {
         let mut profile = HostProfile::new("build-01.corp.local", 3390);
         profile.username = "jdoe".into();
         profile.domain = "CORP".into();
+        profile.experience.quality = Quality::LowBandwidth;
         profile.devices.shared_folders.push(SharedFolder {
             name: "Downloads".into(),
             path: "/home/jdoe/Downloads".into(),
@@ -436,5 +486,29 @@ mod tests {
         assert!(host.devices.clipboard);
         assert!(host.advanced.auto_reconnect);
         assert_eq!(host.advanced.keyboard_layout, DEFAULT_KEYBOARD_LAYOUT);
+        assert_eq!(host.experience.quality, Quality::Best);
+    }
+
+    #[test]
+    fn quality_presets_set_visual_effects() {
+        let mut experience = ExperienceSettings::default();
+        Quality::LowBandwidth.apply_visuals(&mut experience);
+        assert!(!experience.wallpaper && !experience.animations && !experience.font_smoothing);
+        Quality::Balanced.apply_visuals(&mut experience);
+        assert!(!experience.wallpaper && experience.animations && experience.font_smoothing);
+        Quality::Best.apply_visuals(&mut experience);
+        assert!(experience.wallpaper && experience.animations && experience.font_smoothing);
+        // The preset only touches visuals.
+        assert_eq!(experience.graphics, GraphicsMode::default());
+    }
+
+    #[test]
+    fn quality_serializes_in_kebab_case() {
+        let text = toml::to_string(&ExperienceSettings {
+            quality: Quality::LowBandwidth,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(text.contains("quality = \"low-bandwidth\""), "{text}");
     }
 }

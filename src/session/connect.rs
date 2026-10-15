@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ironrdp_connector::{ClientConnector, ConnectionResult, Credentials, DesktopSize, ServerName};
 use ironrdp_displaycontrol::client::DisplayControlClient;
-use ironrdp_pdu::gcc::KeyboardType;
+use ironrdp_pdu::gcc::{ConnectionType, KeyboardType};
 use ironrdp_pdu::nego::NegoRequestData;
 use ironrdp_pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
 use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -25,7 +25,7 @@ use super::{
     SessionEvent, Stage,
 };
 use crate::store::known_hosts::{self, Trust};
-use crate::store::profiles::AudioMode;
+use crate::store::profiles::{AudioMode, ExperienceSettings, Quality};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -231,18 +231,14 @@ fn build_connector(
     let audio = params.devices.audio == AudioMode::Local;
     let desktop = desktop.normalized();
 
-    let mut performance_flags =
-        PerformanceFlags::DISABLE_CURSOR_SHADOW | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION;
-    if !params.experience.wallpaper {
-        performance_flags |= PerformanceFlags::DISABLE_WALLPAPER;
-    }
-    if !params.experience.animations {
-        performance_flags |=
-            PerformanceFlags::DISABLE_MENUANIMATIONS | PerformanceFlags::DISABLE_FULLWINDOWDRAG;
-    }
-    if params.experience.font_smoothing {
-        performance_flags |= PerformanceFlags::ENABLE_FONT_SMOOTHING;
-    }
+    let performance_flags = performance_flags(&params.experience);
+    let connection_type = connection_type(params.experience.quality);
+    tracing::debug!(
+        quality = ?params.experience.quality,
+        ?connection_type,
+        ?performance_flags,
+        "connection quality"
+    );
 
     let load_balance_info = params.advanced.load_balance_info.trim();
     let request_data = (!load_balance_info.is_empty())
@@ -299,6 +295,7 @@ fn build_connector(
         pointer_software_rendering: false,
         multitransport_flags: None,
         support_dyn_vc_gfx_protocol: gfx.is_some(),
+        connection_type,
     };
 
     let mut drdynvc = ironrdp_dvc::DrdynvcClient::new()
@@ -333,6 +330,35 @@ fn build_connector(
     }
 
     connector
+}
+
+/// Visual effects the server should render, from the profile's toggles and quality.
+fn performance_flags(experience: &ExperienceSettings) -> PerformanceFlags {
+    let mut flags = PerformanceFlags::DISABLE_CURSOR_SHADOW;
+    if experience.quality != Quality::LowBandwidth {
+        flags |= PerformanceFlags::ENABLE_DESKTOP_COMPOSITION;
+    }
+    if !experience.wallpaper {
+        flags |= PerformanceFlags::DISABLE_WALLPAPER;
+    }
+    if !experience.animations {
+        flags |=
+            PerformanceFlags::DISABLE_MENUANIMATIONS | PerformanceFlags::DISABLE_FULLWINDOWDRAG;
+    }
+    if experience.font_smoothing {
+        flags |= PerformanceFlags::ENABLE_FONT_SMOOTHING;
+    }
+    flags
+}
+
+/// The link type we report to the server, which tunes video quality and frame rate to it.
+/// Never auto-detect: that needs bandwidth probes IronRDP doesn't answer yet.
+fn connection_type(quality: Quality) -> ConnectionType {
+    match quality {
+        Quality::Best => ConnectionType::Lan,
+        Quality::Balanced => ConnectionType::BroadbandHigh,
+        Quality::LowBandwidth => ConnectionType::BroadbandLow,
+    }
 }
 
 /// The local hostname, as the server shows it (at most 15 characters).
@@ -404,4 +430,51 @@ fn format_time(time: &x509_cert::time::Time) -> String {
     let secs = i64::try_from(time.to_unix_duration().as_secs()).unwrap_or(i64::MAX);
     chrono::DateTime::from_timestamp(secs, 0)
         .map_or_else(|| time.to_string(), |d| d.format("%B %-d, %Y").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_maps_to_connection_type() {
+        assert_eq!(connection_type(Quality::Best), ConnectionType::Lan);
+        assert_eq!(
+            connection_type(Quality::Balanced),
+            ConnectionType::BroadbandHigh
+        );
+        assert_eq!(
+            connection_type(Quality::LowBandwidth),
+            ConnectionType::BroadbandLow
+        );
+    }
+
+    #[test]
+    fn performance_flags_follow_toggles_and_quality() {
+        let mut experience = ExperienceSettings::default();
+        Quality::Best.apply_visuals(&mut experience);
+        let best = performance_flags(&experience);
+        assert!(best.contains(
+            PerformanceFlags::ENABLE_DESKTOP_COMPOSITION | PerformanceFlags::ENABLE_FONT_SMOOTHING
+        ));
+        assert!(!best.intersects(
+            PerformanceFlags::DISABLE_WALLPAPER | PerformanceFlags::DISABLE_MENUANIMATIONS
+        ));
+
+        experience.quality = Quality::LowBandwidth;
+        Quality::LowBandwidth.apply_visuals(&mut experience);
+        let low = performance_flags(&experience);
+        assert!(!low.intersects(
+            PerformanceFlags::ENABLE_DESKTOP_COMPOSITION | PerformanceFlags::ENABLE_FONT_SMOOTHING
+        ));
+        assert!(low.contains(
+            PerformanceFlags::DISABLE_WALLPAPER
+                | PerformanceFlags::DISABLE_MENUANIMATIONS
+                | PerformanceFlags::DISABLE_FULLWINDOWDRAG
+        ));
+
+        // Toggles changed after picking a preset still win.
+        experience.font_smoothing = true;
+        assert!(performance_flags(&experience).contains(PerformanceFlags::ENABLE_FONT_SMOOTHING));
+    }
 }

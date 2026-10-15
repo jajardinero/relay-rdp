@@ -5,7 +5,9 @@ use std::path::Path;
 
 use ironrdp_propertyset::PropertySet;
 
-use super::profiles::{AudioMode, DEFAULT_PORT, HostProfile, ResolutionMode, parse_endpoint};
+use super::profiles::{
+    AudioMode, DEFAULT_PORT, HostProfile, Quality, ResolutionMode, parse_endpoint,
+};
 
 pub struct Imported {
     pub profile: HostProfile,
@@ -100,6 +102,8 @@ pub fn import(text: &str) -> Option<Imported> {
         profile.advanced.auto_reconnect = false;
     }
 
+    apply_quality(&props, &mut profile);
+
     if str_of("gatewayhostname").is_some()
         && int_of("gatewayusagemethod").is_some_and(|m| m != 0 && m != 4)
     {
@@ -119,6 +123,36 @@ pub fn import(text: &str) -> Option<Imported> {
         profile,
         unsupported,
     })
+}
+
+/// The file's connection speed picks a quality preset; explicit effect settings then win.
+fn apply_quality(props: &PropertySet, profile: &mut HostProfile) {
+    let int_of = |key: &str| props.get::<i64>(key);
+    let experience = &mut profile.experience;
+
+    let quality = match int_of("connection type") {
+        // Modem, low-speed broadband, satellite.
+        Some(1..=3) => Some(Quality::LowBandwidth),
+        // High-speed broadband, WAN.
+        Some(4 | 5) => Some(Quality::Balanced),
+        // LAN, auto-detect.
+        Some(6 | 7) => Some(Quality::Best),
+        _ => None,
+    };
+    if let Some(quality) = quality {
+        experience.quality = quality;
+        quality.apply_visuals(experience);
+    }
+
+    if let Some(off) = int_of("disable wallpaper") {
+        experience.wallpaper = off == 0;
+    }
+    if let Some(off) = int_of("disable menu anims") {
+        experience.animations = off == 0;
+    }
+    if let Some(on) = int_of("allow font smoothing") {
+        experience.font_smoothing = on != 0;
+    }
 }
 
 fn apply_display(props: &PropertySet, profile: &mut HostProfile) {
@@ -229,6 +263,27 @@ mod tests {
         assert_eq!(imported.profile.endpoint(), "127.0.0.1:3390");
         assert_eq!(imported.profile.username, "test");
         assert_eq!(imported.profile.devices.audio, AudioMode::Off);
+    }
+
+    #[test]
+    fn connection_speed_picks_quality_and_explicit_effects_win() {
+        let low = import("full address:s:h\nconnection type:i:2\n").unwrap();
+        let e = &low.profile.experience;
+        assert_eq!(e.quality, Quality::LowBandwidth);
+        assert!(!e.wallpaper && !e.animations && !e.font_smoothing);
+
+        let wan = import("full address:s:h\nconnection type:i:5\nallow font smoothing:i:0\ndisable wallpaper:i:0\n")
+            .unwrap();
+        let e = &wan.profile.experience;
+        assert_eq!(e.quality, Quality::Balanced);
+        assert!(e.wallpaper && e.animations && !e.font_smoothing);
+
+        // No connection type: the default quality and effects are kept.
+        let plain = import("full address:s:h\n").unwrap();
+        assert_eq!(
+            plain.profile.experience,
+            HostProfile::new("h", 3389).experience
+        );
     }
 
     #[test]

@@ -266,6 +266,13 @@ pub struct Config {
     ///
     /// [\[MS-RDPEGFX\] 1.5.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/da5c75f9-cd99-450c-98c4-014a496942b0
     pub support_dyn_vc_gfx_protocol: bool,
+
+    /// The connection type advertised in the client core data (`connectionType`).
+    ///
+    /// Servers use it to tune graphics quality, frame rate and visual effects for the link.
+    ///
+    /// Relay patch: backport of the upstream field of the same name (not yet released).
+    pub connection_type: gcc::ConnectionType,
 }
 
 ironrdp_core::assert_impl!(Config: Send, Sync);

@@ -94,8 +94,9 @@ ironrdp-server = { version = "0.13", features = ["helper", "egfx"] }
 rcgen = "0.14.10"
 tokio = { version = "1", features = ["full"] }
 
-# Backport of upstream IronRDP's `support_dyn_vc_gfx_protocol` connector option, required for the
-# graphics pipeline (H.264). Drop once an ironrdp-connector release includes it.
+# Backports of upstream IronRDP's `support_dyn_vc_gfx_protocol` (required for the graphics
+# pipeline / H.264) and `connection_type` (the Quality preset) connector options. Drop once an
+# ironrdp-connector release includes them.
 [patch.crates-io]
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 

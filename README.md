@@ -37,8 +37,14 @@ Addresses that match a saved host use its settings and saved password. A `.rdp`
 file opened from the command line is used as is and is not saved. To keep one,
 use **Import .rdp file** in the host library: it opens the file in the host
 editor so you can review and save it. Relay reads the address, user name,
-domain, display, audio, clipboard and load-balancing settings, and lists any
-setting it can't use yet, such as RD Gateway or RemoteApp.
+domain, display, connection speed, visual effects, audio, clipboard and
+load-balancing settings, and lists any setting it can't use yet, such as RD
+Gateway or RemoteApp.
+
+Each host has a **Quality** setting under **Experience**: Best (office network),
+Balanced (home broadband or VPN) or Low bandwidth (mobile or slow links). It tells
+the server what kind of link you're on, so it can adjust video quality and frame
+rate, and sets the wallpaper, animation and font-smoothing options to match.
 
 | Shortcut | Action |
 | --- | --- |

@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 use super::theme::{self, Palette, radius, size};
 use super::widgets;
 use crate::store::profiles::{
-    AudioMode, GraphicsMode, HostProfile, ProfileStore, ResolutionMode, SharedFolder,
+    AudioMode, GraphicsMode, HostProfile, ProfileStore, Quality, ResolutionMode, SharedFolder,
 };
 
 pub enum PasswordChange {
@@ -460,7 +460,27 @@ fn display(ui: &mut Ui, state: &mut EditorState) {
 }
 
 fn experience(ui: &mut Ui, state: &mut EditorState) {
+    let p = Palette::of(ui);
     let experience = &mut state.draft.experience;
+    widgets::section_label(ui, "Quality");
+    ui.add_space(2.0);
+    for quality in Quality::ALL {
+        if choice_card(
+            ui,
+            experience.quality == quality,
+            quality.label(),
+            quality.description(),
+        ) {
+            experience.quality = quality;
+            quality.apply_visuals(experience);
+        }
+    }
+    ui.label(
+        RichText::new("Also sets the options below. You can still change them.")
+            .size(size::SMALL)
+            .color(p.muted),
+    );
+    ui.add_space(14.0);
     widgets::section_label(ui, "Graphics");
     ui.add_space(2.0);
     for mode in GraphicsMode::ALL {

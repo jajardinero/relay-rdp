@@ -779,7 +779,7 @@ fn create_gcc_blocks<'a>(
 ) -> ConnectorResult<gcc::ClientGccBlocks> {
     use ironrdp_pdu::gcc::{
         ClientCoreData, ClientCoreOptionalData, ClientEarlyCapabilityFlags, ClientGccBlocks, ClientNetworkData,
-        ClientSecurityData, ColorDepth, ConnectionType, EncryptionMethod, HighColorDepth, MonitorOrientation,
+        ClientSecurityData, ColorDepth, EncryptionMethod, HighColorDepth, MonitorOrientation,
         RdpVersion, SecureAccessSequence, SupportedColorDepths,
     };
 
@@ -851,7 +851,7 @@ fn create_gcc_blocks<'a>(
                     Some(early_capability_flags)
                 },
                 dig_product_id: Some(config.dig_product_id.clone()),
-                connection_type: Some(ConnectionType::Lan),
+                connection_type: Some(config.connection_type),
                 server_selected_protocol: Some(selected_protocol),
                 desktop_physical_width: Some(0),  // 0 per FreeRDP
                 desktop_physical_height: Some(0), // 0 per FreeRDP
