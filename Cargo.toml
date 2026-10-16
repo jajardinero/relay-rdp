@@ -98,8 +98,9 @@ rcgen = "0.14.10"
 tokio = { version = "1", features = ["full"] }
 
 # Backports of upstream IronRDP's `support_dyn_vc_gfx_protocol` (required for the graphics
-# pipeline / H.264) and `connection_type` (the Quality preset) connector options. Drop once an
-# ironrdp-connector release includes them.
+# pipeline / H.264) and `connection_type` (the Quality preset) connector options, and the
+# message channel block sent only to servers that accept extended client data (Windows Server
+# 2008 resets the connection otherwise). Drop once an ironrdp-connector release includes them.
 [patch.crates-io]
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 
@@ -108,3 +109,6 @@ ironrdp-pdu = { path = "vendor/ironrdp-pdu" }
 ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 
 ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
+
+# CredSSP: don't send clientNonce to servers older than CredSSP 5 (see RELAY-PATCH.md).
+sspi = { path = "vendor/sspi" }

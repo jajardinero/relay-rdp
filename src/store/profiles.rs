@@ -69,6 +69,7 @@ impl DetectedOs {
             build,
         } = self;
         let name = match (major, minor, build) {
+            (6, 0, _) => "Windows Vista or Server 2008",
             (6, 1, _) => "Windows 7 or Server 2008 R2",
             (6, 2, _) => "Windows 8 or Server 2012",
             (6, 3, _) => "Windows 8.1 or Server 2012 R2",
@@ -405,6 +406,10 @@ pub struct AdvancedSettings {
     pub load_balance_info: String,
     #[serde(default = "yes")]
     pub auto_reconnect: bool,
+    /// Also accept TLS 1.0 and RSA-key-exchange AES-CBC-SHA suites, for old servers (such as
+    /// Windows 7 or Server 2008 R2) that support nothing newer. Off: TLS 1.2 or later only.
+    #[serde(default)]
+    pub allow_legacy_tls: bool,
 }
 
 impl Default for AdvancedSettings {
@@ -413,6 +418,7 @@ impl Default for AdvancedSettings {
             keyboard_layout: DEFAULT_KEYBOARD_LAYOUT,
             load_balance_info: String::new(),
             auto_reconnect: true,
+            allow_legacy_tls: false,
         }
     }
 }

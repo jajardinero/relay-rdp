@@ -58,6 +58,13 @@ remain disabled. Both backends use the same certificate approval and saved
 fingerprint checks before sign-in. The chosen backend, TLS version, and cipher
 are recorded in Relay's logs.
 
+Old Windows computers (such as Windows 7 or Server 2008 R2 without the RDP TLS
+1.2 update) only offer TLS 1.0. For such a host, turn on **Allow legacy TLS**
+in the host editor's **Advanced** section: its OpenSSL attempt then also accepts
+TLS 1.0 and AES-CBC-SHA suites, including RSA key exchange without forward
+secrecy. The setting is per host and off by default, and a connection that uses
+it is logged as a warning. Enabling TLS 1.2 on the server is the better fix.
+
 Each host has a **Quality** setting under **Experience**: Best (office network),
 Balanced (home broadband or VPN) or Low bandwidth (mobile or slow links). It tells
 the server what kind of link you're on, so it can adjust video quality and frame

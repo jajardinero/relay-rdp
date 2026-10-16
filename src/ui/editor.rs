@@ -711,6 +711,16 @@ fn advanced(ui: &mut Ui, state: &mut EditorState) {
             widgets::toggle(ui, &mut advanced.auto_reconnect);
         },
     );
+    widgets::setting_row(
+        ui,
+        "Allow legacy TLS",
+        Some(
+            "Insecure. For old Windows computers that only offer TLS 1.0. The connection may lack forward secrecy; use only on networks you trust.",
+        ),
+        |ui| {
+            widgets::toggle(ui, &mut advanced.allow_legacy_tls);
+        },
+    );
 }
 
 /// Two fields side by side; the first takes `split` of the width.

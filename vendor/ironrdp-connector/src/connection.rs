@@ -138,6 +138,8 @@ pub struct ClientConnector {
     pub static_channels: StaticChannelSet,
     /// MCS message channel ID assigned by the server, once negotiated.
     pub message_channel_id: Option<u16>,
+    /// The flags in the server's negotiation response.
+    pub server_nego_flags: nego::ResponseFlags,
 }
 
 impl ClientConnector {
@@ -148,6 +150,7 @@ impl ClientConnector {
             client_addr,
             static_channels: StaticChannelSet::new(),
             message_channel_id: None,
+            server_nego_flags: nego::ResponseFlags::empty(),
         }
     }
 
@@ -357,6 +360,7 @@ impl Sequence for ClientConnector {
                 };
 
                 info!(?selected_protocol, ?flags, "Server confirmed connection");
+                self.server_nego_flags = flags;
 
                 if !selected_protocol.intersects(requested_protocol) {
                     return Err(reason_err!(
@@ -399,8 +403,12 @@ impl Sequence for ClientConnector {
             ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol } => {
                 debug!("Basic Settings Exchange");
 
-                let client_gcc_blocks =
-                    create_gcc_blocks(&self.config, selected_protocol, self.static_channels.values())?;
+                let client_gcc_blocks = create_gcc_blocks(
+                    &self.config,
+                    selected_protocol,
+                    self.server_nego_flags,
+                    self.static_channels.values(),
+                )?;
 
                 let connect_initial =
                     mcs::ConnectInitial::with_gcc_blocks(client_gcc_blocks).map_err(ConnectorError::decode)?;
@@ -775,6 +783,7 @@ fn respond_to_connect_time_autodetect(
 fn create_gcc_blocks<'a>(
     config: &Config,
     selected_protocol: nego::SecurityProtocol,
+    server_nego_flags: nego::ResponseFlags,
     static_channels: impl Iterator<Item = &'a StaticVirtualChannel>,
 ) -> ConnectorResult<gcc::ClientGccBlocks> {
     use ironrdp_pdu::gcc::{
@@ -810,6 +819,11 @@ fn create_gcc_blocks<'a>(
     let channels = static_channels
         .map(ironrdp_svc::make_channel_definition)
         .collect::<Vec<_>>();
+
+    // The message channel and multitransport blocks are extended client data, which a server
+    // accepts only when its negotiation response says so ([MS-RDPBCGR] 2.2.1.2.1). Servers
+    // before RDP 8 (Windows Server 2008) reset the connection when they're sent.
+    let extended = server_nego_flags.contains(nego::ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED);
 
     Ok(ClientGccBlocks {
         core: ClientCoreData {
@@ -883,9 +897,10 @@ fn create_gcc_blocks<'a>(
         // Request the MCS message channel, which carries network auto-detect
         // ([MS-RDPBCGR] 2.2.14) and the multitransport / heartbeat PDUs. The
         // server assigns its ID in Server Message Channel Data.
-        message_channel: Some(gcc::ClientMessageChannelData),
+        message_channel: extended.then_some(gcc::ClientMessageChannelData),
         multi_transport_channel: config
             .multitransport_flags
+            .filter(|_| extended)
             .map(|flags| gcc::MultiTransportChannelData { flags }),
         monitor_extended: None,
     })

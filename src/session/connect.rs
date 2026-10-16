@@ -196,7 +196,8 @@ async fn begin_secure(
             .await
             .map_err(|e| Failure::from_connector(&e, params.port))?;
         let (tcp, leftover) = framed.into_inner();
-        match tls::upgrade(tcp, &params.host, backend).await {
+        let legacy = params.advanced.allow_legacy_tls;
+        match tls::upgrade(tcp, &params.host, backend, legacy).await {
             Ok((stream, certificate)) => {
                 let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
                 let recorded = hostinfo::Recorded::new(parking_lot::Mutex::new(Some(Vec::new())));
@@ -214,7 +215,7 @@ async fn begin_secure(
             Err(error) if backend == Backend::Rustls && tls::can_retry(&error) => {
                 tracing::info!(%error, "retrying RDP negotiation with TLS compatibility backend");
             }
-            Err(error) => return Err(Failure::tls(&error)),
+            Err(error) => return Err(Failure::tls(&error, params.advanced.allow_legacy_tls)),
         }
     }
     unreachable!("the compatibility backend always returns a connection or an error")
@@ -532,8 +533,9 @@ mod tests {
             builder.set_cipher_list(cipher).unwrap();
             builder.set_min_proto_version(Some(version)).unwrap();
             builder.set_max_proto_version(Some(version)).unwrap();
-            if version == SslVersion::TLS1_1 {
-                builder.set_security_level(0); // Test server only: prove the client rejects TLS 1.1.
+            if [SslVersion::TLS1, SslVersion::TLS1_1].contains(&version) {
+                // Test server only: old TLS needs security level 0.
+                builder.set_security_level(0);
             }
             let context = builder.build();
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -562,7 +564,7 @@ mod tests {
                         if Pin::new(&mut tls).accept().await.is_err() {
                             continue;
                         }
-                        assert_eq!(tls.ssl().version_str(), "TLSv1.2");
+                        assert_eq!(tls.ssl().version2(), Some(version));
                         let cipher = tls.ssl().current_cipher().unwrap().name().to_owned();
                         let mut ping = [0u8; 4];
                         tls.read_exact(&mut ping).await.unwrap();
@@ -631,7 +633,15 @@ mod tests {
 
     async fn check_tls_server(server: TlsServer, expected_cipher: &str) {
         let params = tls_params("127.0.0.1", server.port);
-        let secure = test_secure_connection(&params).await.unwrap();
+        check_secure_connection(&params, server, expected_cipher).await;
+    }
+
+    async fn check_secure_connection(
+        params: &ConnectParams,
+        server: TlsServer,
+        expected_cipher: &str,
+    ) {
+        let secure = test_secure_connection(params).await.unwrap();
         // Both transports must hand the exact server certificate to the common pinning gate.
         assert_eq!(secure.certificate.to_der().unwrap(), server.certificate);
         assert!(ironrdp_tls::extract_tls_server_public_key(&secure.certificate).is_some());
@@ -674,6 +684,31 @@ mod tests {
         assert!(server.task.await.unwrap().is_none());
     }
 
+    /// A server that speaks only TLS 1.0 with RSA key exchange, as old Windows does: refused
+    /// unless the host allows legacy TLS.
+    #[tokio::test]
+    async fn rdp_tls_accepts_tls10_only_when_allowed() {
+        let server = TlsServer::start("AES128-SHA", SslVersion::TLS1, 2).await;
+        let params = tls_params("127.0.0.1", server.port);
+        let failure = match test_secure_connection(&params).await {
+            Ok(_) => panic!("accepted TLS 1.0 without legacy TLS"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.kind, super::super::errors::FailureKind::Security);
+        assert!(
+            failure
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("legacy TLS"))
+        );
+        assert!(server.task.await.unwrap().is_none());
+
+        let server = TlsServer::start("AES128-SHA", SslVersion::TLS1, 2).await;
+        let mut params = tls_params("127.0.0.1", server.port);
+        params.advanced.allow_legacy_tls = true;
+        check_secure_connection(&params, server, "AES128-SHA").await;
+    }
+
     #[tokio::test]
     #[ignore = "unauthenticated RDP/TLS probe; set RELAY_TLS_TEST_HOST explicitly"]
     async fn rdp_tls_remote_handshake() {
@@ -682,10 +717,177 @@ mod tests {
             .with_test_writer()
             .try_init();
         let host = std::env::var("RELAY_TLS_TEST_HOST").unwrap();
-        let params = tls_params(&host, 3389);
+        let mut params = tls_params(&host, 3389);
+        // RELAY_TLS_LEGACY=1 allows legacy TLS, as the host setting does.
+        params.advanced.allow_legacy_tls = std::env::var_os("RELAY_TLS_LEGACY").is_some();
         let secure = test_secure_connection(&params).await.unwrap();
         assert!(ironrdp_tls::extract_tls_server_public_key(&secure.certificate).is_some());
         eprintln!("RDP/TLS succeeded for {host}; no login credentials were sent");
+    }
+
+    /// After TLS, the server must answer CredSSP's first message: an NTLM NEGOTIATE, which
+    /// carries no credentials. Old Windows servers abort here when the TLS records are
+    /// framed in a way they don't accept.
+    #[tokio::test]
+    #[ignore = "unauthenticated RDP/CredSSP probe; set RELAY_TLS_TEST_HOST explicitly"]
+    async fn rdp_credssp_remote_negotiate() {
+        let host = std::env::var("RELAY_TLS_TEST_HOST").unwrap();
+        let mut params = tls_params(&host, 3389);
+        params.advanced.allow_legacy_tls = std::env::var_os("RELAY_TLS_LEGACY").is_some();
+        let secure = test_secure_connection(&params).await.unwrap();
+        let (mut tls, _) = secure.framed.into_inner();
+        let mut negotiate = b"NTLMSSP\0\x01\0\0\0".to_vec();
+        negotiate.extend_from_slice(&0xe208_8297u32.to_le_bytes());
+        negotiate.extend_from_slice(&[0; 16]); // No domain or workstation.
+        negotiate.extend_from_slice(&[6, 1, 0xb1, 0x1d, 0, 0, 0, 15]); // Version.
+        // TSRequest { version 2, negoTokens { { negoToken } } }
+        let token = [&[0x04, negotiate.len() as u8][..], &negotiate].concat();
+        let token = [&[0xa0, token.len() as u8][..], &token].concat();
+        let item = [&[0x30, token.len() as u8][..], &token].concat();
+        let data = [&[0x30, item.len() as u8][..], &item].concat();
+        let data = [&[0xa1, data.len() as u8][..], &data].concat();
+        // RELAY_CREDSSP_VERSION picks the version the probe claims (default 2).
+        let claimed = std::env::var("RELAY_CREDSSP_VERSION").map_or(2, |v| v.parse().unwrap());
+        let body = [&[0xa0, 3, 2, 1, claimed][..], &data].concat();
+        let request = [&[0x30, body.len() as u8][..], &body].concat();
+        tls.write_all(&request).await.unwrap();
+        tls.flush().await.unwrap();
+        let mut reply = vec![0u8; 4096];
+        let n = tls.read(&mut reply).await.expect("the server answered");
+        let reply = &reply[..n];
+        let challenge = reply.windows(12).any(|w| w == b"NTLMSSP\0\x02\0\0\0");
+        assert!(challenge, "no NTLM CHALLENGE in {n} bytes: {reply:02x?}");
+        // TSRequest ::= SEQUENCE { version [0] INTEGER, ... }: the server's CredSSP version.
+        let at = reply
+            .windows(3)
+            .position(|w| w == [0xa0, 3, 2])
+            .expect("a version");
+        let version = reply[at + 4];
+        let os = super::super::hostinfo::detect(reply);
+        eprintln!("{host} speaks CredSSP {version}, OS {os:?}; no credentials were sent");
+    }
+
+    /// Extended client data is only sent to servers that accept it: Server 2008 resets the
+    /// connection on a Connect Initial carrying the message channel block.
+    #[test]
+    fn connect_initial_sends_extended_blocks_only_when_accepted() {
+        use ironrdp_connector::Sequence as _;
+        use ironrdp_pdu::nego::{ResponseFlags, SecurityProtocol};
+        use ironrdp_pdu::x224::{X224, X224Data};
+        let params = tls_params("server", 3389);
+        let message_channel = |flags: ResponseFlags| {
+            let channels = Channels {
+                gfx: None,
+                clipboard: None,
+            };
+            let addr = "127.0.0.1:50000".parse().unwrap();
+            let mut connector = build_connector(&params, params.desktop, addr, channels);
+            connector.server_nego_flags = flags;
+            connector.state =
+                ironrdp_connector::ClientConnectorState::BasicSettingsExchangeSendInitial {
+                    selected_protocol: SecurityProtocol::HYBRID,
+                };
+            let mut output = ironrdp_core::WriteBuf::new();
+            connector.step(&[], &mut output).unwrap();
+            let data = ironrdp_core::decode::<X224<X224Data<'_>>>(output.filled())
+                .unwrap()
+                .0;
+            let initial =
+                ironrdp_core::decode::<ironrdp_pdu::mcs::ConnectInitial>(&data.data).unwrap();
+            initial
+                .conference_create_request
+                .gcc_blocks()
+                .message_channel
+                .is_some()
+        };
+        assert!(!message_channel(ResponseFlags::empty()));
+        assert!(message_channel(
+            ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED
+        ));
+    }
+
+    /// Relay's connection sequence, without NLA and without credentials: TLS, MCS Connect
+    /// Initial, licensing, capabilities. A server that allows it then shows its logon screen;
+    /// no sign-in is attempted.
+    #[tokio::test]
+    #[ignore = "unauthenticated RDP connection without NLA; set RELAY_TLS_TEST_HOST explicitly"]
+    async fn rdp_remote_connects_without_nla() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("info,relay=debug,ironrdp_connector=debug")
+            .with_test_writer()
+            .try_init();
+        let host = std::env::var("RELAY_TLS_TEST_HOST").unwrap();
+        let mut params = tls_params(&host, 3389);
+        params.advanced.allow_legacy_tls = std::env::var_os("RELAY_TLS_LEGACY").is_some();
+        let tcp = open_tcp(&params.host, params.port).await.unwrap();
+        let client_addr = tcp.local_addr().unwrap();
+        let channels = Channels {
+            gfx: None,
+            clipboard: None,
+        };
+        let mut connector = build_connector(&params, params.desktop, client_addr, channels);
+        connector.config.enable_credssp = false;
+        let mut framed = ironrdp_tokio::TokioFramed::new(tcp);
+        let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
+            .await
+            .unwrap();
+        let (tcp, leftover) = framed.into_inner();
+        let legacy = params.advanced.allow_legacy_tls;
+        let (stream, certificate) = tls::upgrade(tcp, &host, Backend::OpenSsl, legacy)
+            .await
+            .unwrap();
+        let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+        let mut framed = ironrdp_tokio::TokioFramed::new_with_leftover(stream, leftover);
+        let key = ironrdp_tls::extract_tls_server_public_key(&certificate)
+            .unwrap()
+            .to_owned();
+        let result = ironrdp_tokio::connect_finalize(
+            upgraded,
+            connector,
+            &mut framed,
+            &mut ReqwestNetworkClient::new(),
+            ServerName::new(host.clone()),
+            key,
+            None,
+        )
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => panic!("{host}: {error:?}"),
+        };
+        eprintln!("{host}: connected at {:?}", result.desktop_size);
+        // The first slow-path PDUs on the IO channel, each checked by the session's decoder.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut decoded = 0;
+        while let Ok(Ok((action, frame))) =
+            tokio::time::timeout_at(deadline, framed.read_pdu()).await
+        {
+            if action != ironrdp_pdu::Action::X224 {
+                continue;
+            }
+            let frames = super::super::slowpath::split(&frame, result.io_channel_id)
+                .unwrap_or_else(|| vec![frame.to_vec()]);
+            for frame in &frames {
+                let Ok(data) = ironrdp_pdu::mcs::decode_send_data_indication(frame) else {
+                    continue;
+                };
+                if data.channel_id != result.io_channel_id {
+                    continue;
+                }
+                let hex: String = data
+                    .user_data
+                    .iter()
+                    .take(24)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                match ironrdp_pdu::rdp::headers::decode_io_channel(data) {
+                    Ok(_) => decoded += 1,
+                    Err(error) => panic!("{host}: undecodable IO channel PDU {hex}…: {error}"),
+                }
+            }
+        }
+        eprintln!("{host}: decoded {decoded} IO channel PDUs");
+        assert!(decoded > 0);
     }
 
     #[test]

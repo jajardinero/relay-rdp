@@ -1,4 +1,5 @@
-//! RDP TLS transports. Rustls is preferred; OpenSSL adds TLS 1.2 CBC compatibility.
+//! RDP TLS transports. Rustls is preferred; OpenSSL adds TLS 1.2 CBC compatibility, and TLS 1.0
+//! for hosts that allow legacy TLS.
 //! Certificate trust is checked by connect::verify_certificate before any CredSSP traffic.
 
 use std::io;
@@ -47,10 +48,12 @@ pub(super) fn can_retry(error: &io::Error) -> bool {
         })
 }
 
+/// `legacy`: the host allows TLS 1.0 and AES-CBC-SHA suites (OpenSSL backend only).
 pub(super) async fn upgrade<S>(
     stream: S,
     host: &str,
     backend: Backend,
+    legacy: bool,
 ) -> io::Result<(Box<dyn AsyncReadWrite>, Certificate)>
 where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
@@ -64,18 +67,32 @@ where
         }
         Backend::OpenSsl => {
             let mut builder = SslConnector::builder(SslMethod::tls_client())?;
-            builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
             // Add only forward-secret AES-CBC/SHA-2 suites to rustls's modern suite set.
             // TLS 1.3 suites use OpenSSL's separate, modern defaults.
-            builder.set_cipher_list(
-                "ECDHE+AESGCM:ECDHE+CHACHA20:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256",
-            )?;
+            const MODERN: &str =
+                "ECDHE+AESGCM:ECDHE+CHACHA20:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256";
+            if legacy {
+                // Old Windows offers only TLS 1.0, often with RSA key exchange and AES-CBC-SHA.
+                // OpenSSL refuses both above security level 0. Preferred suites come first.
+                builder.set_min_proto_version(Some(SslVersion::TLS1))?;
+                builder.set_cipher_list(&format!(
+                    "{MODERN}:ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA:AES256-SHA:AES128-SHA:@SECLEVEL=0"
+                ))?;
+            } else {
+                builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+                builder.set_cipher_list(MODERN)?;
+            }
             // RDP uses explicit certificate pinning, including changed-certificate approval.
             // Do not send credentials until that common trust check has completed.
             builder.set_verify(SslVerifyMode::NONE);
             // CredSSP does not support TLS session resumption.
             builder.set_session_cache_mode(SslSessionCacheMode::OFF);
             builder.set_options(SslOptions::NO_TICKET);
+            // For CBC suites before TLS 1.1, OpenSSL sends an empty record before each one
+            // with data (a BEAST countermeasure; the openssl crate keeps it on). Windows' RDP
+            // server rejects them with an internal-error alert, so send whole records, as
+            // FreeRDP does. TLS 1.1 and later aren't affected.
+            builder.set_options(SslOptions::DONT_INSERT_EMPTY_FRAGMENTS);
             let connector = builder.build();
             let ssl = connector
                 .configure()?
@@ -94,12 +111,19 @@ where
                 .ok_or_else(|| io::Error::other("peer certificate is missing"))?;
             let certificate =
                 Certificate::from_der(&certificate.to_der()?).map_err(io::Error::other)?;
-            tracing::info!(
-                ?backend,
-                version = stream.ssl().version_str(),
-                cipher = stream.ssl().current_cipher().map(|cipher| cipher.name()),
-                "RDP TLS established"
-            );
+            let version = stream.ssl().version_str();
+            let cipher = stream.ssl().current_cipher().map(|cipher| cipher.name());
+            let old = [SslVersion::SSL3, SslVersion::TLS1, SslVersion::TLS1_1];
+            if stream.ssl().version2().is_some_and(|v| old.contains(&v)) {
+                tracing::warn!(
+                    ?backend,
+                    version,
+                    ?cipher,
+                    "RDP TLS established with legacy TLS"
+                );
+            } else {
+                tracing::info!(?backend, version, ?cipher, "RDP TLS established");
+            }
             Ok((Box::new(stream), certificate))
         }
     }

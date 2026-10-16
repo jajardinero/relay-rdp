@@ -15,6 +15,7 @@ mod hostinfo;
 #[cfg(test)]
 mod integration_tests;
 mod netinfo;
+mod slowpath;
 mod tls;
 
 use std::sync::Arc;

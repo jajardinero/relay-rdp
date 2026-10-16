@@ -60,11 +60,19 @@ impl Failure {
         )
     }
 
-    pub fn tls(e: &io::Error) -> Self {
+    /// `legacy`: the host already allows legacy TLS.
+    pub fn tls(e: &io::Error, legacy: bool) -> Self {
+        let hint = if legacy {
+            "The computer must support TLS 1.0 or newer and a compatible encryption suite."
+        } else {
+            "The computer must support TLS 1.2 or newer and a compatible encryption suite. \
+             For older Windows computers that only offer TLS 1.0, turn on Allow legacy TLS in \
+             the host's Advanced settings."
+        };
         Self::new(
             FailureKind::Security,
             "Couldn't establish a secure connection",
-            Some("The computer must support TLS 1.2 or newer and a compatible encryption suite."),
+            Some(hint),
             error_chain(e),
         )
     }

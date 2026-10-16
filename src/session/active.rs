@@ -22,7 +22,7 @@ use super::framebuffer::Rect;
 use super::gfx::{GfxFailure, GfxShared};
 use super::{
     ConnectParams, DesktopRequest, Ended, EventSink, Failure, PointerUpdate, Rendering, SessionCmd,
-    SessionEvent, SharedFrame, Stage, Stats, netinfo,
+    SessionEvent, SharedFrame, Stage, Stats, netinfo, slowpath,
 };
 use crate::store::profiles::GraphicsMode;
 
@@ -283,6 +283,7 @@ impl<'a> ActiveSession<'a> {
         });
 
         let activation_factory = result.activation_factory;
+        let io_channel_id = result.io_channel_id;
         let mut stage: ActiveStage = ActiveStageBuilder {
             static_channels: result.static_channels,
             user_channel_id: result.user_channel_id,
@@ -319,7 +320,16 @@ impl<'a> ActiveSession<'a> {
                         Err(e) => return Exit::Lost(Failure::from_io(&e, port)),
                     };
                     counters.bytes_in += payload.len() as u64;
-                    stage.process(&mut image, action, &payload)
+                    let frames = (action == ironrdp_pdu::Action::X224)
+                        .then(|| slowpath::split(&payload, io_channel_id))
+                        .flatten();
+                    match frames {
+                        Some(frames) => frames.iter().try_fold(Vec::new(), |mut outputs, frame| {
+                            outputs.extend(stage.process(&mut image, action, frame)?);
+                            Ok(outputs)
+                        }),
+                        None => stage.process(&mut image, action, &payload),
+                    }
                 }
                 cmd = cmd_rx.recv() => match cmd {
                     None | Some(SessionCmd::Disconnect) => {
