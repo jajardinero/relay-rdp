@@ -2,6 +2,7 @@
 //! mapped onto the output (the desktop we display).
 
 use crate::gpu::{GpuContext, GpuImage};
+use ironrdp_graphics::progressive::TileCoefficients;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -217,6 +218,27 @@ impl Surface {
         }
         for rect in rects {
             self.damage.add(rect);
+        }
+    }
+
+    /// Draws the `parts` of a RemoteFX progressive tile at `area` from its coefficients, which
+    /// only GPU surfaces take.
+    pub fn draw_tile(&mut self, area: Rect, tile: &TileCoefficients, parts: &[Rect]) {
+        let Some(gpu) = &self.gpu else { return };
+        gpu.record(gpu.context.draw_tile(
+            &gpu.image,
+            (area.x, area.y),
+            &tile.components,
+            tile.reduce_extrapolate,
+            parts,
+        ));
+        for part in parts {
+            if let Some(part) = part
+                .intersect(area)
+                .and_then(|r| r.clip(self.width, self.height))
+            {
+                self.damage.add(part);
+            }
         }
     }
 

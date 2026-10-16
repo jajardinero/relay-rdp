@@ -27,6 +27,12 @@ state only after the last associated context is gone; it preserves the
 coefficient reference until the surface is deleted/reset (MS-RDPEGFX 3.3.1.2–3).
 Otherwise a zero-difference update under a new context reconstructs as gray.
 
+Progressive tiles decode in parallel (rayon). Updates of the same tile within
+one stream apply in order on one thread, and results are reported in stream
+order, so output matches sequential decoding. `decode_bitmap_as` can return a
+tile's DWT coefficients instead of RGBA pixels, letting Relay run the inverse
+DWT and color conversion on the GPU.
+
 Relay's application tests compare these paths with FreeRDP reference decodes
 in `src/session/gfx/testdata`. Remove these patches when equivalent fixes are
 available in an upstream release.

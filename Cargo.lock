@@ -2656,6 +2656,7 @@ dependencies = [
  "ironrdp-pdu",
  "num-derive",
  "num-traits",
+ "rayon",
  "yuv",
 ]
 
@@ -4732,6 +4733,7 @@ dependencies = [
  "arboard",
  "ash",
  "async-trait",
+ "bytemuck",
  "cc",
  "chrono",
  "clap",

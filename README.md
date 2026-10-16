@@ -89,6 +89,12 @@ the decoded regions go straight into GPU surfaces. This needs only the Vulkan
 device, not VA-API. If GPU drawing fails, Relay reconnects and draws that session
 on the CPU.
 
+RemoteFX progressive tiles decode in parallel on all CPU cores. With GPU drawing,
+the CPU only entropy-decodes each tile; its wavelet transform and color
+conversion run in GPU shaders, matching the CPU decoder exactly. This needs
+32 KiB of compute workgroup memory, which current Vulkan drivers provide;
+otherwise tiles are decoded completely on the CPU.
+
 Stream color metadata controls conversion. When unspecified, AVC420 uses the
 protocol's full-range BT.709 defaults. Filtering is clamped to the visible
 picture so macroblock padding does not bleed into its edges.

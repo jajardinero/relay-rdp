@@ -34,6 +34,9 @@ const MAX_BATCH_BYTES: u64 = 64 << 20;
 const DIRECT_UPLOAD_BYTES: usize = 1 << 20;
 /// Pending quads are drawn once their pixels reach this size.
 const MAX_QUAD_BYTES: usize = 16 << 20;
+/// Workgroup memory for reconstructing progressive tiles: a component's samples and one
+/// level's rows, 4096 i32 each (`progressive.wgsl`).
+const PROGRESSIVE_WORKGROUP_BYTES: u32 = 2 * 4096 * 4;
 
 pub struct GpuContext {
     pub device: wgpu::Device,
@@ -48,6 +51,8 @@ pub struct GpuContext {
     quads: wgpu::RenderPipeline,
     /// Bound as the source while quads copy nothing, since the target can't be.
     blank: wgpu::BindGroup,
+    /// None when the device has too little workgroup memory to reconstruct progressive tiles.
+    progressive: Option<ProgressivePipelines>,
     avc444: Avc444Pipelines,
     failure: Arc<Mutex<Option<String>>>,
 }
@@ -64,27 +69,46 @@ struct Batch {
     pending: Quads,
 }
 
-/// Fills, small uploads and copies from other images waiting to be drawn into one image, as
-/// instanced quads in a single render pass. Unlike copies into the same image, draws need no
-/// barrier between them.
+/// Fills, small uploads, copies from other images and progressive tiles waiting to be drawn
+/// into one image, as instanced quads in a single render pass. Unlike copies into the same
+/// image, draws need no barrier between them.
 #[derive(Default)]
 struct Quads {
     target: Option<Arc<GpuImage>>,
     /// x, y, width, height, kind, then a packed RGBA color (fills), the first word of the
-    /// quad's pixels (uploads), or the source x and y (copies); see `quads.wgsl`.
+    /// quad's pixels (uploads), the source x and y (copies), or the tile's first word and the
+    /// quad's position in it (progressive tiles); see `quads.wgsl`.
     items: Vec<[u32; 8]>,
-    /// Uploaded pixels as RGBA, rows packed.
+    /// Uploaded pixels as RGBA, rows packed, and progressive tiles' coefficients.
     pixels: Vec<u8>,
     /// The images copies read: each from its first item until the next. Items before the
     /// first read none.
     sources: Vec<(u32, wgpu::BindGroup)>,
+    /// Progressive tiles' first words among the pixels: standard, then reduce-extrapolate DWT.
+    tiles: [Vec<u32>; 2],
     /// The buffer the shaders read, reused while it is big enough.
-    storage: Option<(wgpu::Buffer, wgpu::BindGroup)>,
+    storage: Option<QuadStorage>,
+}
+
+struct QuadStorage {
+    buffer: wgpu::Buffer,
+    /// For the quads, which read it.
+    draw: wgpu::BindGroup,
+    /// For progressive tiles' reconstruction, which rewrites their coefficients as samples.
+    reconstruct: Option<wgpu::BindGroup>,
+}
+
+/// The compute pipelines that reconstruct progressive tiles: standard, then
+/// reduce-extrapolate DWT.
+struct ProgressivePipelines {
+    layout: wgpu::BindGroupLayout,
+    pipelines: [wgpu::ComputePipeline; 2],
 }
 
 const FILL: u32 = 0;
 const PIXELS: u32 = 1;
 const COPY: u32 = 2;
+const TILE: u32 = 3;
 
 struct Avc444Pipelines {
     layout: wgpu::BindGroupLayout,
@@ -133,6 +157,14 @@ async fn open_device(adapter: &wgpu::Adapter) -> anyhow::Result<(wgpu::Device, w
         label: Some("Relay GPU"),
         required_limits: wgpu::Limits {
             max_texture_dimension_2d: 8192,
+            // Progressive tiles reconstruct on the GPU only with this much (see `progressive`).
+            max_compute_workgroup_storage_size: adapter
+                .limits()
+                .max_compute_workgroup_storage_size
+                .clamp(
+                    wgpu::Limits::default().max_compute_workgroup_storage_size,
+                    PROGRESSIVE_WORKGROUP_BYTES,
+                ),
             ..Default::default()
         },
         ..Default::default()
@@ -266,14 +298,16 @@ fn source_group(
 
 impl GpuContext {
     pub fn new(state: &RenderState) -> Option<Arc<Self>> {
-        let storage = wgpu::DownlevelFlags::VERTEX_STORAGE | wgpu::DownlevelFlags::FRAGMENT_STORAGE;
+        let storage = wgpu::DownlevelFlags::VERTEX_STORAGE
+            | wgpu::DownlevelFlags::FRAGMENT_STORAGE
+            | wgpu::DownlevelFlags::COMPUTE_SHADERS;
         if !state
             .adapter
             .get_downlevel_capabilities()
             .flags
             .contains(storage)
         {
-            tracing::info!("GPU drawing unavailable: shaders cannot read storage buffers");
+            tracing::info!("GPU drawing unavailable: no compute shaders or storage buffers");
             return None;
         }
         Some(Self::from_device(state.device.clone(), state.queue.clone()))
@@ -384,6 +418,12 @@ impl GpuContext {
             view_formats: &[],
         });
         let blank = source_group(&device, &quads, &blank.create_view(&Default::default()));
+        let progressive = (device.limits().max_compute_workgroup_storage_size
+            >= PROGRESSIVE_WORKGROUP_BYTES)
+            .then(|| ProgressivePipelines::new(&device));
+        if progressive.is_none() {
+            tracing::info!("progressive tiles reconstruct on the CPU: too little workgroup memory");
+        }
         let avc444 = Avc444Pipelines::new(&device);
         let belt = wgpu::util::StagingBelt::new(device.clone(), STAGING_CHUNK);
         Self {
@@ -402,6 +442,7 @@ impl GpuContext {
             conversion,
             quads,
             blank,
+            progressive,
             avc444,
             failure,
         }
@@ -547,17 +588,27 @@ impl GpuContext {
             return;
         };
         let count = pending.items.len() as u32;
-        let first_pixel = 4 + count * 8;
-        let words: Vec<u8> = [target.width, target.height, first_pixel, 0]
+        let table = 4 + count * 8;
+        let [standard, extrapolate] = &pending.tiles;
+        let tiles = [standard.len() as u32, extrapolate.len() as u32];
+        let table_words = if tiles == [0, 0] {
+            0
+        } else {
+            1 + tiles[0] + tiles[1]
+        };
+        let first_pixel = table + table_words;
+        let words: Vec<u8> = [target.width, target.height, first_pixel, table]
             .iter()
             .chain(pending.items.iter().flatten())
+            .chain((table_words > 0).then_some(&tiles[0]))
+            .chain(standard.iter().chain(extrapolate))
             .flat_map(|word| word.to_le_bytes())
             .collect();
         let size = (words.len() + pending.pixels.len()) as u64;
         if pending
             .storage
             .as_ref()
-            .is_none_or(|(buffer, _)| buffer.size() < size)
+            .is_none_or(|storage| storage.buffer.size() < size)
         {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("RDP quads"),
@@ -565,17 +616,25 @@ impl GpuContext {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("RDP quads"),
-                layout: &self.quads.get_bind_group_layout(0),
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                }],
+            let bind = |label, layout: &wgpu::BindGroupLayout| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                })
+            };
+            pending.storage = Some(QuadStorage {
+                draw: bind("RDP quads", &self.quads.get_bind_group_layout(0)),
+                reconstruct: (self.progressive.as_ref())
+                    .map(|progressive| bind("RemoteFX progressive tiles", &progressive.layout)),
+                buffer,
             });
-            pending.storage = Some((buffer, bind));
         }
-        let (buffer, bind) = pending.storage.as_ref().expect("just ensured");
+        let storage = pending.storage.as_ref().expect("just ensured");
+        let (buffer, bind) = (&storage.buffer, &storage.draw);
         let slice = belt.allocate(
             NonZeroU64::new(size).expect("the header is not empty"),
             NonZeroU64::new(wgpu::COPY_BUFFER_ALIGNMENT).expect("non-zero"),
@@ -595,6 +654,23 @@ impl GpuContext {
         }
         let encoder = encoder.get_or_insert_with(|| self.encoder());
         encoder.copy_buffer_to_buffer(slice.buffer(), slice.offset(), buffer, 0, size);
+        // Progressive tiles become samples, one workgroup per tile and component. Only a
+        // context with the pipelines takes tiles.
+        if let (true, Some(progressive), Some(bind)) =
+            (table_words > 0, &self.progressive, &storage.reconstruct)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("RemoteFX progressive tiles"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind, &[]);
+            for (pipeline, count) in progressive.pipelines.iter().zip(tiles) {
+                if count > 0 {
+                    pass.set_pipeline(pipeline);
+                    pass.dispatch_workgroups(count, 3, 1);
+                }
+            }
+        }
         // A first fill covering the whole image becomes the pass's clear.
         let clear = pending
             .items
@@ -637,6 +713,61 @@ impl GpuContext {
         pending.items.clear();
         pending.pixels.clear();
         pending.sources.clear();
+        pending.tiles.iter_mut().for_each(Vec::clear);
+    }
+
+    /// Whether [`draw_tile`](Self::draw_tile) is available.
+    pub fn reconstructs_tiles(&self) -> bool {
+        self.progressive.is_some()
+    }
+
+    /// Records a RemoteFX progressive tile whose top-left corner is at (x, y) in `image`: its
+    /// DWT `coefficients` (Y, Cb, Cr) become pixels on the GPU, as on the CPU, and the
+    /// parts of the tile inside `parts` are drawn.
+    pub fn draw_tile(
+        &self,
+        image: &Arc<GpuImage>,
+        (x, y): (u32, u32),
+        coefficients: &[[i16; 4096]; 3],
+        reduce_extrapolate: bool,
+        parts: &[Rect],
+    ) -> anyhow::Result<()> {
+        ensure!(
+            self.reconstructs_tiles(),
+            "progressive tiles need more workgroup memory"
+        );
+        let tile = Rect::new(x, y, 64, 64);
+        let parts: Vec<Rect> = parts
+            .iter()
+            .filter_map(|part| part.intersect(tile)?.clip(image.width, image.height))
+            .collect();
+        if parts.is_empty() {
+            return Ok(());
+        }
+        let mut batch = self.batch.lock();
+        let quads = self.quads_for(&mut batch, image);
+        let first = (quads.pixels.len() / 4) as u32;
+        // The shaders read words of little-endian i16 pairs: the coefficients as they are.
+        let values = coefficients.as_flattened();
+        if cfg!(target_endian = "little") {
+            quads.pixels.extend_from_slice(bytemuck::cast_slice(values));
+        } else {
+            quads
+                .pixels
+                .extend(values.iter().flat_map(|v| v.to_le_bytes()));
+        }
+        quads.tiles[usize::from(reduce_extrapolate)].push(first);
+        quads.items.extend(parts.iter().map(|part| {
+            let at = (part.x - x) | ((part.y - y) << 16);
+            [part.x, part.y, part.w, part.h, TILE, first, at, 0]
+        }));
+        if quads.pixels.len() >= MAX_QUAD_BYTES {
+            self.draw_quads(&mut batch);
+        }
+        if batch.staged >= MAX_BATCH_BYTES {
+            self.flush_batch(&mut batch)?;
+        }
+        Ok(())
     }
 
     /// Records a copy of `rect` from `src` to (x, y) in `dst`, clipped to both images.
@@ -931,6 +1062,47 @@ impl GpuContext {
         resources.1.release(&mut release);
         self.submit(release, resources)?;
         Ok(output)
+    }
+}
+
+impl ProgressivePipelines {
+    fn new(device: &wgpu::Device) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RemoteFX progressive tiles"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RemoteFX progressive tiles"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("RemoteFX progressive tiles"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("progressive.wgsl").into()),
+        });
+        let pipelines = [false, true].map(|extrapolate| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("RemoteFX progressive tiles"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &[("REDUCE_EXTRAPOLATE", f64::from(u8::from(extrapolate)))],
+                    ..Default::default()
+                },
+                cache: None,
+            })
+        });
+        Self { layout, pipelines }
     }
 }
 
@@ -1459,6 +1631,64 @@ pub(crate) mod tests {
         }
         assert_eq!(read(&context, &gpu.gpu.as_ref().unwrap().image), cpu.data);
         assert!(error.lock().is_none(), "{:?}", error.lock());
+    }
+
+    /// Progressive tiles reconstructed on the GPU equal the CPU's, for both DWTs and any
+    /// coefficients: full-range ones exercise every 16-bit truncation and the clamping.
+    #[test]
+    #[ignore = "requires a Vulkan GPU and access to /dev/dri"]
+    fn gpu_progressive_tiles_match_cpu() {
+        use ironrdp_graphics::progressive::TileState;
+        let context = context().unwrap();
+        let (w, h) = (256, 192);
+        let image = context.image(w, h);
+        let background = [10, 20, 30, 255];
+        context.clear(&image, background);
+        let mut expected: Vec<u8> = background.repeat((w * h) as usize);
+        let mut seed = 0x2545_f491_u32;
+        let ranges = [
+            32767, 32767, 8000, 8000, 1200, 1200, 40, 40, 32767, 600, 32767, 600,
+        ];
+        for (i, range) in ranges.into_iter().enumerate() {
+            let mut state = TileState::new();
+            state.use_reduce_extrapolate = i % 2 == 1;
+            for value in state.coefficients.iter_mut().flatten() {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                *value = ((seed % (2 * range + 1)) as i32 - range as i32) as i16;
+            }
+            let mut pixels = vec![0; 64 * 64 * 4];
+            state.reconstruct_to_rgba(&mut pixels);
+            let (x, y) = ((i as u32 % 4) * 64, (i as u32 / 4) * 64);
+            // The last row of tiles draws only parts, as a region's rectangles clip them.
+            let parts = if i < 8 {
+                vec![Rect::new(x, y, 64, 64)]
+            } else {
+                vec![
+                    Rect::new(x + 3, y, 20, 64),
+                    Rect::new(x + 30, y + 40, 50, 10),
+                ]
+            };
+            for part in &parts {
+                let part = part.intersect(Rect::new(x, y, 64, 64)).unwrap();
+                for row in part.y..part.y + part.h {
+                    let from = (((row - y) * 64 + part.x - x) * 4) as usize;
+                    let to = ((row * w + part.x) * 4) as usize;
+                    let len = (part.w * 4) as usize;
+                    expected[to..to + len].copy_from_slice(&pixels[from..from + len]);
+                }
+            }
+            let extrapolate = state.use_reduce_extrapolate;
+            context
+                .draw_tile(&image, (x, y), &state.coefficients, extrapolate, &parts)
+                .unwrap();
+        }
+        let actual = read(&context, &image);
+        for (n, (a, e)) in actual.chunks(4).zip(expected.chunks(4)).enumerate() {
+            let (x, y) = (n as u32 % w, n as u32 / w);
+            assert_eq!(a, e, "pixel ({x}, {y}) of tile {}", (y / 64) * 4 + x / 64);
+        }
     }
 
     fn thread_cpu() -> Duration {

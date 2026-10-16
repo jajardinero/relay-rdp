@@ -25,6 +25,7 @@ ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.9", features = ["std"] } #
 byteorder = "1.5" # TODO: remove
 num-derive.workspace = true # TODO: remove
 num-traits.workspace = true # TODO: remove
+rayon = "1.10"
 yuv = { version = "0.8", features = ["rdp"] }
 
 [dev-dependencies]

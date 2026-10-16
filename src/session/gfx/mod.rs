@@ -27,7 +27,9 @@ use ironrdp_egfx::pdu::{
 };
 use ironrdp_graphics::clearcodec::ClearCodecDecoder;
 use ironrdp_graphics::image_processing::PixelFormat;
-use ironrdp_graphics::progressive::{DecodedTile, ProgressiveDecodeError, ProgressiveDecoder};
+use ironrdp_graphics::progressive::{
+    DecodedTile, ProgressiveDecodeError, ProgressiveDecoder, TileOutput,
+};
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_pdu::geometry::{ExclusiveRectangle, InclusiveRectangle};
 use ironrdp_session::image::DecodedImage;
@@ -64,11 +66,12 @@ impl ProgressiveContexts {
         width: u16,
         height: u16,
         data: &[u8],
+        output: TileOutput,
     ) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
         self.surfaces
             .entry(surface_id)
             .or_default()
-            .decode_bitmap(context_id, width, height, data)
+            .decode_bitmap_as(context_id, width, height, data, output)
     }
 
     fn delete_context(&mut self, surface_id: u16, context_id: u32) {
@@ -656,7 +659,18 @@ impl GraphicsPipelineHandler for Handler {
         let (Ok(w), Ok(h)) = (u16::try_from(surface.width), u16::try_from(surface.height)) else {
             return;
         };
-        match progressive.decode(pdu.surface_id, pdu.codec_context_id, w, h, &pdu.bitmap_data) {
+        // GPU surfaces reconstruct tiles from their coefficients themselves, where they can.
+        let output = if surface
+            .gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.context.reconstructs_tiles())
+        {
+            TileOutput::Coefficients
+        } else {
+            TileOutput::Rgba
+        };
+        let context = pdu.codec_context_id;
+        match progressive.decode(pdu.surface_id, context, w, h, &pdu.bitmap_data, output) {
             Ok(tiles) => {
                 apply_progressive_tiles(surface, tiles);
             }
@@ -739,6 +753,10 @@ fn apply_progressive_tiles(surface: &mut Surface, tiles: Vec<DecodedTile>) {
         } else {
             region.filter_map(|r| r.intersect(area)).collect()
         };
+        if let Some(coefficients) = &tile.coefficients {
+            surface.draw_tile(area, coefficients, &parts);
+            continue;
+        }
         for part in parts {
             let offset = ((part.y - area.y) as usize * 64 + (part.x - area.x) as usize) * 4;
             surface.write(part, &tile.pixels[offset..], 64 * 4, SrcFormat::Rgba);
@@ -1070,11 +1088,15 @@ mod tests {
         let first = include_bytes!("testdata/progressive-160x96.bin");
         let delta = progressive_zero_difference();
         let mut contexts = ProgressiveContexts::default();
-        let expected = contexts.decode(1, 10, 160, 96, first).unwrap();
+        let expected = contexts
+            .decode(1, 10, 160, 96, first, TileOutput::Rgba)
+            .unwrap();
         // Windows may send the next difference under a different encoding context. Its
         // coefficient reference belongs to the surface, independently of either context.
         for context in [11, 12, 13] {
-            let actual = contexts.decode(1, context, 160, 96, &delta).unwrap();
+            let actual = contexts
+                .decode(1, context, 160, 96, &delta, TileOutput::Rgba)
+                .unwrap();
             assert_eq!(actual.len(), expected.len());
             for (actual, expected) in actual.iter().zip(&expected) {
                 assert_eq!(
@@ -1086,7 +1108,9 @@ mod tests {
             contexts.delete_context(1, 10);
         }
         // A separate or recreated surface must not inherit the old reference image.
-        let other = contexts.decode(2, 10, 160, 96, &delta).unwrap();
+        let other = contexts
+            .decode(2, 10, 160, 96, &delta, TileOutput::Rgba)
+            .unwrap();
         assert!(other.iter().all(|tile| {
             tile.pixels
                 .as_chunks::<4>()
@@ -1095,7 +1119,9 @@ mod tests {
                 .all(|p| *p == [128, 128, 128, 255])
         }));
         contexts.remove_surface(1);
-        let recreated = contexts.decode(1, 10, 160, 96, &delta).unwrap();
+        let recreated = contexts
+            .decode(1, 10, 160, 96, &delta, TileOutput::Rgba)
+            .unwrap();
         for (actual, expected) in recreated.iter().zip(&other) {
             assert_eq!(actual.pixels, expected.pixels);
         }
@@ -1109,16 +1135,27 @@ mod tests {
         reference.decode_bitmap(0, 128, 64, first).unwrap();
         let expected = reference.decode_bitmap(0, 128, 64, upgrade).unwrap();
         let mut contexts = ProgressiveContexts::default();
-        contexts.decode(1, 21, 128, 64, first).unwrap();
-        contexts.decode(1, 22, 128, 64, first).unwrap();
+        contexts
+            .decode(1, 21, 128, 64, first, TileOutput::Rgba)
+            .unwrap();
+        contexts
+            .decode(1, 22, 128, 64, first, TileOutput::Rgba)
+            .unwrap();
         contexts.delete_context(1, 21);
-        let actual = contexts.decode(1, 22, 128, 64, upgrade).unwrap();
+        let actual = contexts
+            .decode(1, 22, 128, 64, upgrade, TileOutput::Rgba)
+            .unwrap();
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(&expected) {
             assert_eq!(actual.pixels, expected.pixels);
         }
         contexts.delete_context(1, 22);
-        assert!(contexts.decode(1, 23, 128, 64, upgrade).unwrap().is_empty());
+        assert!(
+            contexts
+                .decode(1, 23, 128, 64, upgrade, TileOutput::Rgba)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1133,7 +1170,9 @@ mod tests {
         let mut expected = Vec::new();
         for id in 0..4 {
             let data = if id == 0 { first.as_slice() } else { &delta };
-            let tiles = contexts.decode(1, id, 160, 96, data).unwrap();
+            let tiles = contexts
+                .decode(1, id, 160, 96, data, TileOutput::Coefficients)
+                .unwrap();
             apply_progressive_tiles(&mut surface, tiles);
             contexts.delete_context(1, id);
             let pixels = crate::gpu::tests::read(&context, &surface.gpu.as_ref().unwrap().image);
@@ -1364,10 +1403,16 @@ mod tests {
             .unwrap();
 
         let mut contexts = ProgressiveContexts::default();
-        contexts.decode(1, 0, 128, 64, first).unwrap();
+        contexts
+            .decode(1, 0, 128, 64, first, TileOutput::Rgba)
+            .unwrap();
         // A different surface may reuse context 0 with different tile state.
-        contexts.decode(2, 0, 128, 64, other_first).unwrap();
-        let actual = contexts.decode(1, 0, 128, 64, upgrade).unwrap();
+        contexts
+            .decode(2, 0, 128, 64, other_first, TileOutput::Rgba)
+            .unwrap();
+        let actual = contexts
+            .decode(1, 0, 128, 64, upgrade, TileOutput::Rgba)
+            .unwrap();
         assert!(!actual.is_empty());
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(&expected) {
@@ -1375,20 +1420,34 @@ mod tests {
         }
 
         contexts.delete_context(1, 0);
-        assert!(contexts.decode(1, 0, 128, 64, upgrade).unwrap().is_empty());
-        let other_actual = contexts.decode(2, 0, 128, 64, other_upgrade).unwrap();
+        assert!(
+            contexts
+                .decode(1, 0, 128, 64, upgrade, TileOutput::Rgba)
+                .unwrap()
+                .is_empty()
+        );
+        let other_actual = contexts
+            .decode(2, 0, 128, 64, other_upgrade, TileOutput::Rgba)
+            .unwrap();
         assert_eq!(other_actual.len(), other_expected.len());
         for (actual, expected) in other_actual.iter().zip(&other_expected) {
             assert_eq!(actual.pixels, expected.pixels);
         }
 
-        contexts.decode(1, 0, 128, 64, first).unwrap();
+        contexts
+            .decode(1, 0, 128, 64, first, TileOutput::Rgba)
+            .unwrap();
         contexts.remove_surface(1);
-        assert!(contexts.decode(1, 0, 128, 64, upgrade).unwrap().is_empty());
+        assert!(
+            contexts
+                .decode(1, 0, 128, 64, upgrade, TileOutput::Rgba)
+                .unwrap()
+                .is_empty()
+        );
         contexts.reset();
         assert!(
             contexts
-                .decode(2, 0, 128, 64, other_upgrade)
+                .decode(2, 0, 128, 64, other_upgrade, TileOutput::Rgba)
                 .unwrap()
                 .is_empty()
         );
@@ -1864,6 +1923,314 @@ mod tests {
             .unwrap();
             std::fs::write(dir.join(format!("progressive-{name}.1.bin")), frame1).unwrap();
             std::fs::write(dir.join(format!("progressive-{name}.2.bin")), frame2).unwrap();
+        }
+    }
+
+    /// A 1920x1080 picture as 510 TILE_SIMPLE tiles at Windows' lossless quantization (6):
+    /// gradients with dense glyph-like detail, the bottom tile row clipped by the region.
+    fn progressive_screen(extrapolate: bool) -> Vec<u8> {
+        use ironrdp_graphics::progressive::{encode_first_pass, rgba_to_ycbcr};
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ComponentCodecQuant, ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu,
+            ProgressiveFrameEndPdu, ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile,
+            TileSimple, encode_progressive_stream,
+        };
+        let quant = ComponentCodecQuant {
+            ll3: 6,
+            hl3: 6,
+            lh3: 6,
+            hh3: 6,
+            hl2: 6,
+            lh2: 6,
+            hh2: 6,
+            hl1: 6,
+            lh1: 6,
+            hh1: 6,
+        };
+        let mut planes: Vec<[Vec<u8>; 3]> = Vec::new();
+        for i in 0..30 * 17 {
+            let (tx, ty) = (i % 30, i / 30);
+            let mut pixels = vec![0u8; 64 * 64 * 4];
+            for (p, px) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let (x, y) = (tx * 64 + p as u32 % 64, ty * 64 + p as u32 / 64);
+                let cell = (x / 2).wrapping_mul(0x9e37_79b9) ^ (y / 3).wrapping_mul(0x85eb_ca6b);
+                let ink = cell.wrapping_mul(0xc2b2_ae35) >> 29 == 0;
+                let paper = [(x / 8) as u8, (y / 5) as u8, ((x + y) / 12) as u8, 255];
+                *px = if ink { [20, 20, 30, 255] } else { paper };
+            }
+            let mut ycbcr = [[0i16; 4096]; 3];
+            let [y, cb, cr] = &mut ycbcr;
+            rgba_to_ycbcr(&pixels, y, cb, cr);
+            planes.push(ycbcr.map(|mut component| {
+                let mut out = vec![0u8; 65536];
+                let lossless = ComponentCodecQuant::LOSSLESS;
+                let n = encode_first_pass(&mut component, &mut out, &quant, &lossless, extrapolate)
+                    .unwrap();
+                out.truncate(n);
+                out
+            }));
+        }
+        let tiles = planes
+            .iter()
+            .enumerate()
+            .map(|(i, [y, cb, cr])| {
+                ProgressiveTile::Simple(TileSimple {
+                    quant_idx_y: 0,
+                    quant_idx_cb: 0,
+                    quant_idx_cr: 0,
+                    x_idx: (i % 30) as u16,
+                    y_idx: (i / 30) as u16,
+                    flags: 0,
+                    y_data: y,
+                    cb_data: cb,
+                    cr_data: cr,
+                    tail_data: &[],
+                })
+            })
+            .collect();
+        encode_progressive_stream(&[
+            ProgressiveBlock::Sync(ProgressiveSyncPdu),
+            ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 64,
+                flags: 0,
+            }),
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(ProgressiveRegion {
+                tile_size: 64,
+                rects: vec![RfxRectangle {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                }],
+                quant_vals: vec![quant],
+                quant_prog_vals: Vec::new(),
+                flags: u8::from(extrapolate), // RFX_DWT_REDUCE_EXTRAPOLATE
+                tiles,
+            }),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ])
+        .unwrap()
+    }
+
+    /// Tiles decode in parallel, each exactly as on its own.
+    #[test]
+    fn progressive_parallel_decoding_matches_each_tile_alone() {
+        use ironrdp_graphics::progressive::TileState;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ComponentCodecQuant, ProgressiveBlock, ProgressiveTile, decode_progressive_stream,
+        };
+        let stream = progressive_screen(true);
+        let actual = ProgressiveDecoder::new()
+            .decode_bitmap(0, 1920, 1080, &stream)
+            .unwrap();
+        let blocks = decode_progressive_stream(&stream).unwrap();
+        let Some(ProgressiveBlock::Region(region)) = blocks
+            .iter()
+            .find(|block| matches!(block, ProgressiveBlock::Region(_)))
+        else {
+            panic!("the stream has a region");
+        };
+        assert_eq!(actual.len(), region.tiles.len());
+        let quant = &region.quant_vals[0];
+        let lossless = ComponentCodecQuant::LOSSLESS;
+        for (tile, decoded) in region.tiles.iter().zip(&actual) {
+            let ProgressiveTile::Simple(tile) = tile else {
+                panic!("expected simple tiles");
+            };
+            let mut state = TileState::new();
+            let data = [tile.y_data, tile.cb_data, tile.cr_data];
+            let quants = [quant; 3];
+            state
+                .decode_first(data, quants, [lossless; 3], [0; 3], 0xFF, true, false)
+                .unwrap();
+            let mut pixels = vec![0; 64 * 64 * 4];
+            state.reconstruct_to_rgba(&mut pixels);
+            assert_eq!((decoded.x_idx, decoded.y_idx), (tile.x_idx, tile.y_idx));
+            assert!(
+                decoded.pixels == pixels,
+                "tile {}, {}",
+                tile.x_idx,
+                tile.y_idx
+            );
+        }
+    }
+
+    /// Updates of the same tile in one stream apply in order, and every update is reported
+    /// in stream order: two passes in one stream equal the two decoded in turn.
+    #[test]
+    fn progressive_repeated_tiles_decode_in_order() {
+        for (first, upgrade) in [
+            (
+                &include_bytes!("testdata/progressive-std.1.bin")[..],
+                &include_bytes!("testdata/progressive-std.2.bin")[..],
+            ),
+            (
+                &include_bytes!("testdata/progressive-rex.1.bin")[..],
+                &include_bytes!("testdata/progressive-rex.2.bin")[..],
+            ),
+        ] {
+            let mut separate = ProgressiveDecoder::new();
+            let mut expected = separate.decode_bitmap(0, 128, 64, first).unwrap();
+            expected.extend(separate.decode_bitmap(0, 128, 64, upgrade).unwrap());
+            let both = [first, upgrade].concat();
+            let actual = ProgressiveDecoder::new()
+                .decode_bitmap(0, 128, 64, &both)
+                .unwrap();
+            assert_eq!(actual.len(), 4);
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(
+                    (actual.x_idx, actual.y_idx),
+                    (expected.x_idx, expected.y_idx)
+                );
+                assert_eq!(actual.pixels, expected.pixels);
+            }
+        }
+    }
+
+    /// Progressive streams draw the same on GPU surfaces, which reconstruct tiles from their
+    /// coefficients, as on CPU surfaces: full pictures for both DWTs, and FreeRDP's first and
+    /// upgrade passes.
+    #[test]
+    #[ignore = "requires a Vulkan GPU and access to /dev/dri"]
+    fn gpu_progressive_streams_match_cpu() {
+        let context = crate::gpu::tests::context().unwrap();
+        let error = Arc::new(Mutex::new(None));
+        let file = |bytes: &[u8]| bytes.to_vec();
+        let cases = [
+            (1920, 1080, vec![progressive_screen(true)]),
+            (1920, 1080, vec![progressive_screen(false)]),
+            (
+                160,
+                96,
+                vec![file(include_bytes!("testdata/progressive-160x96.bin"))],
+            ),
+            (
+                128,
+                64,
+                vec![
+                    file(include_bytes!("testdata/progressive-std.1.bin")),
+                    file(include_bytes!("testdata/progressive-std.2.bin")),
+                ],
+            ),
+            (
+                128,
+                64,
+                vec![
+                    file(include_bytes!("testdata/progressive-rex.1.bin")),
+                    file(include_bytes!("testdata/progressive-rex.2.bin")),
+                ],
+            ),
+        ];
+        for (w, h, passes) in cases {
+            let mut cpu = Surface::new(w, h);
+            let mut gpu = Surface::new_gpu(w, h, Arc::clone(&context), Arc::clone(&error));
+            let (mut cpu_contexts, mut gpu_contexts) = Default::default();
+            for (surface, contexts, output) in [
+                (&mut cpu, &mut cpu_contexts, TileOutput::Rgba),
+                (&mut gpu, &mut gpu_contexts, TileOutput::Coefficients),
+            ] {
+                let contexts: &mut ProgressiveContexts = contexts;
+                for pass in &passes {
+                    let (w, h) = (w as u16, h as u16);
+                    let tiles = contexts.decode(1, 0, w, h, pass, output).unwrap();
+                    apply_progressive_tiles(surface, tiles);
+                }
+            }
+            let actual = crate::gpu::tests::read(&context, &gpu.gpu.as_ref().unwrap().image);
+            assert!(actual == cpu.data, "{w}x{h} differs");
+        }
+        assert!(error.lock().is_none(), "{:?}", error.lock());
+    }
+
+    /// A full 1080p progressive picture onto a GPU surface, decoded to pixels on the CPU and
+    /// uploaded, or to coefficients the GPU reconstructs. Reports elapsed time, the session
+    /// thread's CPU time and the whole process's (the decoding threads' too).
+    #[test]
+    #[ignore = "requires a Vulkan GPU; reports progressive drawing cost"]
+    fn gpu_progressive_throughput() {
+        let cpu_time = |clock| {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(unsafe { libc::clock_gettime(clock, &mut time) }, 0);
+            time.tv_sec as f64 * 1000.0 + time.tv_nsec as f64 / 1e6
+        };
+        let context = crate::gpu::tests::context().unwrap();
+        let error = Arc::new(Mutex::new(None));
+        for extrapolate in [true, false] {
+            let stream = progressive_screen(extrapolate);
+            for output in [TileOutput::Rgba, TileOutput::Coefficients] {
+                let mut surface =
+                    Surface::new_gpu(1920, 1080, Arc::clone(&context), Arc::clone(&error));
+                let mut contexts = ProgressiveContexts::default();
+                let mut frame = || {
+                    let tiles = contexts.decode(1, 0, 1920, 1080, &stream, output).unwrap();
+                    apply_progressive_tiles(&mut surface, tiles);
+                    context.flush().unwrap();
+                    context
+                        .device
+                        .poll(egui_wgpu::wgpu::PollType::wait_indefinitely())
+                        .unwrap();
+                };
+                for _ in 0..3 {
+                    frame();
+                }
+                let runs = 20;
+                let (thread, process) = (
+                    libc::CLOCK_THREAD_CPUTIME_ID,
+                    libc::CLOCK_PROCESS_CPUTIME_ID,
+                );
+                let (start_thread, start_process) = (cpu_time(thread), cpu_time(process));
+                let start = std::time::Instant::now();
+                for _ in 0..runs {
+                    frame();
+                }
+                let per_run = |ms: f64| ms / f64::from(runs);
+                eprintln!(
+                    "1080p progressive via {output:?} (extrapolate {extrapolate}): {:.2} ms elapsed, \
+                     {:.2} ms session-thread CPU, {:.2} ms CPU in all threads",
+                    per_run(start.elapsed().as_secs_f64() * 1000.0),
+                    per_run(cpu_time(thread) - start_thread),
+                    per_run(cpu_time(process) - start_process),
+                );
+            }
+        }
+        assert!(error.lock().is_none(), "{:?}", error.lock());
+    }
+
+    /// Decoding a full 1080p progressive picture on the CPU, to pixels or to coefficients.
+    #[test]
+    #[ignore = "reports progressive decoding cost"]
+    fn progressive_decode_throughput() {
+        for extrapolate in [true, false] {
+            let stream = progressive_screen(extrapolate);
+            for output in [TileOutput::Rgba, TileOutput::Coefficients] {
+                let mut decoder = ProgressiveDecoder::new();
+                let tiles = decoder
+                    .decode_bitmap_as(0, 1920, 1080, &stream, output)
+                    .unwrap();
+                assert_eq!(tiles.len(), 510);
+                let runs = 20;
+                let start = std::time::Instant::now();
+                for _ in 0..runs {
+                    decoder
+                        .decode_bitmap_as(0, 1920, 1080, &stream, output)
+                        .unwrap();
+                }
+                eprintln!(
+                    "1080p progressive to {output:?} (extrapolate {extrapolate}, {} KiB): {:.2} ms",
+                    stream.len() / 1024,
+                    start.elapsed().as_secs_f64() * 1000.0 / f64::from(runs),
+                );
+            }
         }
     }
 
