@@ -76,7 +76,8 @@ cd -- "$_relay_output"
 # avoid skipping runtime dependencies when a compiler is managed outside pacman.
 source ./PKGBUILD
 makepkg --printsrcinfo > .SRCINFO
-makepkg --verifysource
+# --force: a rebuild of the same version replaces the previous package.
+makepkg --verifysource --force
 
 _relay_makepkg_flags=(--force --cleanbuild --check --nosign)
 if ! pacman -T cargo >/dev/null; then
