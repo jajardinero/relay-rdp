@@ -1057,7 +1057,9 @@ impl Ui {
                     });
                 }
             }
-            Action::OpenSettings => self.dialog = Some(Dialog::Settings),
+            Action::OpenSettings => {
+                self.dialog = Some(Dialog::Settings(dialogs::SettingsDrawer::default()));
+            }
             Action::ImportRdpFile => self.picker.rdp_file(),
             Action::SetHostView(view) => {
                 self.settings.settings.host_view = view;
@@ -1100,14 +1102,17 @@ impl Ui {
         let Some(dialog) = &mut self.dialog else {
             return;
         };
+        let before = self.settings.settings.clone();
         let outcome = dialogs::show(ctx, dialog, &mut self.settings.settings);
+        // Persist edits even if the drawer is also dismissed in this frame.
+        if self.settings.settings != before {
+            self.settings.save();
+            self.applied_theme = None;
+            ctx.request_repaint();
+        }
         match outcome {
             dialogs::Outcome::Open => {}
             dialogs::Outcome::Close => self.dialog = None,
-            dialogs::Outcome::SettingsChanged => {
-                self.settings.save();
-                self.applied_theme = None;
-            }
             dialogs::Outcome::Connect {
                 profile,
                 saved,
