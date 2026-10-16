@@ -17,6 +17,10 @@ CPU other clients need.
 In the same full-screen test, Relay used **4.4× less CPU than xfreerdp** and **5.8× less than
 sdl-freerdp** ([details](#head-to-head-with-freerdp)).
 
+![A Windows Server session in Relay. The session bar shows the round-trip time, a latency graph and a GPU badge; its tooltip explains how the picture is rendered.](docs/images/session.png)
+
+![Relay's host library in tile view: hosts grouped, each with a snapshot of its screen and its detected Windows version.](docs/images/host-library.png)
+
 ## Contents
 
 - [Why it's fast](#why-its-fast)
