@@ -66,7 +66,6 @@ const TILE_MIN_WIDTH: f32 = 200.0;
 /// Below a tile's 16:9 preview: name, address and details.
 const TILE_INFO_HEIGHT: f32 = 76.0;
 const TILE_GAP: f32 = 12.0;
-const CONTENT_MAX_WIDTH: f32 = 1040.0;
 
 pub fn show(
     ui: &mut Ui,
@@ -115,7 +114,7 @@ pub fn show(
                 }),
         )
         .show(ui, |ui| {
-            let width = ui.available_width().min(CONTENT_MAX_WIDTH);
+            let width = ui.available_width();
             ui.allocate_ui_with_layout(
                 vec2(width, ui.available_height()),
                 Layout::top_down(Align::Min),
@@ -194,7 +193,21 @@ fn rail(ui: &mut Ui, state: &mut HomeState, profiles: &ProfileStore, actions: &m
         if rail_button(ui, icon::PLUS, "New host").clicked() {
             actions.push(Action::New(None));
         }
+        // Bottom up: above New host.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(version_label())
+                    .size(size::SMALL)
+                    .color(p.muted),
+            );
+        });
     });
+}
+
+fn version_label() -> String {
+    format!("Version {}", env!("CARGO_PKG_VERSION"))
 }
 
 /// The mark: the four-bar link glyph, at full strength.
@@ -1171,9 +1184,12 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("missing sidebar entry: {label}"))
         };
+        let version_text = version_label();
+        let version = label_pos(version_text.as_str());
         let new_host = label_pos("New host");
         let passwords = label_pos("Passwords");
         let import = label_pos("Import .rdp file");
+        assert!(version.y < new_host.y);
         assert!(new_host.y < passwords.y && passwords.y < import.y);
         render(vec![Event::PointerMoved(passwords)]);
         render(vec![pointer_button(passwords, true)]);
