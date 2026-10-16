@@ -886,6 +886,44 @@ impl GpuContext {
         pending.sources.clear();
     }
 
+    /// Copies `image` into a buffer the caller maps for reading (rows `stride` bytes apart),
+    /// after the work submitted so far. For snapshots; frames themselves never leave the GPU.
+    pub fn read_image(&self, image: &GpuImage) -> (wgpu::Buffer, u32) {
+        let stride = (image.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RDP snapshot"),
+            size: u64::from(stride) * u64::from(image.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.encoder();
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &image.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        // Straight to the queue, not through the batch: the copy sees the last finished frame
+        // and leaves a frame the session is drawing alone.
+        self.queue.submit([encoder.finish()]);
+        (buffer, stride)
+    }
+
     /// Whether [`draw_tile`](Self::draw_tile) is available.
     pub fn reconstructs_tiles(&self) -> bool {
         self.progressive.is_some()

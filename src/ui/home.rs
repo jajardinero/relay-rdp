@@ -5,6 +5,7 @@ use egui::{Align, Color32, CornerRadius, Key, Layout, RichText, Sense, Stroke, U
 use egui_phosphor::regular as icon;
 use uuid::Uuid;
 
+use super::previews::Previews;
 use super::theme::{self, Palette, radius, size};
 use super::widgets::{self, Signal};
 use crate::store::credentials::CredentialStore;
@@ -62,7 +63,8 @@ enum Row {
 const RAIL_WIDTH: f32 = 232.0;
 const ROW_HEIGHT: f32 = 52.0;
 const TILE_MIN_WIDTH: f32 = 200.0;
-const TILE_HEIGHT: f32 = 132.0;
+/// Below a tile's 16:9 preview: name, address and details.
+const TILE_INFO_HEIGHT: f32 = 76.0;
 const TILE_GAP: f32 = 12.0;
 const CONTENT_MAX_WIDTH: f32 = 1040.0;
 
@@ -73,6 +75,7 @@ pub fn show(
     credentials: &CredentialStore,
     prober: &Prober,
     view: HostView,
+    previews: &mut Previews,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let p = Palette::of(ui);
@@ -117,7 +120,16 @@ pub fn show(
                 vec2(width, ui.available_height()),
                 Layout::top_down(Align::Min),
                 |ui| {
-                    main_column(ui, state, profiles, credentials, prober, view, &mut actions);
+                    main_column(
+                        ui,
+                        state,
+                        profiles,
+                        credentials,
+                        prober,
+                        view,
+                        previews,
+                        &mut actions,
+                    );
                 },
             );
         });
@@ -287,6 +299,7 @@ fn main_column(
     credentials: &CredentialStore,
     prober: &Prober,
     view: HostView,
+    previews: &mut Previews,
     actions: &mut Vec<Action>,
 ) {
     let p = Palette::of(ui);
@@ -441,8 +454,15 @@ fn main_column(
                                 for host in row {
                                     let signal = prober.signal(host.address.trim(), host.port);
                                     let selected = state.selected == Some(index);
+                                    let preview = previews.texture(ui.ctx(), host.id);
+                                    let tile = Tile {
+                                        signal,
+                                        selected,
+                                        width: tile_width,
+                                        preview: preview.as_ref(),
+                                    };
                                     ui.push_id((heading, host.id), |ui| {
-                                        host_tile(ui, host, signal, selected, tile_width, actions);
+                                        host_tile(ui, host, tile, actions);
                                     });
                                     index += 1;
                                 }
@@ -890,22 +910,27 @@ fn os_logo_color(os: OsKind, palette: &Palette) -> Color32 {
     }
 }
 
-/// A host as a tile: its operating system's logo, name, address, and the detected operating
-/// system (or when it was last used). Hovering shows the same actions as a row.
-fn host_tile(
-    ui: &mut Ui,
-    host: &HostProfile,
+/// How a tile is drawn.
+struct Tile<'a> {
     signal: Signal,
     selected: bool,
     width: f32,
-    actions: &mut Vec<Action>,
-) {
+    /// A snapshot of the host's screen.
+    preview: Option<&'a egui::TextureHandle>,
+}
+
+/// A host as a tile: a snapshot of its screen (or its operating system's logo), its name,
+/// address, and the detected operating system (or when it was last used). Hovering shows the
+/// same actions as a row.
+fn host_tile(ui: &mut Ui, host: &HostProfile, tile: Tile<'_>, actions: &mut Vec<Action>) {
     let p = Palette::of(ui);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, TILE_HEIGHT), Sense::click());
+    let preview_h = (tile.width * 9.0 / 16.0).round();
+    let size = vec2(tile.width, preview_h + TILE_INFO_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let hovered = response.hovered() || ui.rect_contains_pointer(rect);
     let more_id = ui.make_persistent_id("host-more");
     let show_actions = hovered || egui::Popup::is_id_open(ui.ctx(), more_id);
-    let fill = if selected {
+    let fill = if tile.selected {
         p.accent_soft()
     } else if hovered {
         p.hover()
@@ -919,56 +944,105 @@ fn host_tile(
         Stroke::new(1.0, p.hairline),
         egui::StrokeKind::Inside,
     );
-    let inner = rect.shrink(14.0);
-    let painter = ui.painter_at(inner);
 
-    let os = host.os_kind();
-    painter.text(
-        inner.left_top(),
-        egui::Align2::LEFT_TOP,
-        os_glyph(os),
-        theme::font(30.0),
-        os_logo_color(os, &p),
+    // The preview, inside the border, with the tile's top corners.
+    let preview = egui::Rect::from_min_max(
+        rect.min + vec2(1.0, 1.0),
+        egui::pos2(rect.right() - 1.0, rect.top() + preview_h),
     );
+    let top_corners = CornerRadius {
+        nw: radius::PANEL - 1,
+        ne: radius::PANEL - 1,
+        sw: 0,
+        se: 0,
+    };
+    let os = host.os_kind();
+    if let Some(texture) = tile.preview {
+        egui::Image::from_texture(egui::load::SizedTexture::from_handle(texture))
+            .uv(crop_to(texture.size_vec2(), preview.size()))
+            .corner_radius(top_corners)
+            .paint_at(ui, preview);
+        // The operating system as a badge in the preview's corner.
+        let badge = preview.left_bottom() + vec2(22.0, -20.0);
+        ui.painter()
+            .circle(badge, 14.0, p.raised, Stroke::new(1.0, p.hairline));
+        ui.painter().text(
+            badge,
+            egui::Align2::CENTER_CENTER,
+            os_glyph(os),
+            theme::font(15.0),
+            os_logo_color(os, &p),
+        );
+    } else {
+        ui.painter().rect_filled(preview, top_corners, p.canvas);
+        ui.painter().text(
+            preview.center(),
+            egui::Align2::CENTER_CENTER,
+            os_glyph(os),
+            theme::font(40.0),
+            os_logo_color(os, &p),
+        );
+    }
+    ui.painter().hline(
+        preview.x_range(),
+        preview.bottom(),
+        Stroke::new(1.0, p.hairline),
+    );
+    // Signal bars on a dark pill, readable over any picture.
+    let pill =
+        egui::Rect::from_center_size(preview.right_top() + vec2(-24.0, 16.0), vec2(30.0, 20.0));
+    if tile.preview.is_some() {
+        ui.painter()
+            .rect_filled(pill, CornerRadius::same(10), Color32::from_black_alpha(150));
+    }
+    let mut signal_ui = ui.new_child(egui::UiBuilder::new().max_rect(
+        egui::Rect::from_center_size(pill.center(), vec2(16.0, 14.0)),
+    ));
+    widgets::signal_bars(&mut signal_ui, tile.signal).on_hover_text(tile.signal.label());
 
-    let name_y = inner.top() + 50.0;
+    let info = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 14.0, preview.bottom() + 12.0),
+        rect.max - vec2(14.0, 10.0),
+    );
+    let painter = ui.painter_at(info);
+    // On hover, Edit and More take the name row's right end, Connect the bottom right.
+    let name_w = info.width() - if show_actions { 64.0 } else { 0.0 };
     let star_w = if host.favorite { 20.0 } else { 0.0 };
     let name = fitted(
         ui,
         host.display_name(),
         theme::font_medium(size::BODY),
-        inner.width() - star_w,
+        name_w - star_w,
     );
-    let name_w = name.size().x;
-    painter.galley(egui::pos2(inner.left(), name_y), name, p.text);
+    let name_end = info.left() + name.size().x;
+    painter.galley(info.left_top(), name, p.text);
     if host.favorite {
         painter.text(
-            egui::pos2(inner.left() + name_w + 6.0, name_y + 1.0),
+            egui::pos2(name_end + 6.0, info.top() + 1.0),
             egui::Align2::LEFT_TOP,
             icon::STAR,
             theme::font(12.0),
             p.fair,
         );
     }
-    let address = fitted(ui, &host.endpoint(), theme::mono(12.0), inner.width());
-    painter.galley(egui::pos2(inner.left(), name_y + 20.0), address, p.muted);
+    let address = fitted(ui, &host.endpoint(), theme::mono(12.0), info.width());
+    painter.galley(info.left_top() + vec2(0.0, 20.0), address, p.muted);
     let detail = if host.credential_profile_id.is_some() {
         host.account_label()
     } else {
         host.os_label()
             .unwrap_or_else(|| last_used(host.last_connected))
     };
-    // On hover the Connect button takes the bottom right.
-    let detail_w = inner.width() - if show_actions { 96.0 } else { 0.0 };
+    let detail_w = info.width() - if show_actions { 96.0 } else { 0.0 };
     let detail = fitted(ui, &detail, theme::font(size::SMALL), detail_w);
-    let detail_y = inner.bottom() - detail.size().y;
-    painter.galley(egui::pos2(inner.left(), detail_y), detail, p.muted);
+    let detail_y = info.bottom() - detail.size().y;
+    painter.galley(egui::pos2(info.left(), detail_y), detail, p.muted);
 
     let mut clicked_action = false;
     if show_actions {
         let top = egui::Rect::from_min_max(
-            egui::pos2(rect.right() - 100.0, rect.top() + 8.0),
-            egui::pos2(rect.right() - 8.0, rect.top() + 40.0),
+            egui::pos2(rect.right() - 80.0, preview.bottom() + 4.0),
+            egui::pos2(rect.right() - 8.0, preview.bottom() + 36.0),
         );
         let mut top_ui = ui.new_child(
             egui::UiBuilder::new()
@@ -983,8 +1057,8 @@ fn host_tile(
         }
 
         let bottom = egui::Rect::from_min_max(
-            egui::pos2(rect.right() - 110.0, rect.bottom() - 44.0),
-            egui::pos2(rect.right() - 10.0, rect.bottom() - 8.0),
+            egui::pos2(rect.right() - 110.0, rect.bottom() - 40.0),
+            egui::pos2(rect.right() - 10.0, rect.bottom() - 6.0),
         );
         let mut bottom_ui = ui.new_child(
             egui::UiBuilder::new()
@@ -995,15 +1069,26 @@ fn host_tile(
             actions.push(Action::Connect(host.id));
             clicked_action = true;
         }
-    } else {
-        let mut glyph_ui = ui.new_child(egui::UiBuilder::new().max_rect(
-            egui::Rect::from_center_size(inner.right_top() + vec2(-8.0, 8.0), vec2(16.0, 14.0)),
-        ));
-        widgets::signal_bars(&mut glyph_ui, signal).on_hover_text(signal.label());
     }
 
     if !clicked_action && response.double_clicked() {
         actions.push(Action::Connect(host.id));
+    }
+}
+
+/// The part of an image `image` to show in `area`, cropped from the center to its aspect.
+fn crop_to(image: egui::Vec2, area: egui::Vec2) -> egui::Rect {
+    let (image_aspect, area_aspect) = (image.x / image.y.max(1.0), area.x / area.y.max(1.0));
+    if image_aspect > area_aspect {
+        let width = area_aspect / image_aspect;
+        egui::Rect::from_min_max(
+            egui::pos2((1.0 - width) / 2.0, 0.0),
+            egui::pos2((1.0 + width) / 2.0, 1.0),
+        )
+    } else {
+        // Taller pictures keep their top, where title bars and taskbars at the top are.
+        let height = image_aspect / area_aspect;
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, height))
     }
 }
 
@@ -1139,7 +1224,11 @@ mod tests {
                                         HostView::List => {
                                             vec2(ui.available_width() - 25.0, ROW_HEIGHT / 2.0)
                                         }
-                                        HostView::Tiles => vec2(TILE_WIDTH - 23.0, 24.0),
+                                        // The name row, below the 16:9 preview.
+                                        HostView::Tiles => vec2(
+                                            TILE_WIDTH - 23.0,
+                                            (TILE_WIDTH * 9.0 / 16.0).round() + 20.0,
+                                        ),
                                     };
                             } else {
                                 result.other_menu = id;
@@ -1150,14 +1239,13 @@ mod tests {
                                     host_row(ui, host, Signal::Unknown, false, actions);
                                 }
                                 HostView::Tiles => {
-                                    host_tile(
-                                        ui,
-                                        host,
-                                        Signal::Unknown,
-                                        false,
-                                        TILE_WIDTH,
-                                        actions,
-                                    );
+                                    let tile = Tile {
+                                        signal: Signal::Unknown,
+                                        selected: false,
+                                        width: TILE_WIDTH,
+                                        preview: None,
+                                    };
+                                    host_tile(ui, host, tile, actions);
                                 }
                             }
                         });

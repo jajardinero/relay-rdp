@@ -74,6 +74,8 @@ pub struct SessionTab {
     pub last_request: Option<DesktopRequest>,
     /// Was the session ever live? Decides between the connect track and the "disconnected" card.
     pub was_live: bool,
+    /// When the picture last went live (after connecting or reconnecting).
+    pub live_since: Option<Instant>,
     pub bar: BarState,
     db: Database,
     pub wheel: WheelAccumulator,
@@ -121,6 +123,7 @@ impl SessionTab {
             rtt_history: VecDeque::with_capacity(RTT_HISTORY),
             last_request: Some(desktop),
             was_live: false,
+            live_since: None,
             bar: BarState::default(),
             db: Database::new(),
             wheel: WheelAccumulator::default(),
@@ -235,6 +238,7 @@ impl SessionTab {
         let first = !self.was_live;
         self.phase = Phase::Live;
         self.was_live = true;
+        self.live_since = Some(Instant::now());
         if first {
             // Show the session bar briefly so people learn where it lives.
             self.bar.visible_until = Some(Instant::now() + Duration::from_millis(2500));

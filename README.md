@@ -42,6 +42,15 @@ domain, display, connection speed, visual effects, audio, clipboard and
 load-balancing settings, and lists any setting it can't use yet, such as RD
 Gateway or RemoteApp.
 
+The host library shows hosts as a list or as tiles (the buttons beside its
+title). A tile shows a snapshot of the host's screen, taken 10 seconds after a
+session's picture appears, every two minutes while it stays live, and when you
+close or disconnect it. Snapshots are small PNGs in Relay's data folder
+(`~/.local/share/relay/previews`), stored unencrypted. **Settings → Desktop
+previews** turns them off and deletes them. Hosts without a snapshot show their
+operating system's logo; Relay detects Windows versions when signing in, and the
+host editor's **Operating system** field sets it by hand.
+
 Relay prefers rustls for TLS. If the TLS handshake fails because a server
 requires compatibility ciphers, it retries once with OpenSSL over a fresh RDP
 connection. This adds TLS 1.2 ECDHE-RSA AES-CBC/SHA-2 support; TLS 1.0 and 1.1

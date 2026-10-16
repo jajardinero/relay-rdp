@@ -4,6 +4,7 @@ pub mod credentials;
 pub mod dialogs;
 pub mod editor;
 pub mod home;
+pub mod previews;
 pub mod session_view;
 pub mod tab;
 pub mod theme;
@@ -100,6 +101,7 @@ pub struct Ui {
     known_hosts: Arc<Mutex<KnownHosts>>,
     prober: Prober,
     picker: Picker,
+    previews: previews::Previews,
 
     tabs: Vec<SessionTab>,
     active: ActiveTab,
@@ -149,6 +151,10 @@ impl Ui {
         });
         let prober = Prober::new(proxy.clone());
         let picker = Picker::new(proxy.clone());
+        let preview_proxy = proxy.clone();
+        let previews = previews::Previews::new(move || {
+            let _ = preview_proxy.send_event(UserEvent::Wake);
+        });
         let ui = Self {
             gpu: None,
             settings: SettingsStore::load(),
@@ -158,6 +164,7 @@ impl Ui {
             known_hosts: Arc::new(Mutex::new(KnownHosts::load())),
             prober,
             picker,
+            previews,
             proxy,
             tabs: Vec::new(),
             active: ActiveTab::Home,
@@ -248,6 +255,17 @@ impl Ui {
                 tab.handle_event(event);
                 if went_live && tab.saved {
                     self.profiles.mark_connected(tab.profile.id);
+                }
+            }
+        }
+
+        // Snapshots of live sessions for the host library's tiles.
+        if self.settings.settings.desktop_previews {
+            for tab in &self.tabs {
+                if let (true, true, Some(since)) = (tab.saved, tab.is_live(), tab.live_since) {
+                    let gpu = self.gpu.as_ref();
+                    self.previews
+                        .capture_if_due(tab.profile.id, since, &tab.handle.frame, gpu);
                 }
             }
         }
@@ -913,7 +931,23 @@ impl Ui {
         self.request_connect(profile, saved, None);
     }
 
+    /// A last snapshot of a live session the user is leaving.
+    fn capture_preview(&mut self, id: TabId) {
+        if !self.settings.settings.desktop_previews {
+            return;
+        }
+        if let Some(tab) = self.tabs.iter().find(|t| t.id == id)
+            && tab.saved
+            && tab.is_live()
+        {
+            let gpu = self.gpu.as_ref();
+            self.previews
+                .capture(tab.profile.id, &tab.handle.frame, gpu);
+        }
+    }
+
     fn close_tab(&mut self, id: TabId) {
+        self.capture_preview(id);
         if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
             let mut tab = self.tabs.remove(index);
             tab.disconnect();
@@ -1082,6 +1116,7 @@ impl Ui {
             &self.credentials,
             &self.prober,
             view,
+            &mut self.previews,
         );
         for action in actions {
             self.handle_home_action(action);
@@ -1139,6 +1174,7 @@ impl Ui {
                 .requests
                 .push(WindowRequest::SetFullscreen(!self.fullscreen)),
             Action::Disconnect => {
+                self.capture_preview(id);
                 if let Some(tab) = self.tab_mut(id) {
                     tab.disconnect();
                 }
@@ -1334,6 +1370,9 @@ impl Ui {
             self.profiles.hosts(),
             &mut self.credential_manager,
         );
+        if before.desktop_previews && !self.settings.settings.desktop_previews {
+            self.previews.clear();
+        }
         // Persist edits even if the drawer is also dismissed in this frame.
         if self.settings.settings != before {
             self.settings.save();
@@ -1394,6 +1433,7 @@ impl Ui {
                 self.dialog = None;
                 if let Some(removed) = self.profiles.remove(id) {
                     secrets::delete_password_in_background(removed.id);
+                    self.previews.remove(removed.id);
                     self.watch_hosts();
                     self.toasts
                         .info(format!("Deleted {}", removed.display_name()));

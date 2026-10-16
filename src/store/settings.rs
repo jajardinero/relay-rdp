@@ -53,6 +53,9 @@ pub struct AppSettings {
     pub touchpad_momentum: bool,
     #[serde(default)]
     pub host_view: HostView,
+    /// Keep a snapshot of each host's screen for its tile in the host library.
+    #[serde(default = "default_true")]
+    pub desktop_previews: bool,
 }
 
 fn default_true() -> bool {
@@ -74,6 +77,7 @@ impl Default for AppSettings {
             touchpad_scroll_speed: default_scroll_speed(),
             touchpad_momentum: true,
             host_view: HostView::default(),
+            desktop_previews: true,
         }
     }
 }
@@ -109,6 +113,7 @@ mod tests {
         assert!(old.touchpad_momentum);
         assert_eq!(old.touchpad_scroll_speed, 1.0);
         assert_eq!(old.host_view, HostView::List);
+        assert!(old.desktop_previews);
         assert!(!old.low_latency);
         assert_eq!(old.theme, ThemePreference::Dark);
         assert!(AppSettings::default().hardware_video_decoding);

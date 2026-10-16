@@ -453,6 +453,16 @@ fn settings_contents(ui: &mut Ui, settings: &mut AppSettings) {
             widgets::toggle(ui, &mut settings.reduce_motion);
         },
     );
+    settings_row(
+        ui,
+        "Desktop previews",
+        Some(
+            "Show a snapshot of each host's screen on its tile. Saved unencrypted in Relay's data folder; turning this off deletes them.",
+        ),
+        |ui| {
+            widgets::toggle(ui, &mut settings.desktop_previews);
+        },
+    );
 
     ui.add_space(16.0);
     widgets::section_label(ui, "Keyboard");

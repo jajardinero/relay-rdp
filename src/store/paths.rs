@@ -32,6 +32,11 @@ pub fn data_dir() -> Option<PathBuf> {
     project_dirs().map(|d| d.data_dir().to_path_buf())
 }
 
+/// `~/.local/share/relay/previews`: snapshots of hosts' screens for the host library.
+pub fn previews_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("previews"))
+}
+
 /// `~/.local/state/relay/logs`
 pub fn log_dir() -> Option<PathBuf> {
     if let Some(home) = override_dir() {
