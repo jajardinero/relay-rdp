@@ -1,12 +1,15 @@
-// Fills and uploads drawn into one image as instanced quads, all in one render pass.
+// Fills, uploads and copies from other images drawn into one image as instanced quads, all in
+// one render pass.
 //
 // data: [image width, image height, first pixel word, 0], then 8 words per quad
-// (x, y, width, height, kind, payload, 0, 0), then the uploaded pixels as packed RGBA8.
+// (x, y, width, height, kind, payload..., 0), then the uploaded pixels as packed RGBA8.
 // A fill's payload is its packed color; an upload's is its first word among the pixels,
-// whose rows are packed `width` words apart.
+// whose rows are packed `width` words apart; a copy's is the x and y it reads in `source`.
 @group(0) @binding(0) var<storage, read> data: array<u32>;
+@group(1) @binding(0) var source: texture_2d<f32>;
 
 const FILL: u32 = 0u;
+const COPY: u32 = 2u;
 
 struct Varyings {
     @builtin(position) position: vec4<f32>,
@@ -28,9 +31,13 @@ struct Varyings {
 
 @fragment fn fragment(in: Varyings) -> @location(0) vec4<f32> {
     let base = 4u + in.quad * 8u;
-    if data[base + 4u] == FILL {
+    let kind = data[base + 4u];
+    if kind == FILL {
         return unpack4x8unorm(data[base + 5u]);
     }
     let p = vec2<u32>(in.position.xy) - vec2(data[base], data[base + 1u]);
+    if kind == COPY {
+        return textureLoad(source, vec2(data[base + 5u], data[base + 6u]) + p, 0);
+    }
     return unpack4x8unorm(data[data[2] + data[base + 5u] + p.y * data[base + 2u] + p.x]);
 }

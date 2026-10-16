@@ -4,7 +4,7 @@ mod import;
 
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
@@ -22,6 +22,8 @@ pub struct GpuImage {
     pub view: wgpu::TextureView,
     pub width: u32,
     pub height: u32,
+    /// Binds the image for quads that copy from it; made on first use.
+    source: OnceLock<wgpu::BindGroup>,
 }
 
 /// Staging memory is allocated in chunks of this size (a 1080p frame of tiles is about 8 MiB).
@@ -44,6 +46,8 @@ pub struct GpuContext {
     scratch: Mutex<Option<Arc<GpuImage>>>,
     conversion: wgpu::RenderPipeline,
     quads: wgpu::RenderPipeline,
+    /// Bound as the source while quads copy nothing, since the target can't be.
+    blank: wgpu::BindGroup,
     avc444: Avc444Pipelines,
     failure: Arc<Mutex<Option<String>>>,
 }
@@ -60,22 +64,27 @@ struct Batch {
     pending: Quads,
 }
 
-/// Fills and small uploads waiting to be drawn into one image, as instanced quads in a single
-/// render pass. Unlike copies into the same image, draws need no barrier between them.
+/// Fills, small uploads and copies from other images waiting to be drawn into one image, as
+/// instanced quads in a single render pass. Unlike copies into the same image, draws need no
+/// barrier between them.
 #[derive(Default)]
 struct Quads {
     target: Option<Arc<GpuImage>>,
-    /// x, y, width, height, kind, and a packed RGBA color (fills) or the first word of the
-    /// quad's pixels (uploads); see `quads.wgsl`.
+    /// x, y, width, height, kind, then a packed RGBA color (fills), the first word of the
+    /// quad's pixels (uploads), or the source x and y (copies); see `quads.wgsl`.
     items: Vec<[u32; 8]>,
     /// Uploaded pixels as RGBA, rows packed.
     pixels: Vec<u8>,
+    /// The images copies read: each from its first item until the next. Items before the
+    /// first read none.
+    sources: Vec<(u32, wgpu::BindGroup)>,
     /// The buffer the shaders read, reused while it is big enough.
     storage: Option<(wgpu::Buffer, wgpu::BindGroup)>,
 }
 
 const FILL: u32 = 0;
 const PIXELS: u32 = 1;
+const COPY: u32 = 2;
 
 struct Avc444Pipelines {
     layout: wgpu::BindGroupLayout,
@@ -226,6 +235,35 @@ fn interop_node(device: &wgpu::Device) -> anyhow::Result<String> {
     }
 }
 
+/// The size of a copy of `rect` from `src` to (x, y) in `dst`, clipped to both images.
+fn copy_size(src: &GpuImage, rect: Rect, dst: &GpuImage, x: u32, y: u32) -> Option<(u32, u32)> {
+    let w = rect
+        .w
+        .min(src.width.saturating_sub(rect.x))
+        .min(dst.width.saturating_sub(x));
+    let h = rect
+        .h
+        .min(src.height.saturating_sub(rect.y))
+        .min(dst.height.saturating_sub(y));
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// Binds `view` as the image the quad pipeline copies from.
+fn source_group(
+    device: &wgpu::Device,
+    quads: &wgpu::RenderPipeline,
+    view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("RDP quads source"),
+        layout: &quads.get_bind_group_layout(1),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(view),
+        }],
+    })
+}
+
 impl GpuContext {
     pub fn new(state: &RenderState) -> Option<Arc<Self>> {
         let storage = wgpu::DownlevelFlags::VERTEX_STORAGE | wgpu::DownlevelFlags::FRAGMENT_STORAGE;
@@ -331,6 +369,21 @@ impl GpuContext {
             multiview_mask: None,
             cache: None,
         });
+        let blank = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RDP quads blank source"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let blank = source_group(&device, &quads, &blank.create_view(&Default::default()));
         let avc444 = Avc444Pipelines::new(&device);
         let belt = wgpu::util::StagingBelt::new(device.clone(), STAGING_CHUNK);
         Self {
@@ -348,6 +401,7 @@ impl GpuContext {
             scratch: Mutex::new(None),
             conversion,
             quads,
+            blank,
             avc444,
             failure,
         }
@@ -376,7 +430,16 @@ impl GpuContext {
             texture,
             width,
             height,
+            source: OnceLock::new(),
         })
+    }
+
+    /// The bind group quads copy `image` through.
+    fn source(&self, image: &GpuImage) -> wgpu::BindGroup {
+        image
+            .source
+            .get_or_init(|| source_group(&self.device, &self.quads, &image.view))
+            .clone()
     }
 
     pub fn encoder(&self) -> wgpu::CommandEncoder {
@@ -557,21 +620,45 @@ impl GpuContext {
             });
             pass.set_pipeline(&self.quads);
             pass.set_bind_group(0, bind, &[]);
-            pass.draw(0..6, u32::from(clear.is_some())..count);
+            // One draw per source image, each from its first quad to the next source's.
+            let mut first = u32::from(clear.is_some());
+            let mut source = &self.blank;
+            let ends = pending.sources.iter().map(|(start, s)| (*start, s));
+            for (end, next) in ends.chain([(count, &self.blank)]) {
+                if end > first {
+                    pass.set_bind_group(1, source, &[]);
+                    pass.draw(0..6, first..end);
+                    first = end;
+                }
+                source = next;
+            }
         }
         *staged += size;
         pending.items.clear();
         pending.pixels.clear();
+        pending.sources.clear();
     }
 
     /// Records a copy of `rect` from `src` to (x, y) in `dst`, clipped to both images.
-    pub fn copy(&self, src: &GpuImage, rect: Rect, dst: &GpuImage, x: u32, y: u32) {
-        self.record(|encoder| Self::encode_copy(encoder, src, rect, dst, x, y));
+    pub fn copy(&self, src: &GpuImage, rect: Rect, dst: &Arc<GpuImage>, x: u32, y: u32) {
+        if std::ptr::eq(src, &**dst) {
+            return self.copy_within(dst, rect, &[(x, y)]);
+        }
+        let Some((w, h)) = copy_size(src, rect, dst, x, y) else {
+            return;
+        };
+        let source = self.source(src);
+        let mut batch = self.batch.lock();
+        let quads = self.quads_for(&mut batch, dst);
+        if quads.sources.last().is_none_or(|(_, last)| *last != source) {
+            quads.sources.push((quads.items.len() as u32, source));
+        }
+        quads.items.push([x, y, w, h, COPY, rect.x, rect.y, 0]);
     }
 
     /// Records copies of `rect` to each of `points` in the same image, all reading the
     /// original pixels (overlapping copies included).
-    pub fn copy_within(&self, image: &GpuImage, rect: Rect, points: &[(u32, u32)]) {
+    pub fn copy_within(&self, image: &Arc<GpuImage>, rect: Rect, points: &[(u32, u32)]) {
         let Some(rect) = rect.clip(image.width, image.height) else {
             return;
         };
@@ -587,13 +674,11 @@ impl GpuContext {
                 }
             }
         };
-        self.record(|encoder| {
-            Self::encode_copy(encoder, image, rect, &scratch, 0, 0);
-            for &(x, y) in points {
-                let staged = Rect::new(0, 0, rect.w, rect.h);
-                Self::encode_copy(encoder, &scratch, staged, image, x, y);
-            }
-        });
+        // Reading the image ends the pass drawing into it; the copies back start the next.
+        self.record(|encoder| Self::encode_copy(encoder, image, rect, &scratch, 0, 0));
+        for &(x, y) in points {
+            self.copy(&scratch, Rect::new(0, 0, rect.w, rect.h), image, x, y);
+        }
     }
 
     fn encode_copy(
@@ -604,17 +689,9 @@ impl GpuContext {
         x: u32,
         y: u32,
     ) {
-        let w = rect
-            .w
-            .min(src.width.saturating_sub(rect.x))
-            .min(dst.width.saturating_sub(x));
-        let h = rect
-            .h
-            .min(src.height.saturating_sub(rect.y))
-            .min(dst.height.saturating_sub(y));
-        if w == 0 || h == 0 {
+        let Some((w, h)) = copy_size(src, rect, dst, x, y) else {
             return;
-        }
+        };
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &src.texture,
@@ -1330,6 +1407,60 @@ pub(crate) mod tests {
         assert!(error.lock().is_none(), "{:?}", error.lock());
     }
 
+    /// Copies from other images join the quads; reads of the target itself (scrolls,
+    /// snapshots) still see everything drawn before them.
+    #[test]
+    #[ignore = "requires a Vulkan GPU and access to /dev/dri"]
+    fn gpu_copies_keep_order_with_quads() {
+        let context = context().unwrap();
+        let error = Arc::new(Mutex::new(None));
+        let (w, h) = (96, 64);
+        let picture: Vec<u8> = (0..w * h * 4).map(|i| (i % 249) as u8).collect();
+        let mut entries = Vec::new();
+        for color in [[200, 10, 20, 255], [30, 220, 40, 128]] {
+            let mut cpu = Surface::new(16, 12);
+            let mut gpu = Surface::new_gpu(16, 12, context.clone(), error.clone());
+            for entry in [&mut cpu, &mut gpu] {
+                entry.fill(Rect::new(0, 0, 16, 12), color);
+                entry.write(Rect::new(3, 2, 4, 4), &[77; 64], 16, SrcFormat::Rgba);
+            }
+            entries.push((cpu, gpu));
+        }
+        let mut gpu = Surface::new_gpu(w, h, context.clone(), error.clone());
+        let mut cpu = Surface::new(w, h);
+        for (surface, gpu_side) in [(&mut cpu, false), (&mut gpu, true)] {
+            let entry = |i: usize| {
+                let (cpu, gpu) = &entries[i];
+                if gpu_side { gpu } else { cpu }
+            };
+            surface.write(
+                Rect::new(0, 0, w, h),
+                &picture,
+                w as usize * 4,
+                SrcFormat::Rgbx,
+            );
+            surface.fill(Rect::new(4, 4, 30, 20), [1, 2, 3, 255]);
+            surface.copy_from(entry(0), 10, 10);
+            surface.write(Rect::new(12, 12, 4, 4), &[9; 64], 16, SrcFormat::Rgba);
+            surface.copy_from(entry(1), 20, 8);
+            surface.copy_from(entry(0), 88, 58);
+            surface.copy_within(Rect::new(0, 4, w, 40), &[(0, 0), (5, 30)]);
+            surface.fill(Rect::new(40, 2, 8, 8), [4, 5, 6, 255]);
+            surface.copy_within(Rect::new(8, 8, 30, 30), &[(50, 20)]);
+            let snapshot = surface.snapshot(Rect::new(7, 5, 32, 32)).unwrap();
+            surface.copy_from(entry(1), 0, 0);
+            surface.copy_from(&snapshot, 60, 0);
+            // Part of another surface, as SurfaceToSurface copies it.
+            let part = Rect::new(5, 3, 8, 6);
+            match &entry(0).gpu {
+                Some(source) => surface.copy_gpu(&source.image, part, 70, 40),
+                None => surface.copy_from(&entry(0).snapshot(part).unwrap(), 70, 40),
+            }
+        }
+        assert_eq!(read(&context, &gpu.gpu.as_ref().unwrap().image), cpu.data);
+        assert!(error.lock().is_none(), "{:?}", error.lock());
+    }
+
     fn thread_cpu() -> Duration {
         let mut time = libc::timespec {
             tv_sec: 0,
@@ -1343,8 +1474,8 @@ pub(crate) mod tests {
         Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
     }
 
-    /// A busy 1080p lossless frame: a full progressive refresh, glyphs, fills, a scroll and
-    /// cache traffic, then composition onto the output.
+    /// A busy 1080p lossless frame: a full progressive refresh, glyphs among cache hits, fills,
+    /// a scroll and cache traffic, then composition onto the output.
     #[test]
     #[ignore = "requires a Vulkan GPU; reports lossless composition cost per frame"]
     fn gpu_lossless_frame_throughput() {
@@ -1355,6 +1486,13 @@ pub(crate) mod tests {
         let output = context.image(width, height);
         let tile: Vec<u8> = (0..64 * 64 * 4).map(|i| (i * 7) as u8).collect();
         let glyph: Vec<u8> = (0..8 * 16 * 4).map(|i| (i * 13) as u8).collect();
+        let cached: Vec<Surface> = (0..16)
+            .map(|i| {
+                let mut entry = Surface::new_gpu(16, 16, context.clone(), error.clone());
+                entry.fill(Rect::new(0, 0, 16, 16), [i * 16, 80, 160, 255]);
+                entry
+            })
+            .collect();
         let frame = |surface: &mut Surface| {
             for ty in 0..height.div_ceil(64) {
                 for tx in 0..width / 64 {
@@ -1369,6 +1507,10 @@ pub(crate) mod tests {
             for i in 0..300 {
                 let (x, y) = ((i * 37) % (width - 8), (i * 53) % (height - 16));
                 surface.write(Rect::new(x, y, 8, 16), &glyph, 8 * 4, SrcFormat::Bgra);
+                if i % 3 != 0 {
+                    let (x, y) = ((i * 43) % (width - 16), (i * 31) % (height - 16));
+                    surface.copy_from(&cached[i as usize % cached.len()], x, y);
+                }
             }
             for i in 0..100 {
                 let (x, y) = ((i * 71) % (width - 40), (i * 29) % (height - 20));
