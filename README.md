@@ -1,6 +1,6 @@
 # Relay
 
-A native RDP client for Linux and Wayland, using egui and wgpu. X11 windows
+Ultra fast, low-latency and optimized for Wayland RDP client for Linux with GPU-accelerated H.264 written in Rust. X11 windows
 and XWayland are not supported.
 
 ## Build
