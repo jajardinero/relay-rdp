@@ -290,6 +290,36 @@ fn settings_dialog(ui: &mut Ui, settings: &mut AppSettings) -> Outcome {
         });
 
     ui.add_space(16.0);
+    widgets::section_label(ui, "Touchpad");
+    ui.add_space(2.0);
+    widgets::setting_row(
+        ui,
+        "Scroll momentum",
+        Some("Keep scrolling briefly after you lift your fingers, as local apps do."),
+        |ui| {
+            widgets::toggle(ui, &mut settings.touchpad_momentum);
+        },
+    );
+    widgets::setting_row(
+        ui,
+        "Scroll speed",
+        Some("How far the remote page scrolls for each swipe."),
+        |ui| {
+            egui::ComboBox::from_id_salt("scroll-speed")
+                .selected_text(speed_label(settings.touchpad_scroll_speed))
+                .show_ui(ui, |ui| {
+                    for speed in SCROLL_SPEEDS {
+                        ui.selectable_value(
+                            &mut settings.touchpad_scroll_speed,
+                            speed,
+                            speed_label(speed),
+                        );
+                    }
+                });
+        },
+    );
+
+    ui.add_space(16.0);
     widgets::section_label(ui, "Performance");
     ui.add_space(2.0);
     widgets::setting_row(
@@ -319,6 +349,12 @@ fn settings_dialog(ui: &mut Ui, settings: &mut AppSettings) -> Outcome {
     } else {
         Outcome::Open
     }
+}
+
+const SCROLL_SPEEDS: [f32; 6] = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0];
+
+fn speed_label(speed: f32) -> String {
+    format!("{:.0}%", speed * 100.0)
 }
 
 fn capture_label(capture: ShortcutCapture) -> &'static str {

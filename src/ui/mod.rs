@@ -11,6 +11,7 @@ pub mod widgets;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use egui::{Color32, CornerRadius, Sense, Stroke, vec2};
 use egui_phosphor::regular as icon;
@@ -18,7 +19,7 @@ use egui_wgpu::wgpu::FilterMode;
 use ironrdp_input::Operation;
 use parking_lot::Mutex;
 use uuid::Uuid;
-use winit::event::{MouseButton, MouseScrollDelta};
+use winit::event::{MouseButton, MouseScrollDelta, TouchPhase};
 use winit::event_loop::EventLoopProxy;
 use zeroize::Zeroizing;
 
@@ -407,6 +408,7 @@ impl Ui {
         };
         if let Some(tab) = self.tab_mut(tab_id) {
             let op = if pressed {
+                tab.wheel.stop_glide();
                 Operation::MouseButtonPressed(rdp_button)
             } else {
                 Operation::MouseButtonReleased(rdp_button)
@@ -416,7 +418,12 @@ impl Ui {
         true
     }
 
-    pub fn pointer_wheel(&mut self, ctx: &egui::Context, delta: MouseScrollDelta) -> bool {
+    pub fn pointer_wheel(
+        &mut self,
+        ctx: &egui::Context,
+        delta: MouseScrollDelta,
+        phase: TouchPhase,
+    ) -> bool {
         let Some(pos) = self.pointer_pos else {
             return false;
         };
@@ -424,11 +431,39 @@ impl Ui {
             return false;
         };
         self.flush_pointer();
+        let touchpad = self.touchpad_scrolling();
         if let Some(tab) = self.tab_mut(tab_id) {
-            let ops = tab.wheel.operations(delta);
+            let ops = tab.wheel.operations(delta, phase, Instant::now(), touchpad);
             tab.send_ops(ops);
         }
         true
+    }
+
+    fn touchpad_scrolling(&self) -> input::TouchpadScrolling {
+        let settings = &self.settings.settings;
+        input::TouchpadScrolling {
+            speed: f64::from(settings.touchpad_scroll_speed),
+            momentum: settings.touchpad_momentum,
+        }
+    }
+
+    /// Continues touchpad scrolling that is gliding after the fingers lifted.
+    pub fn glide(&mut self, now: Instant) {
+        let touchpad = self.touchpad_scrolling();
+        for tab in &mut self.tabs {
+            if tab.wheel.next_step().is_some_and(|at| at <= now) {
+                let ops = tab.wheel.glide(now, touchpad);
+                tab.send_ops(ops);
+            }
+        }
+    }
+
+    /// When the next glide step is due.
+    pub fn next_glide_step(&self) -> Option<Instant> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| tab.wheel.next_step())
+            .min()
     }
 
     /// While the pointer is over a remote desktop, UI repaints on mouse moves are only needed

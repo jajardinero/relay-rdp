@@ -36,10 +36,20 @@ pub struct AppSettings {
     /// Prefer VA-API decoding and GPU composition for new H.264 sessions.
     #[serde(default = "default_true")]
     pub hardware_video_decoding: bool,
+    /// Multiplies the distance touchpad scrolling covers on the remote computer.
+    #[serde(default = "default_scroll_speed")]
+    pub touchpad_scroll_speed: f32,
+    /// Keep touchpad scrolling going briefly after the fingers lift, as local apps do.
+    #[serde(default = "default_true")]
+    pub touchpad_momentum: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_scroll_speed() -> f32 {
+    1.0
 }
 
 impl Default for AppSettings {
@@ -50,6 +60,8 @@ impl Default for AppSettings {
             capture_shortcuts: ShortcutCapture::default(),
             low_latency: true,
             hardware_video_decoding: true,
+            touchpad_scroll_speed: default_scroll_speed(),
+            touchpad_momentum: true,
         }
     }
 }
@@ -82,6 +94,8 @@ mod tests {
     fn existing_settings_enable_hardware_by_default() {
         let old: AppSettings = toml::from_str("theme = 'dark'\nlow_latency = false\n").unwrap();
         assert!(old.hardware_video_decoding);
+        assert!(old.touchpad_momentum);
+        assert_eq!(old.touchpad_scroll_speed, 1.0);
         assert!(!old.low_latency);
         assert_eq!(old.theme, ThemePreference::Dark);
         assert!(AppSettings::default().hardware_video_decoding);

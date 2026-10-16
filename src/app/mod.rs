@@ -364,10 +364,10 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if self.ui.pointer_wheel(&self.egui_ctx, *delta) {
-                    return;
-                }
+            WindowEvent::MouseWheel { delta, phase, .. }
+                if self.ui.pointer_wheel(&self.egui_ctx, *delta, *phase) =>
+            {
+                return;
             }
             _ => {}
         }
@@ -382,16 +382,20 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Mouse moves are coalesced per event batch: one move per batch, not one per event.
         self.ui.flush_pointer();
+        let now = Instant::now();
+        self.ui.glide(now);
 
-        match self.next_repaint {
-            Some(at) if at <= Instant::now() => {
-                self.next_repaint = None;
-                self.request_redraw();
-                event_loop.set_control_flow(ControlFlow::Wait);
-            }
-            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+        if self.next_repaint.is_some_and(|at| at <= now) {
+            self.next_repaint = None;
+            self.request_redraw();
         }
+        // Wake for the next repaint or touchpad glide step, whichever comes first.
+        let wake = self
+            .next_repaint
+            .into_iter()
+            .chain(self.ui.next_glide_step())
+            .min();
+        event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
