@@ -1,8 +1,14 @@
 use ironrdp_core::{DecodeError, decode};
 use ironrdp_pdu::bitmap::rdp6::{BitmapStream as BitmapStreamPdu, ColorPlaneDefinition};
 
+use rayon::iter::{IndexedParallelIterator as _, IntoParallelIterator as _, ParallelIterator as _};
+use rayon::slice::ParallelSliceMut as _;
+
 use crate::color_conversion::Rgb;
-use crate::rdp6::rle::{RleDecodeError, decompress_8bpp_plane};
+use crate::rdp6::rle::{RleDecodeError, compressed_8bpp_plane_size, decompress_8bpp_plane};
+
+/// Bitmaps with at least this many pixels decode their planes and rows in parallel.
+const PARALLEL_PIXELS: usize = 1 << 16;
 
 #[derive(Debug)]
 pub enum BitmapDecodeError {
@@ -117,42 +123,40 @@ impl<'a> BitmapStreamDecoderImpl<'a> {
             let uncompressed_planes_buffer = &mut aux_buffer[..self.uncompressed_planes_size];
 
             let compressed = self.bitmap.color_panes_data();
-            let mut src_offset = 0;
+            // The alpha plane is discarded (always 0xFF): only its size matters.
+            let mut src_offset = if self.bitmap.header.use_alpha {
+                compressed_8bpp_plane_size(compressed, self.image_width, self.image_height)?
+            } else {
+                0
+            };
 
-            // Decompress Alpha plane
-            if self.bitmap.header.use_alpha {
-                // Decompress alpha alpha, but discard it (always 0xFF)
-                src_offset += decompress_8bpp_plane(
-                    &compressed[src_offset..],
-                    uncompressed_planes_buffer,
-                    self.image_width,
-                    self.image_height,
-                )?;
+            // R/Y, G/Co and B/Cg planes
+            let (first, rest) = uncompressed_planes_buffer.split_at_mut(self.color_plane_offsets[1]);
+            let (second, third) = rest.split_at_mut(self.chroma_plane_size);
+            let planes = [
+                (first, self.image_width, self.image_height),
+                (second, self.chroma_width, self.chroma_height),
+                (third, self.chroma_width, self.chroma_height),
+            ];
+            if self.full_plane_size >= PARALLEL_PIXELS {
+                // A plane's size is only known by reading it, which is much cheaper than
+                // decoding it: find where each starts, then decode them in parallel.
+                let mut sources: [&[u8]; 3] = [&[]; 3];
+                for (source, (_, width, height)) in sources.iter_mut().zip(&planes) {
+                    *source = &compressed[src_offset..];
+                    src_offset += compressed_8bpp_plane_size(source, *width, *height)?;
+                }
+                planes
+                    .into_par_iter()
+                    .zip(sources)
+                    .try_for_each(|((dst, width, height), src)| {
+                        decompress_8bpp_plane(src, dst, width, height).map(drop)
+                    })?;
+            } else {
+                for (dst, width, height) in planes {
+                    src_offset += decompress_8bpp_plane(&compressed[src_offset..], dst, width, height)?;
+                }
             }
-
-            // Decompress R/Y plane
-            src_offset += decompress_8bpp_plane(
-                &compressed[src_offset..],
-                &mut uncompressed_planes_buffer[self.color_plane_offsets[0]..],
-                self.image_width,
-                self.image_height,
-            )?;
-
-            // Decompress G/Co plane
-            src_offset += decompress_8bpp_plane(
-                &compressed[src_offset..],
-                &mut uncompressed_planes_buffer[self.color_plane_offsets[1]..],
-                self.chroma_width,
-                self.chroma_height,
-            )?;
-
-            // Decompress B/Cg plane
-            decompress_8bpp_plane(
-                &compressed[src_offset..],
-                &mut uncompressed_planes_buffer[self.color_plane_offsets[2]..],
-                self.chroma_width,
-                self.chroma_height,
-            )?;
 
             &uncompressed_planes_buffer[..self.uncompressed_planes_size]
         } else {
@@ -187,10 +191,37 @@ impl<'a> BitmapStreamDecoderImpl<'a> {
         let g_plane = &planes[g_offset..g_offset + self.full_plane_size];
         let b_plane = &planes[b_offset..b_offset + self.full_plane_size];
 
-        for i in 0..self.full_plane_size {
-            let (r, g, b) = (r_plane[i], g_plane[i], b_plane[i]);
+        self.write_rows(dst, |y, line| {
+            let row = y * self.image_width..(y + 1) * self.image_width;
+            let channels = r_plane[row.clone()]
+                .iter()
+                .zip(&g_plane[row.clone()])
+                .zip(&b_plane[row]);
+            for (pixel, ((&r, &g), &b)) in line.as_chunks_mut::<3>().0.iter_mut().zip(channels) {
+                *pixel = [r, g, b];
+            }
+        });
+    }
 
-            dst.extend_from_slice(&[r, g, b]);
+    /// Appends the image to `dst` as rgb24, `row(y, line)` filling each line; large images
+    /// fill their lines in parallel.
+    fn write_rows(&self, dst: &mut Vec<u8>, row: impl Fn(usize, &mut [u8]) + Sync) {
+        let line_size = self.image_width * 3;
+        if line_size == 0 {
+            return;
+        }
+        let start = dst.len();
+        dst.resize(start + line_size * self.image_height, 0);
+        let lines = &mut dst[start..];
+        if self.full_plane_size >= PARALLEL_PIXELS {
+            lines
+                .par_chunks_mut(line_size)
+                .enumerate()
+                .for_each(|(y, line)| row(y, line));
+        } else {
+            for (y, line) in lines.chunks_mut(line_size).enumerate() {
+                row(y, line);
+            }
         }
     }
 
@@ -209,24 +240,22 @@ impl<'a> BitmapStreamDecoderImpl<'a> {
         let co_plane = &planes[co_offset..co_offset + self.chroma_plane_size];
         let cg_plane = &planes[cg_offset..cg_offset + self.chroma_plane_size];
 
-        for (idx, y) in y_plane.iter().copied().enumerate() {
-            let chroma_row = (idx / self.image_width) >> sample_shift;
-            let chroma_col = (idx % self.image_width) >> sample_shift;
-            let chroma_idx = chroma_row * self.chroma_width + chroma_col;
+        self.write_rows(dst, |row, line| {
+            let chroma_row = (row >> sample_shift) * self.chroma_width;
+            let lumas = &y_plane[row * self.image_width..(row + 1) * self.image_width];
+            for (col, (pixel, &y)) in line.as_chunks_mut::<3>().0.iter_mut().zip(lumas).enumerate() {
+                let chroma_idx = chroma_row + (col >> sample_shift);
 
-            let co = co_plane[chroma_idx];
-            let cg = cg_plane[chroma_idx];
+                let co = co_plane[chroma_idx];
+                let cg = cg_plane[chroma_idx];
 
-            let Rgb { r, g, b } = ycocg_with_cll_to_rgb(params.color_loss_level, y, co, cg);
+                let Rgb { r, g, b } = ycocg_with_cll_to_rgb(params.color_loss_level, y, co, cg);
 
-            // As described in 3.1.9.1.2 [MS-RDPEGDI], R and B channels are swapped for
-            // AYCoCg when 24-bit image is used (no alpha). We swap them back here
-            if params.alpha {
-                dst.extend_from_slice(&[r, g, b]);
-            } else {
-                dst.extend_from_slice(&[b, g, r]);
+                // As described in 3.1.9.1.2 [MS-RDPEGDI], R and B channels are swapped for
+                // AYCoCg when 24-bit image is used (no alpha). We swap them back here
+                *pixel = if params.alpha { [r, g, b] } else { [b, g, r] };
             }
-        }
+        });
     }
 
     fn decode(self, dst: &mut Vec<u8>, aux_buffer: &'a mut Vec<u8>) -> Result<(), BitmapDecodeError> {

@@ -131,6 +131,11 @@ back to RemoteFX or sends ordinary H.264 in Full color mode.
 Hover over it for details and any software fallback reason. The same information
 is recorded in Relay's logs.
 
+Every minute, and when a session ends, Relay logs a `graphics traffic` line: the
+frames received; for each codec, its updates, payload size and decoding time;
+and the counts of solid fills, surface copies, and cache saves and hits. It
+shows what a server actually sends, and where decoding time goes.
+
 Enabling hardware decoding advertises support; the server still chooses the
 codec. If it selects V8 graphics or disables AVC, its ClearCodec/RemoteFX bitmap
 updates decode on the CPU. Relay records this separately from a VA-API failure

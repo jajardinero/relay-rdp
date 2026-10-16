@@ -6,10 +6,10 @@
 // each pair of samples (an even one and the odd one after it) is computed on its own, all in
 // parallel. That takes 32 KiB of workgroup memory (PROGRESSIVE_WORKGROUP_BYTES in mod.rs).
 //
-// data is the quad pass's buffer (see quads.wgsl). data[3] is the tile table: the number of
-// standard tiles, then each tile's first word among the pixels, standard tiles first. A tile
-// is Y, Cb and Cr, 2048 words each: 4096 coefficients as packed i16 pairs, which become
-// the component's 64x64 samples, clamped for the color conversion in quads.wgsl.
+// data is a batch's quad data (see quads.wgsl). data[0] is the first word of its tile table:
+// the number of standard tiles, then each tile's first word, standard tiles first. A tile is
+// Y, Cb and Cr, 2048 words each: 4096 coefficients as packed i16 pairs, which become the
+// component's 64x64 samples, clamped for the color conversion in quads.wgsl.
 override REDUCE_EXTRAPOLATE: bool;
 
 const THREADS: u32 = 256u;
@@ -132,9 +132,9 @@ fn level(off: u32, n_l: u32, n_h: u32, i: u32) {
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) i: u32) {
-    let table = data[3];
+    let table = data[0];
     let entry = table + 1u + select(0u, data[table], REDUCE_EXTRAPOLATE) + group.x;
-    let base = data[2] + data[entry] + group.y * 2048u;
+    let base = data[entry] + group.y * 2048u;
     for (var k = i; k < 2048u; k += THREADS) {
         let packed = data[base + k];
         m[2u * k] = i32(packed << 16u) >> 16u;

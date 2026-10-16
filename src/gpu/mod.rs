@@ -32,8 +32,12 @@ const STAGING_CHUNK: u64 = 8 << 20;
 const MAX_BATCH_BYTES: u64 = 64 << 20;
 /// Uploads this large are copied into the image; smaller ones are drawn as quads.
 const DIRECT_UPLOAD_BYTES: usize = 1 << 20;
-/// Pending quads are drawn once their pixels reach this size.
-const MAX_QUAD_BYTES: usize = 16 << 20;
+/// A batch's quad data is staged in pieces of at least this size.
+const STREAM_PIECE: u64 = 1 << 20;
+/// The quad data starts with the batch's header: the progressive tile table's first word.
+const STREAM_HEADER: u64 = 32;
+/// The smallest buffer for quad data; it doubles when a batch's data doesn't fit.
+const MIN_STORAGE: u64 = 4 << 20;
 /// Workgroup memory for reconstructing progressive tiles: a component's samples and one
 /// level's rows, 4096 i32 each (`progressive.wgsl`).
 const PROGRESSIVE_WORKGROUP_BYTES: u32 = 2 * 4096 * 4;
@@ -66,7 +70,11 @@ struct Batch {
     staged: u64,
     /// One converted row on its way to staging memory, which is write-only.
     line: Vec<u8>,
+    /// What the batch's quads read.
+    stream: Stream,
     pending: Quads,
+    /// The buffer quads and progressive tiles read; replaced only between batches.
+    storage: Option<QuadStorage>,
 }
 
 /// Fills, small uploads, copies from other images and progressive tiles waiting to be drawn
@@ -77,17 +85,90 @@ struct Quads {
     target: Option<Arc<GpuImage>>,
     /// x, y, width, height, kind, then a packed RGBA color (fills), the first word of the
     /// quad's pixels (uploads), the source x and y (copies), or the tile's first word and the
-    /// quad's position in it (progressive tiles); see `quads.wgsl`.
+    /// quad's position in it (progressive tiles); see `quads.wgsl`. The last word, the
+    /// target's size, is filled in when they are drawn.
     items: Vec<[u32; 8]>,
-    /// Uploaded pixels as RGBA, rows packed, and progressive tiles' coefficients.
-    pixels: Vec<u8>,
     /// The images copies read: each from its first item until the next. Items before the
     /// first read none.
     sources: Vec<(u32, wgpu::BindGroup)>,
-    /// Progressive tiles' first words among the pixels: standard, then reduce-extrapolate DWT.
+}
+
+/// What a batch's quads read: uploaded pixels, progressive tiles' coefficients, and the
+/// quads themselves. It goes straight into staging memory as it arrives, and into the storage
+/// buffer in one copy ahead of the batch's commands. Each render pass reads its own part, so
+/// passes never wait on one another's data.
+#[derive(Default)]
+struct Stream {
+    /// Staging memory, in storage buffer order.
+    pieces: Vec<Piece>,
+    /// The storage buffer bytes in use.
+    len: u64,
+    /// Progressive tiles' first words: standard, then reduce-extrapolate DWT.
     tiles: [Vec<u32>; 2],
-    /// The buffer the shaders read, reused while it is big enough.
-    storage: Option<QuadStorage>,
+}
+
+/// Staging memory for a run of the storage buffer.
+struct Piece {
+    buffer: wgpu::Buffer,
+    offset: u64,
+    /// Where it goes in the storage buffer.
+    at: u64,
+    size: u64,
+    /// The bytes written.
+    used: u64,
+}
+
+impl Stream {
+    /// Reserves `size` bytes (a multiple of 4) at a multiple of `align` (at least 8) in the
+    /// storage buffer: that place, and the staging memory to write.
+    fn reserve(
+        &mut self,
+        belt: &mut wgpu::util::StagingBelt,
+        size: u64,
+        align: u64,
+    ) -> (u64, wgpu::BufferSlice<'_>) {
+        if self.pieces.is_empty() {
+            self.len = STREAM_HEADER;
+            self.add_piece(belt, 0, STREAM_HEADER + size);
+        }
+        let at = self.len.next_multiple_of(align);
+        let last = self.pieces.last().expect("the first piece");
+        if at + size > last.at + last.size {
+            self.add_piece(belt, at, size);
+        }
+        let piece = self.pieces.last_mut().expect("the first piece");
+        piece.used = at + size - piece.at;
+        self.len = at + size;
+        let start = piece.offset + (at - piece.at);
+        (at, piece.buffer.slice(start..start + size))
+    }
+
+    fn add_piece(&mut self, belt: &mut wgpu::util::StagingBelt, at: u64, size: u64) {
+        let size = size.max(STREAM_PIECE).next_multiple_of(8);
+        let slice = belt.allocate(
+            NonZeroU64::new(size).expect("at least a piece"),
+            NonZeroU64::new(8).expect("non-zero"),
+        );
+        self.pieces.push(Piece {
+            buffer: slice.buffer().clone(),
+            offset: slice.offset(),
+            at,
+            size,
+            used: 0,
+        });
+    }
+
+    /// Writes `bytes` (a multiple of 4) at a multiple of `align`; returns their first word.
+    fn write(
+        &mut self,
+        belt: &mut wgpu::util::StagingBelt,
+        bytes: &[u8],
+        align: u64,
+    ) -> anyhow::Result<u32> {
+        let (at, slice) = self.reserve(belt, bytes.len() as u64, align);
+        slice.get_mapped_range_mut()?.copy_from_slice(bytes);
+        Ok((at / 4) as u32)
+    }
 }
 
 struct QuadStorage {
@@ -436,7 +517,9 @@ impl GpuContext {
                 belt,
                 staged: 0,
                 line: Vec::new(),
+                stream: Stream::default(),
                 pending: Quads::default(),
+                storage: None,
             }),
             scratch: Mutex::new(None),
             conversion,
@@ -510,19 +593,169 @@ impl GpuContext {
     }
 
     fn flush_batch(&self, batch: &mut Batch) -> anyhow::Result<()> {
-        match self.finish_batch(batch) {
-            Some(buffer) => self.submit_buffers([buffer], ()),
-            None => Ok(()),
+        let buffers = self.finish_batch(batch);
+        if buffers.is_empty() {
+            return Ok(());
         }
+        self.submit_buffers(buffers, ())
     }
 
-    /// Ends the batch; the caller submits the result while still holding the batch lock.
-    fn finish_batch(&self, batch: &mut Batch) -> Option<wgpu::CommandBuffer> {
+    /// Ends the batch: its quad data's upload, then its commands. The caller submits them
+    /// while still holding the batch lock.
+    fn finish_batch(&self, batch: &mut Batch) -> Vec<wgpu::CommandBuffer> {
         self.draw_quads(batch);
-        let encoder = batch.encoder.take()?;
-        batch.belt.finish_and_recall_on_submit(&encoder);
+        let upload = self.upload_stream(batch);
+        let encoder = batch.encoder.take();
+        if let Some(last) = encoder.as_ref().or(upload.as_ref()) {
+            batch.belt.finish_and_recall_on_submit(last);
+        }
         batch.staged = 0;
-        Some(encoder.finish())
+        upload
+            .into_iter()
+            .chain(encoder)
+            .map(wgpu::CommandEncoder::finish)
+            .collect()
+    }
+
+    /// Records the copy of the batch's quad data into the storage buffer, then the
+    /// reconstruction of its progressive tiles, to run before the batch's commands.
+    fn upload_stream(&self, batch: &mut Batch) -> Option<wgpu::CommandEncoder> {
+        let Batch {
+            belt,
+            stream,
+            storage,
+            ..
+        } = batch;
+        if stream.pieces.is_empty() {
+            return None;
+        }
+        let storage = storage
+            .as_ref()
+            .expect("quad data has room in a storage buffer");
+        let counts = stream.tiles.each_ref().map(|tiles| tiles.len() as u32);
+        let mut header = [0u32; (STREAM_HEADER / 4) as usize];
+        if counts != [0, 0] {
+            // The tile table: the number of standard tiles, then every tile's first word.
+            let [standard, extrapolate] = &stream.tiles;
+            let table: Vec<u8> = [counts[0]]
+                .iter()
+                .chain(standard)
+                .chain(extrapolate)
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            match stream.write(belt, &table, 8) {
+                Ok(word) => header[0] = word,
+                Err(error) => self.fail(error),
+            }
+        }
+        let first = &stream.pieces[0];
+        let header_bytes: Vec<u8> = header.iter().flat_map(|w| w.to_le_bytes()).collect();
+        match first
+            .buffer
+            .slice(first.offset..first.offset + STREAM_HEADER)
+            .get_mapped_range_mut()
+        {
+            Ok(mut view) => view.copy_from_slice(&header_bytes),
+            Err(error) => self.fail(error.into()),
+        }
+        let mut encoder = self.encoder();
+        for piece in &stream.pieces {
+            encoder.copy_buffer_to_buffer(
+                &piece.buffer,
+                piece.offset,
+                &storage.buffer,
+                piece.at,
+                piece.used,
+            );
+        }
+        // Progressive tiles become samples, one workgroup per tile and component. Only a
+        // context with the pipelines takes tiles.
+        if let (true, Some(progressive), Some(bind)) =
+            (counts != [0, 0], &self.progressive, &storage.reconstruct)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("RemoteFX progressive tiles"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind, &[]);
+            for (pipeline, count) in progressive.pipelines.iter().zip(counts) {
+                if count > 0 {
+                    pass.set_pipeline(pipeline);
+                    pass.dispatch_workgroups(count, 3, 1);
+                }
+            }
+        }
+        *stream = Stream::default();
+        Some(encoder)
+    }
+
+    fn fail(&self, error: anyhow::Error) {
+        self.failure.lock().get_or_insert_with(|| error.to_string());
+    }
+
+    /// Makes room in the storage buffer for `bytes` more data and `quads` more quads of this
+    /// batch, submitting the batch first when they wouldn't fit. The buffer is replaced, with
+    /// a bigger one, only between batches, when no recorded pass reads it.
+    fn make_room(&self, batch: &mut Batch, bytes: u64, quads: usize) -> anyhow::Result<()> {
+        let need = |batch: &Batch| {
+            let items = (batch.pending.items.len() + quads) as u64;
+            let table = 2 + batch.stream.tiles.iter().map(Vec::len).sum::<usize>() as u64;
+            // Each part may be padded to its alignment.
+            batch.stream.len.max(STREAM_HEADER) + (bytes + 8) + (items * 32 + 32) + (table * 4 + 8)
+        };
+        let capacity = batch.storage.as_ref().map_or(0, |s| s.buffer.size());
+        if need(batch) <= capacity {
+            return Ok(());
+        }
+        let mut grow = capacity;
+        let started = batch.encoder.is_some()
+            || !batch.stream.pieces.is_empty()
+            || batch.pending.target.is_some();
+        if capacity > 0 && started {
+            // This batch's passes read the current buffer. Later batches get one twice the size.
+            self.draw_quads(batch);
+            self.flush_batch(batch)?;
+            grow = capacity * 2;
+        }
+        let limits = self.device.limits();
+        let largest = limits
+            .max_storage_buffer_binding_size
+            .min(limits.max_buffer_size);
+        let need = need(batch);
+        let size = need
+            .max(grow)
+            .max(MIN_STORAGE)
+            .next_power_of_two()
+            .min(largest);
+        ensure!(
+            size >= need,
+            "{need} bytes of quad data don't fit a storage buffer"
+        );
+        if size > capacity {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("RDP quads"),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind = |label, layout: &wgpu::BindGroupLayout| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                })
+            };
+            batch.storage = Some(QuadStorage {
+                draw: bind("RDP quads", &self.quads.get_bind_group_layout(0)),
+                reconstruct: (self.progressive.as_ref())
+                    .map(|progressive| bind("RemoteFX progressive tiles", &progressive.layout)),
+                buffer,
+            });
+        }
+        Ok(())
     }
 
     fn submit_buffers(
@@ -575,102 +808,41 @@ impl GpuContext {
         &mut batch.pending
     }
 
-    /// Records the pending quads as one render pass. Their data reaches the GPU in one copy.
+    /// Records the pending quads as one render pass, reading their own part of the batch's
+    /// quad data.
     fn draw_quads(&self, batch: &mut Batch) {
         let Batch {
             encoder,
             belt,
             staged,
+            stream,
             pending,
+            storage,
             ..
         } = batch;
         let Some(target) = pending.target.take() else {
             return;
         };
-        let count = pending.items.len() as u32;
-        let table = 4 + count * 8;
-        let [standard, extrapolate] = &pending.tiles;
-        let tiles = [standard.len() as u32, extrapolate.len() as u32];
-        let table_words = if tiles == [0, 0] {
-            0
-        } else {
-            1 + tiles[0] + tiles[1]
-        };
-        let first_pixel = table + table_words;
-        let words: Vec<u8> = [target.width, target.height, first_pixel, table]
+        let size = target.width | (target.height << 16);
+        let bytes: Vec<u8> = pending
+            .items
             .iter()
-            .chain(pending.items.iter().flatten())
-            .chain((table_words > 0).then_some(&tiles[0]))
-            .chain(standard.iter().chain(extrapolate))
+            .flat_map(|item| item[..7].iter().chain([&size]))
             .flat_map(|word| word.to_le_bytes())
             .collect();
-        let size = (words.len() + pending.pixels.len()) as u64;
-        if pending
-            .storage
-            .as_ref()
-            .is_none_or(|storage| storage.buffer.size() < size)
-        {
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("RDP quads"),
-                size: size.next_power_of_two().max(1 << 20),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bind = |label, layout: &wgpu::BindGroupLayout| {
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(label),
-                    layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buffer.as_entire_binding(),
-                    }],
-                })
-            };
-            pending.storage = Some(QuadStorage {
-                draw: bind("RDP quads", &self.quads.get_bind_group_layout(0)),
-                reconstruct: (self.progressive.as_ref())
-                    .map(|progressive| bind("RemoteFX progressive tiles", &progressive.layout)),
-                buffer,
-            });
-        }
-        let storage = pending.storage.as_ref().expect("just ensured");
-        let (buffer, bind) = (&storage.buffer, &storage.draw);
-        let slice = belt.allocate(
-            NonZeroU64::new(size).expect("the header is not empty"),
-            NonZeroU64::new(wgpu::COPY_BUFFER_ALIGNMENT).expect("non-zero"),
-        );
-        match slice.get_mapped_range_mut() {
-            Ok(mut staging) => {
-                staging.slice(..words.len()).copy_from_slice(&words);
-                if !pending.pixels.is_empty() {
-                    staging
-                        .slice(words.len()..)
-                        .copy_from_slice(&pending.pixels);
-                }
-            }
+        let first_word = match stream.write(belt, &bytes, 32) {
+            Ok(word) => word,
             Err(error) => {
-                self.failure.lock().get_or_insert_with(|| error.to_string());
+                self.fail(error);
+                pending.items.clear();
+                pending.sources.clear();
+                return;
             }
-        }
-        let encoder = encoder.get_or_insert_with(|| self.encoder());
-        encoder.copy_buffer_to_buffer(slice.buffer(), slice.offset(), buffer, 0, size);
-        // Progressive tiles become samples, one workgroup per tile and component. Only a
-        // context with the pipelines takes tiles.
-        if let (true, Some(progressive), Some(bind)) =
-            (table_words > 0, &self.progressive, &storage.reconstruct)
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("RemoteFX progressive tiles"),
-                timestamp_writes: None,
-            });
-            pass.set_bind_group(0, bind, &[]);
-            for (pipeline, count) in progressive.pipelines.iter().zip(tiles) {
-                if count > 0 {
-                    pass.set_pipeline(pipeline);
-                    pass.dispatch_workgroups(count, 3, 1);
-                }
-            }
-        }
+        };
+        *staged += bytes.len() as u64;
+        let storage = storage.as_ref().expect("room was made for these quads");
+        let first_quad = first_word / 8;
+        let count = pending.items.len() as u32;
         // A first fill covering the whole image becomes the pass's clear.
         let clear = pending
             .items
@@ -680,6 +852,7 @@ impl GpuContext {
                 let [r, g, b, a] = q[5].to_le_bytes().map(|c| f64::from(c) / 255.0);
                 wgpu::Color { r, g, b, a }
             });
+        let encoder = encoder.get_or_insert_with(|| self.encoder());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("RDP quads"),
@@ -695,7 +868,7 @@ impl GpuContext {
                 ..Default::default()
             });
             pass.set_pipeline(&self.quads);
-            pass.set_bind_group(0, bind, &[]);
+            pass.set_bind_group(0, &storage.draw, &[]);
             // One draw per source image, each from its first quad to the next source's.
             let mut first = u32::from(clear.is_some());
             let mut source = &self.blank;
@@ -703,17 +876,14 @@ impl GpuContext {
             for (end, next) in ends.chain([(count, &self.blank)]) {
                 if end > first {
                     pass.set_bind_group(1, source, &[]);
-                    pass.draw(0..6, first..end);
+                    pass.draw(0..6, first_quad + first..first_quad + end);
                     first = end;
                 }
                 source = next;
             }
         }
-        *staged += size;
         pending.items.clear();
-        pending.pixels.clear();
         pending.sources.clear();
-        pending.tiles.iter_mut().for_each(Vec::clear);
     }
 
     /// Whether [`draw_tile`](Self::draw_tile) is available.
@@ -744,26 +914,32 @@ impl GpuContext {
         if parts.is_empty() {
             return Ok(());
         }
-        let mut batch = self.batch.lock();
-        let quads = self.quads_for(&mut batch, image);
-        let first = (quads.pixels.len() / 4) as u32;
         // The shaders read words of little-endian i16 pairs: the coefficients as they are.
         let values = coefficients.as_flattened();
-        if cfg!(target_endian = "little") {
-            quads.pixels.extend_from_slice(bytemuck::cast_slice(values));
+        let swapped: Vec<u8>;
+        let bytes: &[u8] = if cfg!(target_endian = "little") {
+            bytemuck::cast_slice(values)
         } else {
-            quads
-                .pixels
-                .extend(values.iter().flat_map(|v| v.to_le_bytes()));
-        }
-        quads.tiles[usize::from(reduce_extrapolate)].push(first);
-        quads.items.extend(parts.iter().map(|part| {
+            swapped = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            &swapped
+        };
+        let mut batch = self.batch.lock();
+        self.make_room(&mut batch, bytes.len() as u64, parts.len())?;
+        self.quads_for(&mut batch, image);
+        let Batch {
+            belt,
+            stream,
+            pending,
+            staged,
+            ..
+        } = &mut *batch;
+        let first = stream.write(belt, bytes, 8)?;
+        *staged += bytes.len() as u64;
+        stream.tiles[usize::from(reduce_extrapolate)].push(first);
+        pending.items.extend(parts.iter().map(|part| {
             let at = (part.x - x) | ((part.y - y) << 16);
             [part.x, part.y, part.w, part.h, TILE, first, at, 0]
         }));
-        if quads.pixels.len() >= MAX_QUAD_BYTES {
-            self.draw_quads(&mut batch);
-        }
         if batch.staged >= MAX_BATCH_BYTES {
             self.flush_batch(&mut batch)?;
         }
@@ -780,6 +956,9 @@ impl GpuContext {
         };
         let source = self.source(src);
         let mut batch = self.batch.lock();
+        if let Err(error) = self.make_room(&mut batch, 0, 1) {
+            return self.fail(error);
+        }
         let quads = self.quads_for(&mut batch, dst);
         if quads.sources.last().is_none_or(|(_, last)| *last != source) {
             quads.sources.push((quads.items.len() as u32, source));
@@ -863,6 +1042,9 @@ impl GpuContext {
         }
         let color = u32::from_le_bytes(rgba);
         let mut batch = self.batch.lock();
+        if let Err(error) = self.make_room(&mut batch, 0, rects.len()) {
+            return self.fail(error);
+        }
         let quads = self.quads_for(&mut batch, image);
         quads.items.extend(
             rects
@@ -889,22 +1071,34 @@ impl GpuContext {
             self.draw_quads(&mut batch);
             self.copy_upload(&mut batch, image, rect, row)?;
         } else {
-            let quads = self.quads_for(&mut batch, image);
-            let start = quads.pixels.len();
-            quads.pixels.resize(start + bytes, 0);
-            for (i, line) in quads.pixels[start..]
-                .chunks_exact_mut(row_bytes)
-                .enumerate()
+            self.make_room(&mut batch, bytes as u64, 1)?;
+            self.quads_for(&mut batch, image);
+            let Batch {
+                belt,
+                staged,
+                line,
+                stream,
+                pending,
+                ..
+            } = &mut *batch;
+            // Rows are converted in a small buffer, then go straight to staging memory.
+            let (at, slice) = stream.reserve(belt, bytes as u64, 8);
             {
-                row(i, line);
+                let mut staging = slice.get_mapped_range_mut()?;
+                line.resize(row_bytes, 0);
+                for i in 0..rect.h as usize {
+                    row(i, line);
+                    let start = i * row_bytes;
+                    staging
+                        .slice(start..start + row_bytes)
+                        .copy_from_slice(line);
+                }
             }
-            let first = (start / 4) as u32;
-            quads
+            *staged += bytes as u64;
+            let first = (at / 4) as u32;
+            pending
                 .items
                 .push([rect.x, rect.y, rect.w, rect.h, PIXELS, first, 0, 0]);
-            if quads.pixels.len() >= MAX_QUAD_BYTES {
-                self.draw_quads(&mut batch);
-            }
         }
         if batch.staged >= MAX_BATCH_BYTES {
             self.flush_batch(&mut batch)?;
@@ -1630,6 +1824,99 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(read(&context, &gpu.gpu.as_ref().unwrap().image), cpu.data);
+        assert!(error.lock().is_none(), "{:?}", error.lock());
+    }
+
+    /// The cost of switching between target images: cache saves alternating with fills,
+    /// each switch ending one render pass and starting another.
+    #[test]
+    #[ignore = "requires a Vulkan GPU; reports the cost of switching target images"]
+    fn gpu_target_switch_throughput() {
+        let context = context().unwrap();
+        let error = Arc::new(Mutex::new(None));
+        let mut surface = Surface::new_gpu(1920, 1080, context.clone(), error.clone());
+        let saves = 300;
+        let mut cache: Vec<Surface> = (0..saves)
+            .map(|_| Surface::new_gpu(64, 64, context.clone(), error.clone()))
+            .collect();
+        let image = Arc::clone(&surface.gpu.as_ref().unwrap().image);
+        let mut frame = || {
+            for (i, entry) in cache.iter_mut().enumerate() {
+                let i = i as u32;
+                entry.copy_gpu(
+                    &image,
+                    Rect::new((i * 7) % 1600, (i * 3) % 800, 64, 64),
+                    0,
+                    0,
+                );
+                surface.fill(Rect::new(i, i, 4, 4), [i as u8, 0, 0, 255]);
+            }
+            context.flush().unwrap();
+            context
+                .device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        };
+        frame();
+        let runs = 10;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            frame();
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
+        eprintln!(
+            "{saves} cache saves between fills: {elapsed:.2} ms, {:.1} us per switch",
+            elapsed * 1000.0 / f64::from(2 * saves)
+        );
+        assert!(error.lock().is_none(), "{:?}", error.lock());
+    }
+
+    /// Busy frames draw the same on the GPU as on the CPU: more quad data than the storage
+    /// buffer first holds, and hundreds of switches between the surface and cache entries.
+    #[test]
+    #[ignore = "requires a Vulkan GPU and access to /dev/dri"]
+    fn gpu_busy_frames_match_cpu() {
+        let context = context().unwrap();
+        let error = Arc::new(Mutex::new(None));
+        let (w, h) = (1920, 1080);
+        let mut gpu = Surface::new_gpu(w, h, context.clone(), error.clone());
+        let mut cpu = Surface::new(w, h);
+        let mut cpu_cache: Vec<Surface> = Vec::new();
+        let mut gpu_cache: Vec<Surface> = Vec::new();
+        for frame in 0..2u32 {
+            for (surface, cache) in [(&mut cpu, &mut cpu_cache), (&mut gpu, &mut gpu_cache)] {
+                for ty in 0..h.div_ceil(64) {
+                    for tx in 0..w / 64 {
+                        let tile: Vec<u8> = (0..64 * 64 * 4)
+                            .map(|i| (i as u32 * 7 + tx * 31 + ty * 17 + frame) as u8)
+                            .collect();
+                        surface.write(
+                            Rect::new(tx * 64, ty * 64, 64, 64),
+                            &tile,
+                            64 * 4,
+                            SrcFormat::Rgbx,
+                        );
+                    }
+                }
+                for i in 0..300 {
+                    let (x, y) = ((i * 37) % (w - 8), (i * 53) % (h - 16));
+                    let glyph = [(i % 251) as u8; 8 * 16 * 4];
+                    surface.write(Rect::new(x, y, 8, 16), &glyph, 8 * 4, SrcFormat::Bgra);
+                    surface.fill(Rect::new(y % 500, x % 500, 9, 5), [i as u8, 3, 4, 255]);
+                    if i % 2 == 0 {
+                        let at = Rect::new((i * 61) % (w - 64), (i * 13) % (h - 64), 48, 40);
+                        cache.push(surface.snapshot(at).unwrap());
+                    }
+                    if let Some(entry) = cache.get((i as usize * 7) % cache.len().max(1)) {
+                        surface.copy_from(entry, (i * 97) % (w - 64), (i * 41) % (h - 64));
+                    }
+                }
+                surface.copy_within(Rect::new(0, 40, w, 1000), &[(0, 0)]);
+            }
+            context.flush().unwrap();
+            let actual = read(&context, &gpu.gpu.as_ref().unwrap().image);
+            assert!(actual == cpu.data, "frame {frame} differs");
+        }
         assert!(error.lock().is_none(), "{:?}", error.lock());
     }
 

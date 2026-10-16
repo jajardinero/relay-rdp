@@ -42,6 +42,13 @@ reaching across the whole history, and corrupted streams. Truncated tokens,
 truncated multipart segments, and matches beyond the history now return errors
 instead of panicking or copying from the wrong place.
 
+Planar bitmaps of 65,536 pixels or more decode their three color planes in
+parallel: reading the RLE segment headers finds where each plane starts, which
+is much cheaper than decoding it. Their rows are then interleaved in parallel
+into a preallocated buffer, instead of one pixel at a time. A discarded alpha
+plane is skipped by size rather than decoded. Output and errors match the
+previous decoder.
+
 Relay's application tests compare these paths with FreeRDP reference decodes
 in `src/session/gfx/testdata`. Remove these patches when equivalent fixes are
 available in an upstream release.

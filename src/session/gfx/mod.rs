@@ -11,8 +11,10 @@ pub(crate) mod surface;
 pub(crate) mod vaapi;
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use ironrdp_core::Decode as _;
 use ironrdp_egfx::client::{
@@ -130,6 +132,94 @@ pub struct GfxShared {
     video: AtomicU8,
     /// Why hardware decoding or H.264 isn't available, for the session bar.
     fallback: Mutex<Option<String>>,
+    traffic: Mutex<Traffic>,
+}
+
+/// How often the graphics traffic is logged.
+const TRAFFIC_PERIOD: Duration = Duration::from_secs(60);
+
+/// What the server sent through the graphics pipeline, logged every minute and when the
+/// session ends, to show which codecs and commands are worth optimizing.
+#[derive(Default)]
+struct Traffic {
+    /// When this period started: the first update after the last report.
+    since: Option<Instant>,
+    frames: u64,
+    /// Per codec: updates, payload bytes, and the time spent decoding and drawing them.
+    codecs: BTreeMap<&'static str, (u64, u64, Duration)>,
+    solid_fills: u64,
+    surface_to_surface: u64,
+    surface_to_cache: u64,
+    cache_to_surface: u64,
+}
+
+impl Traffic {
+    fn start(&mut self) {
+        self.since.get_or_insert_with(Instant::now);
+    }
+
+    /// Counts an update of `codec` with `bytes` of payload, handled since `started`.
+    fn update(&mut self, codec: &'static str, bytes: usize, started: Instant) {
+        self.start();
+        let (updates, total, time) = self.codecs.entry(codec).or_default();
+        *updates += 1;
+        *total += bytes as u64;
+        *time += started.elapsed();
+    }
+
+    fn command(&mut self, count: impl FnOnce(&mut Self) -> &mut u64) {
+        self.start();
+        *count(self) += 1;
+    }
+
+    /// Logs the period, once it has lasted a minute or when `last`, and starts the next.
+    fn report(&mut self, last: bool) {
+        let Some(since) = self.since else { return };
+        let period = since.elapsed();
+        if !last && period < TRAFFIC_PERIOD {
+            return;
+        }
+        let mut codecs = String::new();
+        for (name, (updates, bytes, time)) in &self.codecs {
+            let separator = if codecs.is_empty() { "" } else { "; " };
+            let _ = write!(
+                codecs,
+                "{separator}{name}: {updates} updates, {:.1} MB, {:.0} ms",
+                *bytes as f64 / 1e6,
+                time.as_secs_f64() * 1000.0,
+            );
+        }
+        tracing::info!(
+            seconds = period.as_secs(),
+            frames = self.frames,
+            codecs = %codecs,
+            solid_fills = self.solid_fills,
+            surface_to_surface = self.surface_to_surface,
+            surface_to_cache = self.surface_to_cache,
+            cache_to_surface = self.cache_to_surface,
+            "graphics traffic"
+        );
+        *self = Self::default();
+    }
+}
+
+impl Drop for GfxShared {
+    fn drop(&mut self) {
+        self.traffic.get_mut().report(true);
+    }
+}
+
+fn codec_name(codec: Codec1Type) -> &'static str {
+    match codec {
+        Codec1Type::Uncompressed => "Uncompressed",
+        Codec1Type::RemoteFx => "RemoteFX",
+        Codec1Type::ClearCodec => "ClearCodec",
+        Codec1Type::Planar => "Planar",
+        Codec1Type::Avc420 => "AVC420",
+        Codec1Type::Alpha => "Alpha",
+        Codec1Type::Avc444 => "AVC444",
+        Codec1Type::Avc444v2 => "AVC444v2",
+    }
 }
 
 /// GPU surfaces and composition, plus VA-API decoding in the H.264 modes.
@@ -228,6 +318,7 @@ impl GfxShared {
             failure: Mutex::new(None),
             video: AtomicU8::new(0),
             fallback: Mutex::new(reason),
+            traffic: Mutex::default(),
         })
     }
 
@@ -398,6 +489,7 @@ impl GraphicsPipelineHandler for Handler {
         dest: &ExclusiveRectangle,
         stream: &ironrdp_egfx::pdu::Avc420BitmapStream<'_>,
     ) -> ironrdp_pdu::PduResult<()> {
+        let started = Instant::now();
         // Recording the failure lets the outer session loop reconnect with
         // software. Never attempt a midstream decoder swap without a keyframe.
         let result = if self.0.mode == GraphicsMode::FullColor {
@@ -410,6 +502,8 @@ impl GraphicsPipelineHandler for Handler {
         if let Err(error) = result {
             self.0.fail_video(error.to_string());
         }
+        let bytes = stream.data.len();
+        self.0.traffic.lock().update("AVC420", bytes, started);
         Ok(())
     }
 
@@ -532,6 +626,7 @@ impl GraphicsPipelineHandler for Handler {
         if update.data.is_empty() {
             return;
         }
+        let started = Instant::now();
         let Some(dest) = rect(&update.destination_rectangle) else {
             return;
         };
@@ -550,14 +645,30 @@ impl GraphicsPipelineHandler for Handler {
             );
             surface.write(dest, &update.data, usize::from(update.width) * 4, format);
         }
+        drop(state);
+        // Pictures decoded inside ironrdp-egfx (OpenH264) arrive decoded, so their bytes are
+        // decoded pixels.
+        let codec = match update.codec_id {
+            Codec1Type::Uncompressed => "Uncompressed",
+            Codec1Type::Avc420 => "AVC420 (OpenH264, decoded bytes)",
+            other => codec_name(other),
+        };
+        let bytes = update.data.len();
+        self.0.traffic.lock().update(codec, bytes, started);
     }
 
     fn on_frame_complete(&mut self, _frame_id: u32) {
         let mut state = self.0.state.lock();
         self.0.present(&mut state);
+        drop(state);
+        let mut traffic = self.0.traffic.lock();
+        traffic.start();
+        traffic.frames += 1;
+        traffic.report(false);
     }
 
     fn on_solid_fill(&mut self, pdu: &SolidFillPdu) {
+        self.0.traffic.lock().command(|t| &mut t.solid_fills);
         let c = &pdu.fill_pixel;
         let rgba = [c.r, c.g, c.b, 0xFF];
         let rects: Vec<Rect> = pdu.rectangles.iter().filter_map(rect).collect();
@@ -568,6 +679,7 @@ impl GraphicsPipelineHandler for Handler {
     }
 
     fn on_surface_to_surface(&mut self, pdu: &SurfaceToSurfacePdu) {
+        self.0.traffic.lock().command(|t| &mut t.surface_to_surface);
         let Some(src_rect) = rect(&pdu.source_rectangle) else {
             return;
         };
@@ -610,6 +722,7 @@ impl GraphicsPipelineHandler for Handler {
     }
 
     fn on_surface_to_cache(&mut self, pdu: &SurfaceToCachePdu) {
+        self.0.traffic.lock().command(|t| &mut t.surface_to_cache);
         let Some(src_rect) = rect(&pdu.source_rectangle) else {
             return;
         };
@@ -624,6 +737,7 @@ impl GraphicsPipelineHandler for Handler {
     }
 
     fn on_cache_to_surface(&mut self, pdu: &CacheToSurfacePdu) {
+        self.0.traffic.lock().command(|t| &mut t.cache_to_surface);
         let mut state = self.0.state.lock();
         let GfxState {
             cache, surfaces, ..
@@ -647,6 +761,8 @@ impl GraphicsPipelineHandler for Handler {
         if pdu.codec_id != Codec2Type::RemoteFxProgressive {
             return self.0.fail(format!("unsupported codec {:?}", pdu.codec_id));
         }
+        let started = Instant::now();
+        let bytes = pdu.bitmap_data.len();
         let mut state = self.0.state.lock();
         let GfxState {
             surfaces,
@@ -673,12 +789,17 @@ impl GraphicsPipelineHandler for Handler {
         match progressive.decode(pdu.surface_id, context, w, h, &pdu.bitmap_data, output) {
             Ok(tiles) => {
                 apply_progressive_tiles(surface, tiles);
+                drop(state);
             }
             Err(e) => {
                 drop(state);
                 self.0.fail(format!("progressive decode: {e}"));
             }
         }
+        self.0
+            .traffic
+            .lock()
+            .update("RemoteFX progressive", bytes, started);
     }
 
     fn on_delete_encoding_context(&mut self, pdu: &DeleteEncodingContextPdu) {
@@ -695,14 +816,20 @@ impl GraphicsPipelineHandler for Handler {
                 if matches!(wire.codec_id, Codec1Type::Avc444 | Codec1Type::Avc444v2)
                     && self.0.mode == GraphicsMode::FullColor =>
             {
+                let started = Instant::now();
                 if let Err(error) = self.avc444(wire) {
                     self.0.fail_video(error.to_string());
                 }
+                let (codec, bytes) = (codec_name(wire.codec_id), wire.bitmap_data.len());
+                self.0.traffic.lock().update(codec, bytes, started);
             }
             GfxPdu::WireToSurface1(wire) => {
+                let started = Instant::now();
                 if let Err(reason) = self.wire_to_surface1(wire) {
                     self.0.fail(reason);
                 }
+                let (codec, bytes) = (codec_name(wire.codec_id), wire.bitmap_data.len());
+                self.0.traffic.lock().update(codec, bytes, started);
             }
             other => tracing::debug!(pdu = ?std::mem::discriminant(other), "ignored graphics PDU"),
         }
@@ -2337,6 +2464,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Traffic adds up per codec and command, and a report starts the next period.
+    #[test]
+    fn traffic_reports_and_restarts() {
+        let mut traffic = Traffic::default();
+        traffic.report(true); // Nothing to report yet.
+        traffic.update("Planar", 100, Instant::now());
+        traffic.update("Planar", 50, Instant::now());
+        traffic.command(|t| &mut t.surface_to_cache);
+        traffic.frames += 1;
+        traffic.report(false); // Less than a minute: kept.
+        assert_eq!(traffic.codecs["Planar"].0, 2);
+        assert_eq!(traffic.codecs["Planar"].1, 150);
+        assert_eq!(traffic.surface_to_cache, 1);
+        traffic.report(true);
+        assert!(traffic.since.is_none() && traffic.codecs.is_empty() && traffic.frames == 0);
     }
 
     /// A FreeRDP-encoded progressive picture must decode like FreeRDP decodes it. The fixtures

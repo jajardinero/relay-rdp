@@ -177,6 +177,40 @@ impl RlePlaneDecoder {
     }
 }
 
+/// The number of bytes the RLE-encoded 8bpp plane at the start of `src` takes, found by reading
+/// its segment headers without decoding it. It fails exactly where
+/// [`decompress_8bpp_plane`] would.
+pub(crate) fn compressed_8bpp_plane_size(src: &[u8], width: usize, height: usize) -> Result<usize, RleDecodeError> {
+    let eof = || RleDecodeError::ReadCompressedData(std::io::ErrorKind::UnexpectedEof.into());
+    let mut read_bytes = 0;
+    // The decoder always reads the first scanline.
+    for _ in 0..height.max(1) {
+        let mut decoded_columns = 0;
+        while decoded_columns < width {
+            let control_byte = *src.get(read_bytes).ok_or_else(eof)?;
+            if control_byte == 0 {
+                return Err(RleDecodeError::InvalidSegmentHeader);
+            }
+            let rle_bytes_field = control_byte & 0x0F;
+            let raw_bytes_field = (control_byte >> 4) & 0x0F;
+            let (run_length, raw_bytes_count) = match rle_bytes_field {
+                1 => (16 + usize::from(raw_bytes_field), 0),
+                2 => (32 + usize::from(raw_bytes_field), 0),
+                rle_control => (usize::from(rle_control), usize::from(raw_bytes_field)),
+            };
+            read_bytes += 1 + raw_bytes_count;
+            if read_bytes > src.len() {
+                return Err(eof());
+            }
+            decoded_columns += raw_bytes_count + run_length;
+            if decoded_columns > width {
+                return Err(RleDecodeError::SegmentDoNotFitScanline);
+            }
+        }
+    }
+    Ok(read_bytes)
+}
+
 /// Performs decompression of 8bpp color plane into slice.
 /// Slice must have enough space for decompressed data.
 /// Size of data written to dst buffer is exactly equal to `width * height`.
