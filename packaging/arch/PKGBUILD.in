@@ -68,7 +68,7 @@ package() {
   install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/relay/LICENSE-APACHE"
   install -Dm644 assets/fonts/OFL.txt "$pkgdir/usr/share/licenses/relay/fonts-OFL.txt"
   local crate file
-  for crate in ironrdp-connector ironrdp-egfx ironrdp-graphics ironrdp-pdu sspi; do
+  for crate in ironrdp-connector ironrdp-egfx ironrdp-graphics ironrdp-pdu ironrdp-session sspi; do
     for file in LICENSE-MIT LICENSE-APACHE; do
       install -Dm644 "vendor/$crate/$file" "$pkgdir/usr/share/licenses/relay/$crate/$file"
     done

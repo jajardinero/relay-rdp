@@ -110,5 +110,8 @@ ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 
 ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
 
+# Bitmap updates cut to their destination rectangle (see RELAY-PATCH.md).
+ironrdp-session = { path = "vendor/ironrdp-session" }
+
 # CredSSP: don't send clientNonce to servers older than CredSSP 5 (see RELAY-PATCH.md).
 sspi = { path = "vendor/sspi" }

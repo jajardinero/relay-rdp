@@ -819,6 +819,9 @@ mod tests {
         let host = std::env::var("RELAY_TLS_TEST_HOST").unwrap();
         let mut params = tls_params(&host, 3389);
         params.advanced.allow_legacy_tls = std::env::var_os("RELAY_TLS_LEGACY").is_some();
+        // 1080 rows: the bottom row of 64-row tiles is cut at the desktop's edge.
+        params.desktop.width = 1920;
+        params.desktop.height = 1080;
         let tcp = open_tcp(&params.host, params.port).await.unwrap();
         let client_addr = tcp.local_addr().unwrap();
         let channels = Channels {
@@ -859,6 +862,22 @@ mod tests {
         // The first slow-path PDUs on the IO channel, each checked by the session's decoder.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut decoded = 0;
+        let mut bitmaps = 0;
+        let size = result.desktop_size;
+        let mut image = ironrdp_session::image::DecodedImage::new(
+            ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+            size.width,
+            size.height,
+        );
+        let mut processor = ironrdp_session::fast_path::ProcessorBuilder {
+            io_channel_id: result.io_channel_id,
+            user_channel_id: result.user_channel_id,
+            share_id: result.share_id,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            bulk_decompressor: None,
+        }
+        .build();
         while let Ok(Ok((action, frame))) =
             tokio::time::timeout_at(deadline, framed.read_pdu()).await
         {
@@ -880,13 +899,27 @@ mod tests {
                     .take(24)
                     .map(|b| format!("{b:02x}"))
                     .collect();
-                match ironrdp_pdu::rdp::headers::decode_io_channel(data) {
-                    Ok(_) => decoded += 1,
+                let pdu = match ironrdp_pdu::rdp::headers::decode_io_channel(data) {
+                    Ok(pdu) => pdu,
                     Err(error) => panic!("{host}: undecodable IO channel PDU {hex}…: {error}"),
+                };
+                decoded += 1;
+                // Bitmaps go through the session's decoder onto a desktop-sized framebuffer.
+                if let ironrdp_pdu::rdp::headers::IoChannelPdu::Data(ctx) = pdu
+                    && let ironrdp_pdu::rdp::headers::ShareDataPdu::Update(update) = ctx.pdu
+                {
+                    let mut src = ironrdp_core::ReadCursor::new(&update);
+                    let kind = ironrdp_pdu::slow_path::read_graphics_update_type(&mut src).unwrap();
+                    if kind == ironrdp_pdu::slow_path::GraphicsUpdateType::Bitmap {
+                        let bitmap =
+                            ironrdp_pdu::slow_path::decode_slow_path_bitmap(&mut src).unwrap();
+                        bitmaps += bitmap.rectangles.len();
+                        processor.process_bitmap_update(&mut image, bitmap).unwrap();
+                    }
                 }
             }
         }
-        eprintln!("{host}: decoded {decoded} IO channel PDUs");
+        eprintln!("{host}: decoded {decoded} IO channel PDUs, drew {bitmaps} bitmaps");
         assert!(decoded > 0);
     }
 
