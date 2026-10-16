@@ -878,6 +878,18 @@ fn os_glyph(os: OsKind) -> &'static str {
     }
 }
 
+fn os_logo_color(os: OsKind, palette: &Palette) -> Color32 {
+    match (os, palette.dark) {
+        (OsKind::Windows, true) => Color32::from_rgb(64, 166, 255),
+        (OsKind::Windows, false) => Color32::from_rgb(0, 103, 192),
+        (OsKind::Linux, true) => Color32::from_rgb(250, 204, 21),
+        (OsKind::Linux, false) => Color32::from_rgb(180, 120, 0),
+        (OsKind::MacOs, true) => Color32::from_rgb(196, 167, 255),
+        (OsKind::MacOs, false) => Color32::from_rgb(124, 58, 237),
+        (OsKind::Unknown, _) => palette.muted,
+    }
+}
+
 /// A host as a tile: its operating system's logo, name, address, and the detected operating
 /// system (or when it was last used). Hovering shows the same actions as a row.
 fn host_tile(
@@ -916,11 +928,7 @@ fn host_tile(
         egui::Align2::LEFT_TOP,
         os_glyph(os),
         theme::font(30.0),
-        if os == OsKind::Unknown {
-            p.muted
-        } else {
-            p.text
-        },
+        os_logo_color(os, &p),
     );
 
     let name_y = inner.top() + 50.0;
