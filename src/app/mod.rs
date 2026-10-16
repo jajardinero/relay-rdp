@@ -48,12 +48,12 @@ pub fn run(launch: Option<LaunchRequest>) -> anyhow::Result<()> {
 }
 
 struct Gfx {
-    // Field order matters: the inhibitor borrows winit's Wayland connection and must be dropped
-    // before the window.
+    // Field order matters: the inhibitor and egui's clipboard (in `egui_state`) borrow winit's
+    // Wayland connection and must be dropped before the window.
     inhibitor: Option<inhibit::ShortcutInhibitor>,
+    egui_state: egui_winit::State,
     window: Arc<Window>,
     painter: Painter,
-    egui_state: egui_winit::State,
 }
 
 /// What the window cursor currently shows while it is over a remote desktop.
@@ -403,6 +403,10 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(gfx) = &mut self.gfx {
             gfx.painter.destroy();
         }
+        // `run_app` closes the Wayland connection when it returns, before `App` is dropped.
+        // The clipboard's worker thread still uses that connection to clean up, so drop the
+        // window state (clipboard included) now, while the connection is open.
+        self.gfx = None;
     }
 }
 
