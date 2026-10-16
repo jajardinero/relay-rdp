@@ -51,6 +51,15 @@ previews** turns them off and deletes them. Hosts without a snapshot show their
 operating system's logo; Relay detects Windows versions when signing in, and the
 host editor's **Operating system** field sets it by hand.
 
+With **Clipboard** on (the host editor's **Devices** section), copied text,
+images and files go both ways: files copied in your file manager paste in
+Windows Explorer, and files copied in Windows paste in your file manager.
+Copying a folder includes its contents (up to 20,000 entries; links to other
+folders inside it are skipped). Files copied on the remote computer show up in a
+read-only folder under `$XDG_RUNTIME_DIR/relay` and are fetched only as they're
+read, so the file manager's copy dialog shows the transfer. This needs the
+`fuse3` package, and works while the session that copied them is connected.
+
 Relay prefers rustls for TLS. If the TLS handshake fails because a server
 requires compatibility ciphers, it retries once with OpenSSL over a fresh RDP
 connection. This adds TLS 1.2 ECDHE-RSA AES-CBC/SHA-2 support; TLS 1.0 and 1.1
@@ -284,5 +293,6 @@ the OpenH264 `.so.8` ABI; rebuild it after incompatible library upgrades.
 
 A Wayland compositor is required. Install a Vulkan driver and a VA-API H.264
 driver appropriate for your GPU to use hardware decoding. A Secret Service
-provider is optional for saving passwords. The package does not register file
+provider is optional for saving passwords, and `fuse3` for pasting files copied
+on the remote computer. The package does not register file
 or URI associations, change default applications, or alter desktop settings.

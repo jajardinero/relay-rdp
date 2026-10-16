@@ -601,7 +601,7 @@ fn devices(ui: &mut Ui, state: &mut EditorState) {
     widgets::setting_row(
         ui,
         "Clipboard",
-        Some("Copy and paste text and images both ways."),
+        Some("Copy and paste text, images and files both ways."),
         |ui| {
             widgets::toggle(ui, &mut devices.clipboard);
         },

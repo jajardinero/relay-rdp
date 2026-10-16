@@ -31,6 +31,7 @@ optdepends=(
   'vulkan-driver: Vulkan rendering and GPU frame import'
   'libva-driver: hardware H.264 video decoding'
   'org.freedesktop.secrets: saving connection passwords in a keyring'
+  'fuse3: pasting files copied on the remote computer'
 )
 # Cargo.toml already enables thin LTO. Avoid a second native LTO setting and
 # avoid generating a separate debug package on hosts that enable one globally.

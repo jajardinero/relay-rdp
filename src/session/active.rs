@@ -359,7 +359,7 @@ impl<'a> ActiveSession<'a> {
                         }
                         Ok(Vec::new())
                     }
-                    Some(SessionCmd::Clipboard(message)) => clipboard_message(&mut stage, message),
+                    Some(SessionCmd::Clipboard(message)) => clipboard_message(&mut stage, message, self.clipboard),
                 },
                 () = sleep_until(resize_at) => {
                     let mut pending = pending_resize.take().expect("armed");
@@ -579,10 +579,23 @@ impl<'a> ActiveSession<'a> {
 fn clipboard_message(
     stage: &mut ActiveStage,
     message: ironrdp_cliprdr::backend::ClipboardMessage,
+    clipboard: Option<&ClipboardWorker>,
 ) -> ironrdp_session::SessionResult<Vec<ActiveStageOutput>> {
     use ironrdp_cliprdr::backend::ClipboardMessage as M;
 
+    // Something is waiting for the answer to a file request; tell it the request is lost.
+    let file_request = match &message {
+        M::SendFileContentsRequest(request) => Some(request.stream_id),
+        _ => None,
+    };
+    let dropped = || {
+        if let (Some(stream_id), Some(clipboard)) = (file_request, clipboard) {
+            clipboard.file_request_failed(stream_id);
+        }
+    };
+
     let Some(cliprdr) = stage.get_svc_processor_mut::<ironrdp_cliprdr::CliprdrClient>() else {
+        dropped();
         return Ok(Vec::new());
     };
     let messages = match message {
@@ -604,6 +617,7 @@ fn clipboard_message(
         // Clipboard trouble (e.g. the channel isn't ready yet) must never end the session.
         Err(e) => {
             tracing::debug!(error = %e, "clipboard request dropped");
+            dropped();
             Ok(Vec::new())
         }
     }

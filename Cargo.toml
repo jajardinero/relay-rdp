@@ -67,6 +67,10 @@ ironrdp-rdpdr = "0.7"
 ironrdp-rdpdr-native = "0.7"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control", "image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Copied files: arboard can't offer several MIME types or read CRLF uri-lists; remote files
+# are served through FUSE (mounted with the fuse3 package's fusermount3, no libfuse linking).
+wl-clipboard-rs = "0.9"
+fuser = { version = "0.18", default-features = false }
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 raw-window-handle = "0.6"
 wayland-client = "0.31"
