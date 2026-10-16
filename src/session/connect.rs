@@ -20,13 +20,14 @@ use x509_cert::der::Encode as _;
 use super::clipboard::ClipboardWorker;
 use super::drive::SharedDrives;
 use super::gfx::GfxShared;
+use super::hostinfo;
 use super::tls::{self, Backend};
 use super::{
     CertificateInfo, CertificatePrompt, ConnectParams, DesktopRequest, EventSink, Failure,
     SessionEvent, Stage,
 };
 use crate::store::known_hosts::{self, Trust};
-use crate::store::profiles::{AudioMode, ExperienceSettings, Quality};
+use crate::store::profiles::{AudioMode, DetectedOs, ExperienceSettings, Quality};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -45,6 +46,8 @@ pub struct Connection {
     pub framed: UpgradedFramed,
     /// The TCP socket under TLS, for RTT sampling. Valid while `framed` is alive.
     pub socket_fd: RawFd,
+    /// The server's operating system, if it revealed it while signing in.
+    pub os: Option<DetectedOs>,
 }
 
 /// Reports stage progress to the UI. Silent during automatic reconnects, where the UI shows
@@ -113,6 +116,7 @@ pub async fn connect(
         mut framed,
         certificate,
         socket_fd,
+        recorded,
     } = with_timeout(begin_secure(params, desktop, channels, stream), params.port).await?;
 
     // Not under a timeout: this may wait for the user to read and answer the trust prompt.
@@ -138,6 +142,15 @@ pub async fn connect(
         .map_err(|e| Failure::from_connector(&e, params.port))
     };
     let result = with_timeout(sign_in, params.port).await?;
+    // Taking the recording also stops it.
+    let os = recorded
+        .lock()
+        .take()
+        .and_then(|bytes| hostinfo::detect(&bytes));
+    match os {
+        Some(os) => tracing::info!(?os, label = %os.label(), "server identified"),
+        None => tracing::debug!("the server didn't reveal its operating system"),
+    }
 
     progress.advance(Stage::Desktop);
 
@@ -145,6 +158,7 @@ pub async fn connect(
         result,
         framed,
         socket_fd,
+        os,
     })
 }
 
@@ -154,6 +168,8 @@ struct SecureConnection {
     framed: UpgradedFramed,
     certificate: x509_cert::Certificate,
     socket_fd: RawFd,
+    /// What the server sends until sign-in completes.
+    recorded: hostinfo::Recorded,
 }
 
 /// A failed TLS handshake consumes its socket. A compatibility attempt starts with a fresh
@@ -183,12 +199,16 @@ async fn begin_secure(
         match tls::upgrade(tcp, &params.host, backend).await {
             Ok((stream, certificate)) => {
                 let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+                let recorded = hostinfo::Recorded::new(parking_lot::Mutex::new(Some(Vec::new())));
+                let stream: Box<dyn AsyncReadWrite> =
+                    Box::new(hostinfo::Recording::new(stream, Arc::clone(&recorded)));
                 return Ok(SecureConnection {
                     upgraded,
                     connector,
                     framed: ironrdp_tokio::TokioFramed::new_with_leftover(stream, leftover),
                     certificate,
                     socket_fd,
+                    recorded,
                 });
             }
             Err(error) if backend == Backend::Rustls && tls::can_retry(&error) => {

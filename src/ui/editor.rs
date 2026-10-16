@@ -8,7 +8,8 @@ use zeroize::Zeroizing;
 use super::theme::{self, Palette, radius, size};
 use super::widgets;
 use crate::store::profiles::{
-    AudioMode, GraphicsMode, HostProfile, ProfileStore, Quality, ResolutionMode, SharedFolder,
+    AudioMode, GraphicsMode, HostProfile, OsChoice, ProfileStore, Quality, ResolutionMode,
+    SharedFolder,
 };
 
 pub enum PasswordChange {
@@ -370,6 +371,37 @@ fn connection(ui: &mut Ui, state: &mut EditorState, profiles: &ProfileStore) {
     widgets::setting_row(ui, "Favorite", None, |ui| {
         widgets::toggle(ui, &mut state.draft.favorite);
     });
+
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new("Operating system")
+            .size(size::SMALL)
+            .color(p.muted),
+    );
+    // Automatic shows what Relay detected when it last connected.
+    let automatic = match state.draft.detected_os {
+        Some(os) => format!("Automatic ({})", os.label()),
+        None => "Automatic (not detected yet)".to_owned(),
+    };
+    let label = |choice: OsChoice| match choice {
+        OsChoice::Automatic => automatic.clone(),
+        OsChoice::Windows => "Windows".to_owned(),
+        OsChoice::Linux => "Linux".to_owned(),
+        OsChoice::MacOs => "macOS".to_owned(),
+    };
+    egui::ComboBox::from_id_salt("os")
+        .width(ui.available_width())
+        .selected_text(label(state.draft.os))
+        .show_ui(ui, |ui| {
+            for choice in [
+                OsChoice::Automatic,
+                OsChoice::Windows,
+                OsChoice::Linux,
+                OsChoice::MacOs,
+            ] {
+                ui.selectable_value(&mut state.draft.os, choice, label(choice));
+            }
+        });
 }
 
 fn display(ui: &mut Ui, state: &mut EditorState) {

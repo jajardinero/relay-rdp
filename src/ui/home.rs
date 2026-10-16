@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use super::theme::{self, Palette, radius, size};
 use super::widgets::{self, Signal};
-use crate::store::profiles::{HostProfile, ProfileStore, parse_endpoint};
+use crate::store::profiles::{HostProfile, OsKind, ProfileStore, parse_endpoint};
+use crate::store::settings::HostView;
 use crate::util::probe::Prober;
 
 pub enum Action {
@@ -21,6 +22,7 @@ pub enum Action {
     Delete(Uuid),
     OpenSettings,
     ImportRdpFile,
+    SetHostView(HostView),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -57,6 +59,9 @@ enum Row {
 
 const RAIL_WIDTH: f32 = 232.0;
 const ROW_HEIGHT: f32 = 52.0;
+const TILE_MIN_WIDTH: f32 = 200.0;
+const TILE_HEIGHT: f32 = 132.0;
+const TILE_GAP: f32 = 12.0;
 const CONTENT_MAX_WIDTH: f32 = 1040.0;
 
 pub fn show(
@@ -64,6 +69,7 @@ pub fn show(
     state: &mut HomeState,
     profiles: &ProfileStore,
     prober: &Prober,
+    view: HostView,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let p = Palette::of(ui);
@@ -108,7 +114,7 @@ pub fn show(
                 vec2(width, ui.available_height()),
                 Layout::top_down(Align::Min),
                 |ui| {
-                    main_column(ui, state, profiles, prober, &mut actions);
+                    main_column(ui, state, profiles, prober, view, &mut actions);
                 },
             );
         });
@@ -273,6 +279,7 @@ fn main_column(
     state: &mut HomeState,
     profiles: &ProfileStore,
     prober: &Prober,
+    view: HostView,
     actions: &mut Vec<Action>,
 ) {
     let p = Palette::of(ui);
@@ -281,7 +288,30 @@ fn main_column(
         Filter::Favorites => "Favorites",
         Filter::Group(g) => g.as_str(),
     };
-    ui.label(RichText::new(title).font(theme::font_semibold(size::HEADING)));
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).font(theme::font_semibold(size::HEADING)));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            // Right to left: Tiles ends up on the right.
+            for (option, glyph, label) in [
+                (HostView::Tiles, icon::SQUARES_FOUR, "Tiles"),
+                (HostView::List, icon::LIST, "List"),
+            ] {
+                let active = view == option;
+                let button = egui::Button::new(RichText::new(glyph).size(16.0).color(if active {
+                    p.on_accent
+                } else {
+                    p.muted
+                }))
+                .fill(if active { p.accent } else { p.raised })
+                .corner_radius(CornerRadius::same(radius::CONTROL))
+                .min_size(vec2(32.0, 28.0));
+                if ui.add(button).on_hover_text(label).clicked() && !active {
+                    actions.push(Action::SetHostView(option));
+                }
+            }
+        });
+    });
     ui.add_space(14.0);
 
     // Build the visible rows before drawing the search box so its key handling can use them.
@@ -364,16 +394,41 @@ fn main_column(
                     widgets::section_label(ui, heading);
                     ui.add_space(2.0);
                 }
-                for id in ids {
-                    if let Some(host) = profiles.get(*id) {
-                        let signal = prober.signal(host.address.trim(), host.port);
-                        // A host can appear in both Recent and its group. Keep each row's
-                        // widget/menu IDs stable and distinct as hover controls appear.
-                        ui.push_id((heading, host.id), |ui| {
-                            host_row(ui, host, signal, state.selected == Some(index), actions);
-                        });
+                let hosts: Vec<&HostProfile> =
+                    ids.iter().filter_map(|id| profiles.get(*id)).collect();
+                // A host can appear in both Recent and its group. Keep each row's or tile's
+                // widget/menu IDs stable and distinct as hover controls appear.
+                match view {
+                    HostView::List => {
+                        for host in hosts {
+                            let signal = prober.signal(host.address.trim(), host.port);
+                            ui.push_id((heading, host.id), |ui| {
+                                host_row(ui, host, signal, state.selected == Some(index), actions);
+                            });
+                            index += 1;
+                        }
                     }
-                    index += 1;
+                    HostView::Tiles => {
+                        let width = ui.available_width();
+                        let columns = ((width + TILE_GAP) / (TILE_MIN_WIDTH + TILE_GAP))
+                            .floor()
+                            .max(1.0);
+                        let tile_width = (width - TILE_GAP * (columns - 1.0)) / columns;
+                        for row in hosts.chunks(columns as usize) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = TILE_GAP;
+                                for host in row {
+                                    let signal = prober.signal(host.address.trim(), host.port);
+                                    let selected = state.selected == Some(index);
+                                    ui.push_id((heading, host.id), |ui| {
+                                        host_tile(ui, host, signal, selected, tile_width, actions);
+                                    });
+                                    index += 1;
+                                }
+                            });
+                            ui.add_space(TILE_GAP);
+                        }
+                    }
                 }
                 ui.add_space(18.0);
             }
@@ -731,32 +786,7 @@ fn host_row(
         );
         row_ui.spacing_mut().item_spacing.x = 2.0;
 
-        let more = widgets::icon_button(&mut row_ui, icon::DOTS_THREE, "More");
-        egui::Popup::menu(&more).id(more_id).show(|ui| {
-            ui.set_min_width(170.0);
-            if ui.button(format!("{}  Duplicate", icon::COPY)).clicked() {
-                actions.push(Action::Duplicate(host.id));
-            }
-            let favorite_label = if host.favorite {
-                "Remove from favorites"
-            } else {
-                "Add to favorites"
-            };
-            if ui
-                .button(format!("{}  {favorite_label}", icon::STAR))
-                .clicked()
-            {
-                actions.push(Action::ToggleFavorite(host.id));
-            }
-            ui.separator();
-            if ui
-                .button(RichText::new(format!("{}  Delete", icon::TRASH)).color(p.poor))
-                .clicked()
-            {
-                actions.push(Action::Delete(host.id));
-            }
-        });
-        clicked_action |= more.clicked();
+        clicked_action |= more_menu(&mut row_ui, host, more_id, actions).clicked();
 
         if widgets::icon_button(&mut row_ui, icon::PENCIL_SIMPLE, "Edit").clicked() {
             actions.push(Action::Edit(host.id));
@@ -767,6 +797,177 @@ fn host_row(
             actions.push(Action::Connect(host.id));
             clicked_action = true;
         }
+    }
+
+    if !clicked_action && response.double_clicked() {
+        actions.push(Action::Connect(host.id));
+    }
+}
+
+/// The "More" button and its menu: duplicate, favorite, delete.
+fn more_menu(
+    ui: &mut Ui,
+    host: &HostProfile,
+    id: egui::Id,
+    actions: &mut Vec<Action>,
+) -> egui::Response {
+    let p = Palette::of(ui);
+    let more = widgets::icon_button(ui, icon::DOTS_THREE, "More");
+    egui::Popup::menu(&more).id(id).show(|ui| {
+        ui.set_min_width(170.0);
+        if ui.button(format!("{}  Duplicate", icon::COPY)).clicked() {
+            actions.push(Action::Duplicate(host.id));
+        }
+        let favorite_label = if host.favorite {
+            "Remove from favorites"
+        } else {
+            "Add to favorites"
+        };
+        if ui
+            .button(format!("{}  {favorite_label}", icon::STAR))
+            .clicked()
+        {
+            actions.push(Action::ToggleFavorite(host.id));
+        }
+        ui.separator();
+        if ui
+            .button(RichText::new(format!("{}  Delete", icon::TRASH)).color(p.poor))
+            .clicked()
+        {
+            actions.push(Action::Delete(host.id));
+        }
+    });
+    more
+}
+
+/// `text` on one line, shortened with an ellipsis to fit `width`.
+fn fitted(ui: &Ui, text: &str, font: egui::FontId, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job =
+        egui::text::LayoutJob::simple_singleline(text.to_owned(), font, Color32::PLACEHOLDER);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(0.0));
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+fn os_glyph(os: OsKind) -> &'static str {
+    match os {
+        OsKind::Windows => icon::WINDOWS_LOGO,
+        OsKind::Linux => icon::LINUX_LOGO,
+        OsKind::MacOs => icon::APPLE_LOGO,
+        OsKind::Unknown => icon::DESKTOP,
+    }
+}
+
+/// A host as a tile: its operating system's logo, name, address, and the detected operating
+/// system (or when it was last used). Hovering shows the same actions as a row.
+fn host_tile(
+    ui: &mut Ui,
+    host: &HostProfile,
+    signal: Signal,
+    selected: bool,
+    width: f32,
+    actions: &mut Vec<Action>,
+) {
+    let p = Palette::of(ui);
+    let (rect, response) = ui.allocate_exact_size(vec2(width, TILE_HEIGHT), Sense::click());
+    let hovered = response.hovered() || ui.rect_contains_pointer(rect);
+    let more_id = ui.make_persistent_id("host-more");
+    let show_actions = hovered || egui::Popup::is_id_open(ui.ctx(), more_id);
+    let fill = if selected {
+        p.accent_soft()
+    } else if hovered {
+        p.hover()
+    } else {
+        p.raised
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(radius::PANEL),
+        fill,
+        Stroke::new(1.0, p.hairline),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink(14.0);
+    let painter = ui.painter_at(inner);
+
+    let os = host.os_kind();
+    painter.text(
+        inner.left_top(),
+        egui::Align2::LEFT_TOP,
+        os_glyph(os),
+        theme::font(30.0),
+        if os == OsKind::Unknown {
+            p.muted
+        } else {
+            p.text
+        },
+    );
+
+    let name_y = inner.top() + 50.0;
+    let star_w = if host.favorite { 20.0 } else { 0.0 };
+    let name = fitted(
+        ui,
+        host.display_name(),
+        theme::font_medium(size::BODY),
+        inner.width() - star_w,
+    );
+    let name_w = name.size().x;
+    painter.galley(egui::pos2(inner.left(), name_y), name, p.text);
+    if host.favorite {
+        painter.text(
+            egui::pos2(inner.left() + name_w + 6.0, name_y + 1.0),
+            egui::Align2::LEFT_TOP,
+            icon::STAR,
+            theme::font(12.0),
+            p.fair,
+        );
+    }
+    let address = fitted(ui, &host.endpoint(), theme::mono(12.0), inner.width());
+    painter.galley(egui::pos2(inner.left(), name_y + 20.0), address, p.muted);
+    let detail = host
+        .os_label()
+        .unwrap_or_else(|| last_used(host.last_connected));
+    // On hover the Connect button takes the bottom right.
+    let detail_w = inner.width() - if show_actions { 96.0 } else { 0.0 };
+    let detail = fitted(ui, &detail, theme::font(size::SMALL), detail_w);
+    let detail_y = inner.bottom() - detail.size().y;
+    painter.galley(egui::pos2(inner.left(), detail_y), detail, p.muted);
+
+    let mut clicked_action = false;
+    if show_actions {
+        let top = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - 100.0, rect.top() + 8.0),
+            egui::pos2(rect.right() - 8.0, rect.top() + 40.0),
+        );
+        let mut top_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(top)
+                .layout(Layout::right_to_left(Align::Center)),
+        );
+        top_ui.spacing_mut().item_spacing.x = 2.0;
+        clicked_action |= more_menu(&mut top_ui, host, more_id, actions).clicked();
+        if widgets::icon_button(&mut top_ui, icon::PENCIL_SIMPLE, "Edit").clicked() {
+            actions.push(Action::Edit(host.id));
+            clicked_action = true;
+        }
+
+        let bottom = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - 110.0, rect.bottom() - 44.0),
+            egui::pos2(rect.right() - 10.0, rect.bottom() - 8.0),
+        );
+        let mut bottom_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(bottom)
+                .layout(Layout::right_to_left(Align::Center)),
+        );
+        if widgets::primary_button(&mut bottom_ui, "Connect").clicked() {
+            actions.push(Action::Connect(host.id));
+            clicked_action = true;
+        }
+    } else {
+        let mut glyph_ui = ui.new_child(egui::UiBuilder::new().max_rect(
+            egui::Rect::from_center_size(inner.right_top() + vec2(-8.0, 8.0), vec2(16.0, 14.0)),
+        ));
+        widgets::signal_bars(&mut glyph_ui, signal).on_hover_text(signal.label());
     }
 
     if !clicked_action && response.double_clicked() {
@@ -824,6 +1025,15 @@ mod tests {
     }
 
     fn frame(ctx: &Context, host: &HostProfile, events: Vec<Event>) -> MenuFrame {
+        frame_in(ctx, host, events, HostView::List)
+    }
+
+    fn frame_in(
+        ctx: &Context,
+        host: &HostProfile,
+        events: Vec<Event>,
+        view: HostView,
+    ) -> MenuFrame {
         let mut result = MenuFrame {
             menu: Id::NULL,
             other_menu: Id::NULL,
@@ -845,11 +1055,31 @@ mod tests {
                             if heading.is_some() {
                                 result.menu = id;
                                 result.more = ui.cursor().min
-                                    + vec2(ui.available_width() - 25.0, ROW_HEIGHT / 2.0);
+                                    + match view {
+                                        HostView::List => {
+                                            vec2(ui.available_width() - 25.0, ROW_HEIGHT / 2.0)
+                                        }
+                                        HostView::Tiles => vec2(TILE_WIDTH - 23.0, 24.0),
+                                    };
                             } else {
                                 result.other_menu = id;
                             }
-                            host_row(ui, host, Signal::Unknown, false, &mut result.actions);
+                            let actions = &mut result.actions;
+                            match view {
+                                HostView::List => {
+                                    host_row(ui, host, Signal::Unknown, false, actions);
+                                }
+                                HostView::Tiles => {
+                                    host_tile(
+                                        ui,
+                                        host,
+                                        Signal::Unknown,
+                                        false,
+                                        TILE_WIDTH,
+                                        actions,
+                                    );
+                                }
+                            }
                         });
                     }
                 });
@@ -872,6 +1102,31 @@ mod tests {
             pressed,
             modifiers: Modifiers::NONE,
         }
+    }
+
+    const TILE_WIDTH: f32 = 220.0;
+
+    /// Tiles share the rows' menu: it opens from the tile's More button and selects.
+    #[test]
+    fn tile_more_menu_opens_and_selects() {
+        let ctx = Context::default();
+        theme::install_fonts(&ctx);
+        let host = HostProfile::new("example.test", 3389);
+        let frame = |events| frame_in(&ctx, &host, events, HostView::Tiles);
+        let more = frame(vec![]).more;
+        frame(vec![Event::PointerMoved(more)]);
+        frame(vec![pointer_button(more, true)]);
+        frame(vec![pointer_button(more, false)]);
+        let opened = frame(vec![]);
+        assert!(egui::Popup::is_id_open(&ctx, opened.menu));
+        assert!(!egui::Popup::is_id_open(&ctx, opened.other_menu));
+        let option = opened
+            .duplicate
+            .expect("Duplicate option should be visible");
+        frame(vec![Event::PointerMoved(option)]);
+        frame(vec![pointer_button(option, true)]);
+        let selected = frame(vec![pointer_button(option, false)]);
+        assert!(matches!(selected.actions.as_slice(), [Action::Duplicate(id)] if *id == host.id));
     }
 
     #[test]

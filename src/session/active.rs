@@ -264,7 +264,11 @@ impl<'a> ActiveSession<'a> {
             result,
             framed,
             socket_fd,
+            os,
         } = self.connection.take().expect("connection present");
+        if let Some(os) = os {
+            self.events.send(SessionEvent::HostOs(os));
+        }
         let port = self.params.port;
 
         let (mut reader, mut writer) = split_tokio_framed(framed);

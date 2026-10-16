@@ -11,6 +11,7 @@ mod drive;
 pub mod errors;
 pub mod framebuffer;
 pub(crate) mod gfx;
+mod hostinfo;
 #[cfg(test)]
 mod integration_tests;
 mod netinfo;
@@ -267,6 +268,8 @@ pub enum SessionEvent {
         reason: String,
     },
     Stats(Stats),
+    /// The server's operating system, as it revealed it while signing in.
+    HostOs(crate::store::profiles::DetectedOs),
     Ended(Ended),
 }
 

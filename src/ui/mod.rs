@@ -218,6 +218,11 @@ impl Ui {
         for tab in &mut self.tabs {
             while let Some(event) = tab.handle.try_event() {
                 let went_live = matches!(event, SessionEvent::StageCompleted(Stage::Desktop, _));
+                if let SessionEvent::HostOs(os) = event
+                    && tab.saved
+                {
+                    self.profiles.set_detected_os(tab.profile.id, os);
+                }
                 tab.handle_event(event);
                 if went_live && tab.saved {
                     self.profiles.mark_connected(tab.profile.id);
@@ -879,7 +884,8 @@ impl Ui {
     }
 
     fn home_screen(&mut self, ui: &mut egui::Ui) {
-        let actions = home::show(ui, &mut self.home, &self.profiles, &self.prober);
+        let view = self.settings.settings.host_view;
+        let actions = home::show(ui, &mut self.home, &self.profiles, &self.prober, view);
         for action in actions {
             self.handle_home_action(action);
         }
@@ -1053,6 +1059,10 @@ impl Ui {
             }
             Action::OpenSettings => self.dialog = Some(Dialog::Settings),
             Action::ImportRdpFile => self.picker.rdp_file(),
+            Action::SetHostView(view) => {
+                self.settings.settings.host_view = view;
+                self.settings.save();
+            }
         }
     }
 

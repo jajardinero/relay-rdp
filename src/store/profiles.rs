@@ -42,6 +42,65 @@ pub struct HostProfile {
     pub devices: DeviceSettings,
     #[serde(default)]
     pub advanced: AdvancedSettings,
+    /// The operating system the host reported when Relay last connected.
+    #[serde(default)]
+    pub detected_os: Option<DetectedOs>,
+    /// The operating system chosen in the editor; Automatic uses the detected one.
+    #[serde(default)]
+    pub os: OsChoice,
+}
+
+/// What a server revealed about its operating system while signing in.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum DetectedOs {
+    /// The version in the server's NTLM challenge.
+    Windows { major: u8, minor: u8, build: u16 },
+}
+
+impl DetectedOs {
+    /// A name for people, such as "Windows 11" or "Windows 10 or Server 2019".
+    pub fn label(self) -> String {
+        let Self::Windows {
+            major,
+            minor,
+            build,
+        } = self;
+        let name = match (major, minor, build) {
+            (6, 1, _) => "Windows 7 or Server 2008 R2",
+            (6, 2, _) => "Windows 8 or Server 2012",
+            (6, 3, _) => "Windows 8.1 or Server 2012 R2",
+            // Builds that a desktop and a server release share.
+            (10, 0, 14393) => "Windows 10 or Server 2016",
+            (10, 0, 17763) => "Windows 10 or Server 2019",
+            (10, 0, 26100) => "Windows 11 or Server 2025",
+            (10, 0, 20348) => "Windows Server 2022",
+            (10, 0, 22000..) => "Windows 11",
+            (10, 0, 10240..) => "Windows 10",
+            _ => return format!("Windows (build {build})"),
+        };
+        name.to_owned()
+    }
+}
+
+/// The operating system shown for a host.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OsChoice {
+    /// Whatever Relay detected.
+    #[default]
+    Automatic,
+    Windows,
+    Linux,
+    MacOs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsKind {
+    Windows,
+    Linux,
+    MacOs,
+    Unknown,
 }
 
 impl HostProfile {
@@ -62,6 +121,28 @@ impl HostProfile {
             experience: ExperienceSettings::default(),
             devices: DeviceSettings::default(),
             advanced: AdvancedSettings::default(),
+            detected_os: None,
+            os: OsChoice::default(),
+        }
+    }
+
+    /// The host's operating system: the editor's choice, else what was detected.
+    pub fn os_kind(&self) -> OsKind {
+        match (self.os, self.detected_os) {
+            (OsChoice::Windows, _) => OsKind::Windows,
+            (OsChoice::Linux, _) => OsKind::Linux,
+            (OsChoice::MacOs, _) => OsKind::MacOs,
+            (OsChoice::Automatic, Some(DetectedOs::Windows { .. })) => OsKind::Windows,
+            (OsChoice::Automatic, None) => OsKind::Unknown,
+        }
+    }
+
+    /// The detected operating system's name, unless the editor chose another.
+    pub fn os_label(&self) -> Option<String> {
+        match self.os {
+            OsChoice::Automatic | OsChoice::Windows => self.detected_os.map(DetectedOs::label),
+            OsChoice::Linux => Some("Linux".to_owned()),
+            OsChoice::MacOs => Some("macOS".to_owned()),
         }
     }
 
@@ -386,6 +467,16 @@ impl ProfileStore {
         }
     }
 
+    /// Records the operating system a host reported, saving only when it changed.
+    pub fn set_detected_os(&mut self, id: Uuid, os: DetectedOs) {
+        if let Some(host) = self.hosts.iter_mut().find(|h| h.id == id)
+            && host.detected_os != Some(os)
+        {
+            host.detected_os = Some(os);
+            self.save();
+        }
+    }
+
     pub fn toggle_favorite(&mut self, id: Uuid) {
         if let Some(host) = self.hosts.iter_mut().find(|h| h.id == id) {
             host.favorite = !host.favorite;
@@ -503,6 +594,45 @@ mod tests {
         assert!(host.advanced.auto_reconnect);
         assert_eq!(host.advanced.keyboard_layout, DEFAULT_KEYBOARD_LAYOUT);
         assert_eq!(host.experience.quality, Quality::Best);
+        assert_eq!(host.detected_os, None);
+        assert_eq!(host.os, OsChoice::Automatic);
+        assert_eq!(host.os_kind(), OsKind::Unknown);
+    }
+
+    #[test]
+    fn windows_builds_have_names() {
+        let windows = |major, minor, build| DetectedOs::Windows {
+            major,
+            minor,
+            build,
+        };
+        assert_eq!(windows(10, 0, 22631).label(), "Windows 11");
+        assert_eq!(windows(10, 0, 19045).label(), "Windows 10");
+        assert_eq!(windows(10, 0, 20348).label(), "Windows Server 2022");
+        assert_eq!(windows(10, 0, 17763).label(), "Windows 10 or Server 2019");
+        assert_eq!(windows(6, 3, 9600).label(), "Windows 8.1 or Server 2012 R2");
+        assert_eq!(windows(5, 2, 3790).label(), "Windows (build 3790)");
+    }
+
+    #[test]
+    fn the_editor_choice_beats_detection() {
+        let mut host = HostProfile::new("a", DEFAULT_PORT);
+        host.detected_os = Some(DetectedOs::Windows {
+            major: 10,
+            minor: 0,
+            build: 22631,
+        });
+        assert_eq!(host.os_kind(), OsKind::Windows);
+        assert_eq!(host.os_label().as_deref(), Some("Windows 11"));
+        host.os = OsChoice::Linux;
+        assert_eq!(host.os_kind(), OsKind::Linux);
+        assert_eq!(host.os_label().as_deref(), Some("Linux"));
+        let text = toml::to_string(&HostsFile {
+            hosts: vec![host.clone()],
+        })
+        .unwrap();
+        let parsed: HostsFile = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.hosts, vec![host]);
     }
 
     #[test]

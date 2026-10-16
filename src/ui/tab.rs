@@ -191,6 +191,8 @@ impl SessionTab {
                 self.remote_size = Some((width, height))
             }
             SessionEvent::Pointer(pointer) => self.cursor = pointer,
+            // The host library records it (`Ui::poll`).
+            SessionEvent::HostOs(_) => {}
             SessionEvent::Reconnecting {
                 attempt,
                 retry_in,
