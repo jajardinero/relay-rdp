@@ -32,6 +32,8 @@ pub struct HostProfile {
     pub favorite: bool,
     #[serde(default)]
     pub save_password: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_profile_id: Option<Uuid>,
     #[serde(default)]
     pub last_connected: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -116,6 +118,7 @@ impl HostProfile {
             group: String::new(),
             favorite: false,
             save_password: false,
+            credential_profile_id: None,
             last_connected: None,
             display: DisplaySettings::default(),
             experience: ExperienceSettings::default(),
@@ -421,6 +424,7 @@ struct HostsFile {
 }
 
 /// The saved host library, persisted to `~/.config/relay/hosts.toml`.
+#[derive(Default)]
 pub struct ProfileStore {
     path: Option<PathBuf>,
     hosts: Vec<HostProfile>,
@@ -442,6 +446,26 @@ impl ProfileStore {
 
     pub fn get(&self, id: Uuid) -> Option<&HostProfile> {
         self.hosts.iter().find(|h| h.id == id)
+    }
+
+    pub fn unassign_credentials(&mut self, id: Uuid) -> anyhow::Result<()> {
+        let mut hosts = self.hosts.clone();
+        for host in &mut hosts {
+            if host.credential_profile_id == Some(id) {
+                host.credential_profile_id = None;
+                host.save_password = false;
+            }
+        }
+        if let Some(path) = &self.path {
+            super::save_toml(
+                path,
+                &HostsFile {
+                    hosts: hosts.clone(),
+                },
+            )?;
+        }
+        self.hosts = hosts;
+        Ok(())
     }
 
     /// Inserts or replaces the profile with the same id.
@@ -568,6 +592,7 @@ mod tests {
         let mut profile = HostProfile::new("build-01.corp.local", 3390);
         profile.username = "jdoe".into();
         profile.domain = "CORP".into();
+        profile.credential_profile_id = Some(Uuid::new_v4());
         profile.experience.quality = Quality::LowBandwidth;
         profile.devices.shared_folders.push(SharedFolder {
             name: "Downloads".into(),
@@ -590,6 +615,7 @@ mod tests {
         let parsed: HostsFile = toml::from_str(&text).unwrap();
         let host = &parsed.hosts[0];
         assert_eq!(host.port, DEFAULT_PORT);
+        assert_eq!(host.credential_profile_id, None);
         assert!(host.devices.clipboard);
         assert!(host.advanced.auto_reconnect);
         assert_eq!(host.advanced.keyboard_layout, DEFAULT_KEYBOARD_LAYOUT);
@@ -612,6 +638,27 @@ mod tests {
         assert_eq!(windows(10, 0, 17763).label(), "Windows 10 or Server 2019");
         assert_eq!(windows(6, 3, 9600).label(), "Windows 8.1 or Server 2012 R2");
         assert_eq!(windows(5, 2, 3790).label(), "Windows (build 3790)");
+    }
+
+    #[test]
+    fn deleting_credentials_unassigns_all_hosts_and_disables_dormant_passwords() {
+        let credential = Uuid::new_v4();
+        let mut a = HostProfile::new("a", 3389);
+        a.credential_profile_id = Some(credential);
+        a.save_password = true;
+        let mut b = a.clone();
+        b.id = Uuid::new_v4();
+        let manual = HostProfile::new("manual", 3389);
+        let mut store = ProfileStore {
+            path: None,
+            hosts: vec![a, b, manual.clone()],
+        };
+        store.unassign_credentials(credential).unwrap();
+        for host in &store.hosts()[..2] {
+            assert_eq!(host.credential_profile_id, None);
+            assert!(!host.save_password);
+        }
+        assert_eq!(store.hosts()[2], manual);
     }
 
     #[test]

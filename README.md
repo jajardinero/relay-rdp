@@ -63,6 +63,28 @@ rate, and sets the wallpaper, animation and font-smoothing options to match.
 By default, system shortcuts such as Super and Alt+Tab go to the remote
 computer only in fullscreen. **Settings → Keyboard** changes this.
 
+## Credential profiles
+
+Open **Passwords**, directly below **+ New host** in the sidebar, then choose
+**Add profile** to save a named account
+with a username, optional domain, and password. Passwords stay in the system
+keyring; `credentials.toml` contains only account metadata. You can leave the
+password empty and enter it when connecting.
+
+Choose the profile under **Sign-in → Credentials** in a host's editor, or select
+it in the sign-in prompt. Selecting a profile at sign-in remembers it for a saved
+host; quick connections use it for that session. **Manual** keeps host-specific
+credentials available.
+
+Editing a profile changes future connections and manual reconnects for every
+assigned host. Open sessions and automatic retries keep their current credentials.
+A password entered at sign-in is used once unless you select **Update profile
+password**. Profile saves and password updates report keyring failures so you
+can retry. When editing a profile, an empty password field keeps its saved password.
+
+Deleting a profile asks for confirmation, unassigns its hosts, and makes them
+prompt for credentials next time. It does not disconnect open sessions.
+
 ## Video decoding
 
 **Settings → Performance → Hardware video decoding** is enabled by default,

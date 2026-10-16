@@ -1,3 +1,4 @@
+pub mod credentials;
 pub mod known_hosts;
 pub mod paths;
 pub mod profiles;

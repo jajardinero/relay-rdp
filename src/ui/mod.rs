@@ -1,5 +1,6 @@
 //! Application UI: tab strip, host library, sessions, dialogs.
 
+pub mod credentials;
 pub mod dialogs;
 pub mod editor;
 pub mod home;
@@ -31,8 +32,10 @@ use crate::app::UserEvent;
 use crate::app::gpu::RemoteTextures;
 use crate::app::input::{self, RemoteViewport};
 use crate::session::{Ended, PointerUpdate, SessionEvent, SessionId, SharedFrame, Stage};
+use crate::store::credentials::{CredentialProfile, CredentialStore};
 use crate::store::known_hosts::KnownHosts;
 use crate::store::profiles::{HostProfile, ProfileStore, parse_endpoint};
+use crate::store::secrets::{SecretId, SecretOperation, SecretWorker};
 use crate::store::settings::{AppSettings, SettingsStore, ShortcutCapture, ThemePreference};
 use crate::store::{rdpfile, secrets};
 use crate::util::pick::{Picked, Picker};
@@ -67,12 +70,24 @@ pub struct LaunchRequest {
     pub password: Option<Zeroizing<String>>,
 }
 
-/// Result of a background keyring lookup.
-struct PasswordLookup {
+struct SignIn {
     profile: HostProfile,
     saved: bool,
     tab: Option<TabId>,
-    password: Option<Zeroizing<String>>,
+    password: Zeroizing<String>,
+    remember: bool,
+}
+
+enum PendingSecret {
+    Connect {
+        profile: HostProfile,
+        saved: bool,
+        tab: Option<TabId>,
+    },
+    SaveCredential(CredentialProfile),
+    DeleteCredential(Uuid),
+    UpdatePassword(SignIn),
+    HostWrite,
 }
 
 pub struct Ui {
@@ -80,6 +95,8 @@ pub struct Ui {
     proxy: EventLoopProxy<UserEvent>,
     settings: SettingsStore,
     profiles: ProfileStore,
+    credentials: CredentialStore,
+    credential_manager: credentials::Manager,
     known_hosts: Arc<Mutex<KnownHosts>>,
     prober: Prober,
     picker: Picker,
@@ -109,8 +126,8 @@ pub struct Ui {
     pending_move: Option<(TabId, ironrdp_input::MousePosition)>,
     surrender_focus: bool,
 
-    password_tx: std::sync::mpsc::Sender<PasswordLookup>,
-    password_rx: std::sync::mpsc::Receiver<PasswordLookup>,
+    secret_worker: SecretWorker,
+    pending_secrets: HashMap<Uuid, PendingSecret>,
     /// The egui context, kept for work triggered outside a frame (keyring results).
     last_ctx: Option<egui::Context>,
     window_focused: bool,
@@ -126,13 +143,18 @@ impl Ui {
         launch: Option<LaunchRequest>,
     ) -> Self {
         theme::install_fonts(ctx);
-        let (password_tx, password_rx) = std::sync::mpsc::channel();
+        let wake_proxy = proxy.clone();
+        let secret_worker = SecretWorker::new(secrets::DesktopKeyring, move || {
+            let _ = wake_proxy.send_event(UserEvent::Wake);
+        });
         let prober = Prober::new(proxy.clone());
         let picker = Picker::new(proxy.clone());
         let ui = Self {
             gpu: None,
             settings: SettingsStore::load(),
             profiles: ProfileStore::load(),
+            credentials: CredentialStore::load(),
+            credential_manager: credentials::Manager::default(),
             known_hosts: Arc::new(Mutex::new(KnownHosts::load())),
             prober,
             picker,
@@ -158,8 +180,8 @@ impl Ui {
             buttons_down: 0,
             pending_move: None,
             surrender_focus: false,
-            password_tx,
-            password_rx,
+            secret_worker,
+            pending_secrets: HashMap::new(),
             last_ctx: None,
             window_focused: true,
             focused_session: None,
@@ -252,21 +274,7 @@ impl Ui {
             }
         }
 
-        while let Ok(lookup) = self.password_rx.try_recv() {
-            match lookup.password {
-                Some(password) if !lookup.profile.username.is_empty() => {
-                    self.launch(lookup.profile, lookup.saved, password, lookup.tab);
-                }
-                _ => {
-                    self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
-                        lookup.profile,
-                        lookup.saved,
-                        lookup.tab,
-                        None,
-                    )));
-                }
-            }
-        }
+        self.poll_secrets();
     }
 
     pub fn frames(&self) -> Vec<(SessionId, Arc<SharedFrame>)> {
@@ -563,27 +571,196 @@ impl Ui {
 
     /// Connect to a profile: use the keyring password if one is saved, otherwise ask.
     fn request_connect(&mut self, profile: HostProfile, saved: bool, tab: Option<TabId>) {
-        if saved && profile.save_password && !profile.username.is_empty() {
-            let tx = self.password_tx.clone();
-            let proxy = self.proxy.clone();
-            std::thread::spawn(move || {
-                let password = secrets::load_password(profile.id).unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "keyring lookup failed");
-                    None
-                });
-                let _ = tx.send(PasswordLookup {
+        let (snapshot, target) = match self.credentials.connection(&profile, saved) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
                     profile,
                     saved,
                     tab,
-                    password,
-                });
-                let _ = proxy.send_event(UserEvent::Wake);
-            });
+                    Some(error.to_string()),
+                )));
+                return;
+            }
+        };
+        if let Some(target) = target {
+            let request = self.secret_worker.submit(SecretOperation::Load(target));
+            self.pending_secrets.insert(
+                request,
+                PendingSecret::Connect {
+                    profile: snapshot,
+                    saved,
+                    tab,
+                },
+            );
         } else {
             self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
                 profile, saved, tab, None,
             )));
         }
+    }
+
+    fn handle_credential_action(&mut self, action: credentials::Action) {
+        if self.credential_manager.busy {
+            return;
+        }
+        let (operation, pending) = match action {
+            credentials::Action::Save {
+                mut profile,
+                password,
+            } => {
+                if let Err(error) = profile.validate() {
+                    self.credential_manager.finish(Err(error));
+                    return;
+                }
+                let operation = password.map_or(SecretOperation::Keep, |password| {
+                    SecretOperation::Save(SecretId::Credential(profile.id), password)
+                });
+                (operation, PendingSecret::SaveCredential(profile))
+            }
+            credentials::Action::Delete(id) => (
+                SecretOperation::Delete(SecretId::Credential(id)),
+                PendingSecret::DeleteCredential(id),
+            ),
+        };
+        self.credential_manager.busy = true;
+        self.credential_manager.error = None;
+        let request = self.secret_worker.submit(operation);
+        self.pending_secrets.insert(request, pending);
+    }
+
+    fn poll_secrets(&mut self) {
+        while let Some(completion) = self.secret_worker.try_recv() {
+            let Some(pending) = self.pending_secrets.remove(&completion.request) else {
+                continue;
+            };
+            match pending {
+                PendingSecret::Connect {
+                    profile,
+                    saved,
+                    tab,
+                } => match completion.result {
+                    Ok(Some(password)) => match self.credentials.resolve(&profile) {
+                        // A queued profile save may have completed while this lookup waited.
+                        Ok(snapshot) => self.launch(snapshot, saved, password, tab),
+                        Err(error) => {
+                            self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
+                                profile,
+                                saved,
+                                tab,
+                                Some(error.to_string()),
+                            )));
+                        }
+                    },
+                    result => {
+                        let reason = match result {
+                            Err(error) => format!(
+                                "Couldn't read the saved password: {error}. Enter a password to continue."
+                            ),
+                            _ => "No password is saved for this account. Enter one to continue."
+                                .to_owned(),
+                        };
+                        self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
+                            profile,
+                            saved,
+                            tab,
+                            Some(reason),
+                        )));
+                    }
+                },
+                PendingSecret::SaveCredential(profile) => {
+                    let result = completion
+                        .result
+                        .and_then(|_| self.credentials.upsert(profile));
+                    if result.is_ok() {
+                        self.toasts.info("Saved credential profile");
+                    } else if let Err(error) = &result {
+                        self.toasts
+                            .error(format!("Couldn't save credential profile: {error}"));
+                    }
+                    self.credential_manager.finish(result);
+                }
+                PendingSecret::DeleteCredential(id) => {
+                    let result = completion.result.and_then(|_| {
+                        self.profiles.unassign_credentials(id)?;
+                        self.credentials.remove(id)
+                    });
+                    if result.is_ok() {
+                        if let Some(editor) = &mut self.editor {
+                            editor.unassign_credentials(id);
+                        }
+                        self.toasts.info("Deleted credential profile");
+                    } else if let Err(error) = &result {
+                        self.toasts
+                            .error(format!("Couldn't delete credential profile: {error}"));
+                    }
+                    self.credential_manager.finish(result);
+                }
+                PendingSecret::UpdatePassword(sign_in) => match completion.result {
+                    Ok(_) => {
+                        self.toasts.info("Updated profile password");
+                        self.finish_sign_in(sign_in);
+                    }
+                    Err(error) => {
+                        let mut dialog = CredentialsDialog::new(
+                            sign_in.profile,
+                            sign_in.saved,
+                            sign_in.tab,
+                            None,
+                        );
+                        dialog.password_save_failed(sign_in.password, format!("Couldn't update the profile password: {error}. Retry or uncheck Update profile password to use it once."));
+                        self.dialog = Some(Dialog::Credentials(dialog));
+                    }
+                },
+                PendingSecret::HostWrite => {
+                    if let Err(error) = completion.result {
+                        self.toasts
+                            .error(format!("Couldn't save the host password: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_sign_in(&mut self, sign_in: SignIn) {
+        let SignIn {
+            profile,
+            saved,
+            tab,
+            password,
+            remember,
+        } = sign_in;
+        let snapshot = match self.credentials.resolve(&profile) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
+                    profile,
+                    saved,
+                    tab,
+                    Some(error.to_string()),
+                )));
+                return;
+            }
+        };
+        if saved {
+            let mut stored = self
+                .profiles
+                .get(profile.id)
+                .cloned()
+                .unwrap_or_else(|| profile.clone());
+            remember_assignment(&mut stored, &profile, remember);
+            if profile.credential_profile_id.is_none() && remember {
+                let request = self.secret_worker.submit(SecretOperation::Save(
+                    SecretId::Host(profile.id),
+                    password.clone(),
+                ));
+                self.pending_secrets
+                    .insert(request, PendingSecret::HostWrite);
+            }
+            self.profiles.upsert(stored);
+        }
+        self.dialog = None;
+        self.launch(snapshot, saved, password, tab);
     }
 
     fn launch(
@@ -669,14 +846,27 @@ impl Ui {
             };
             self.profile_for(&host, port)
         };
-        if let Some(user) = launch.user {
-            profile.username = user;
+        let explicit_user = launch.user.is_some();
+        match self
+            .credentials
+            .for_launch(&profile, launch.user, launch.password.is_some())
+        {
+            Ok(snapshot) => profile = snapshot,
+            Err(error) => {
+                self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
+                    profile,
+                    saved,
+                    None,
+                    Some(error.to_string()),
+                )));
+                return;
+            }
         }
         match launch.password {
             Some(password) if !profile.username.is_empty() => {
                 self.launch(profile, saved, password, None)
             }
-            _ => self.request_connect(profile, saved, None),
+            _ => self.request_connect(profile, saved && !explicit_user, None),
         }
     }
 
@@ -801,7 +991,7 @@ impl Ui {
         if self.active == ActiveTab::Home
             && let Some(state) = &mut self.editor
         {
-            let actions = editor::show(root, state, &self.profiles);
+            let actions = editor::show(root, state, &self.profiles, &self.credentials);
             for action in actions {
                 self.handle_editor_action(action);
             }
@@ -885,7 +1075,14 @@ impl Ui {
 
     fn home_screen(&mut self, ui: &mut egui::Ui) {
         let view = self.settings.settings.host_view;
-        let actions = home::show(ui, &mut self.home, &self.profiles, &self.prober, view);
+        let actions = home::show(
+            ui,
+            &mut self.home,
+            &self.profiles,
+            &self.credentials,
+            &self.prober,
+            view,
+        );
         for action in actions {
             self.handle_home_action(action);
         }
@@ -948,6 +1145,21 @@ impl Ui {
             }
             Action::CloseTab => self.close_tab(id),
             Action::Reconnect => {
+                if let Some(tab) = self.tab(id) {
+                    let profile = self
+                        .profiles
+                        .get(tab.profile.id)
+                        .filter(|_| tab.saved)
+                        .unwrap_or(&tab.profile)
+                        .clone();
+                    if profile.credential_profile_id.is_some()
+                        || tab.profile.credential_profile_id.is_some()
+                    {
+                        let saved = tab.saved;
+                        self.request_connect(profile, saved, Some(id));
+                        return;
+                    }
+                }
                 let Some(ctx) = self.last_ctx.clone() else {
                     return;
                 };
@@ -978,7 +1190,11 @@ impl Ui {
                         _ => None,
                     };
                     self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
-                        tab.profile.clone(),
+                        self.profiles
+                            .get(tab.profile.id)
+                            .filter(|_| tab.saved)
+                            .unwrap_or(&tab.profile)
+                            .clone(),
                         tab.saved,
                         Some(id),
                         failure,
@@ -1058,7 +1274,10 @@ impl Ui {
                 }
             }
             Action::OpenSettings => {
-                self.dialog = Some(Dialog::Settings(dialogs::SettingsDrawer::default()));
+                self.dialog = Some(Dialog::Settings(dialogs::DrawerState::default()));
+            }
+            Action::OpenPasswords => {
+                self.dialog = Some(Dialog::Passwords(dialogs::DrawerState::default()));
             }
             Action::ImportRdpFile => self.picker.rdp_file(),
             Action::SetHostView(view) => {
@@ -1080,7 +1299,11 @@ impl Ui {
                 match password {
                     editor::PasswordChange::Keep => {}
                     editor::PasswordChange::Set(password) => {
-                        secrets::save_password_in_background(profile.id, password);
+                        let request = self
+                            .secret_worker
+                            .submit(SecretOperation::Save(SecretId::Host(profile.id), password));
+                        self.pending_secrets
+                            .insert(request, PendingSecret::HostWrite);
                     }
                     editor::PasswordChange::Forget => {
                         secrets::delete_password_in_background(profile.id)
@@ -1103,7 +1326,14 @@ impl Ui {
             return;
         };
         let before = self.settings.settings.clone();
-        let outcome = dialogs::show(ctx, dialog, &mut self.settings.settings);
+        let outcome = dialogs::show(
+            ctx,
+            dialog,
+            &mut self.settings.settings,
+            &self.credentials,
+            self.profiles.hosts(),
+            &mut self.credential_manager,
+        );
         // Persist edits even if the drawer is also dismissed in this frame.
         if self.settings.settings != before {
             self.settings.save();
@@ -1119,24 +1349,47 @@ impl Ui {
                 tab,
                 password,
                 remember,
+                update_profile_password,
+                use_stored_password,
             } => {
-                self.dialog = None;
-                if saved {
-                    let mut stored = self
-                        .profiles
-                        .get(profile.id)
-                        .cloned()
-                        .unwrap_or_else(|| profile.clone());
-                    stored.username = profile.username.clone();
-                    stored.domain = profile.domain.clone();
-                    if remember {
-                        stored.save_password = true;
-                        secrets::save_password_in_background(profile.id, password.clone());
+                if use_stored_password && profile.credential_profile_id.is_some() {
+                    // Remember the explicitly selected link before the asynchronous lookup.
+                    if saved && let Some(mut stored) = self.profiles.get(profile.id).cloned() {
+                        stored.credential_profile_id = profile.credential_profile_id;
+                        self.profiles.upsert(stored);
                     }
-                    self.profiles.upsert(stored);
+                    self.dialog = None;
+                    self.request_connect(profile, saved, tab);
+                } else if update_profile_password && let Some(id) = profile.credential_profile_id {
+                    let request = self.secret_worker.submit(SecretOperation::Save(
+                        SecretId::Credential(id),
+                        password.clone(),
+                    ));
+                    self.pending_secrets.insert(
+                        request,
+                        PendingSecret::UpdatePassword(SignIn {
+                            profile,
+                            saved,
+                            tab,
+                            password,
+                            remember,
+                        }),
+                    );
+                    // Keep the entered password in the dialog until the keyring acknowledges it.
+                    if let Some(Dialog::Credentials(state)) = &mut self.dialog {
+                        state.set_busy(true);
+                    }
+                } else {
+                    self.finish_sign_in(SignIn {
+                        profile,
+                        saved,
+                        tab,
+                        password,
+                        remember,
+                    });
                 }
-                self.launch(profile, saved, password, tab);
             }
+            dialogs::Outcome::Credential(action) => self.handle_credential_action(action),
             dialogs::Outcome::Delete(id) => {
                 self.dialog = None;
                 if let Some(removed) = self.profiles.remove(id) {
@@ -1150,6 +1403,16 @@ impl Ui {
                 }
             }
         }
+    }
+}
+
+/// Remember the link, never the shared account's resolved username or password.
+fn remember_assignment(stored: &mut HostProfile, selected: &HostProfile, remember_password: bool) {
+    stored.credential_profile_id = selected.credential_profile_id;
+    if selected.credential_profile_id.is_none() {
+        stored.username.clone_from(&selected.username);
+        stored.domain.clone_from(&selected.domain);
+        stored.save_password = remember_password;
     }
 }
 
@@ -1254,5 +1517,32 @@ fn tab_status_color(tab: &SessionTab, palette: &Palette) -> Color32 {
         Phase::Reconnecting { .. } => palette.fair,
         Phase::Ended(Ended::Failed(_)) => palette.poor,
         Phase::Ended(_) => palette.muted,
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn remembering_a_shared_assignment_preserves_manual_credentials() {
+        let mut stored = HostProfile::new("host", 3389);
+        stored.username = "local".into();
+        stored.domain = "LOCAL".into();
+        let mut selected = stored.clone();
+        let id = Uuid::new_v4();
+        selected.credential_profile_id = Some(id);
+        selected.username = "shared".into();
+        selected.domain = "CORP".into();
+        remember_assignment(&mut stored, &selected, true);
+        assert_eq!(stored.credential_profile_id, Some(id));
+        assert_eq!(stored.username, "local");
+        assert_eq!(stored.domain, "LOCAL");
+        assert!(!stored.save_password);
+        selected.credential_profile_id = None;
+        remember_assignment(&mut stored, &selected, true);
+        assert_eq!(stored.credential_profile_id, None);
+        assert_eq!(stored.username, "shared");
+        assert!(stored.save_password);
     }
 }

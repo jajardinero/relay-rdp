@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use super::theme::{self, Palette, radius, size};
 use super::widgets::{self, Signal};
+use crate::store::credentials::CredentialStore;
 use crate::store::profiles::{HostProfile, OsKind, ProfileStore, parse_endpoint};
 use crate::store::settings::HostView;
 use crate::util::probe::Prober;
@@ -21,6 +22,7 @@ pub enum Action {
     ToggleFavorite(Uuid),
     Delete(Uuid),
     OpenSettings,
+    OpenPasswords,
     ImportRdpFile,
     SetHostView(HostView),
 }
@@ -68,6 +70,7 @@ pub fn show(
     ui: &mut Ui,
     state: &mut HomeState,
     profiles: &ProfileStore,
+    credentials: &CredentialStore,
     prober: &Prober,
     view: HostView,
 ) -> Vec<Action> {
@@ -114,7 +117,7 @@ pub fn show(
                 vec2(width, ui.available_height()),
                 Layout::top_down(Align::Min),
                 |ui| {
-                    main_column(ui, state, profiles, prober, view, &mut actions);
+                    main_column(ui, state, profiles, credentials, prober, view, &mut actions);
                 },
             );
         });
@@ -172,6 +175,9 @@ fn rail(ui: &mut Ui, state: &mut HomeState, profiles: &ProfileStore, actions: &m
         }
         if rail_button(ui, icon::FILE_ARROW_DOWN, "Import .rdp file").clicked() {
             actions.push(Action::ImportRdpFile);
+        }
+        if rail_button(ui, icon::KEY, "Passwords").clicked() {
+            actions.push(Action::OpenPasswords);
         }
         if rail_button(ui, icon::PLUS, "New host").clicked() {
             actions.push(Action::New(None));
@@ -278,6 +284,7 @@ fn main_column(
     ui: &mut Ui,
     state: &mut HomeState,
     profiles: &ProfileStore,
+    credentials: &CredentialStore,
     prober: &Prober,
     view: HostView,
     actions: &mut Vec<Action>,
@@ -317,8 +324,20 @@ fn main_column(
     // Build the visible rows before drawing the search box so its key handling can use them.
     let query = state.query.trim().to_owned();
     let endpoint = parse_endpoint(&query);
-    let hosts: Vec<&HostProfile> = profiles
+    // Resolve display accounts without changing the saved manual credentials.
+    let display_hosts: Vec<HostProfile> = profiles
         .hosts()
+        .iter()
+        .map(|host| {
+            let mut display = host.clone();
+            if host.credential_profile_id.is_some() {
+                display.username = credentials.account_label(host);
+                display.domain.clear();
+            }
+            display
+        })
+        .collect();
+    let hosts: Vec<&HostProfile> = display_hosts
         .iter()
         .filter(|h| match &state.filter {
             Filter::All => true,
@@ -394,8 +413,10 @@ fn main_column(
                     widgets::section_label(ui, heading);
                     ui.add_space(2.0);
                 }
-                let hosts: Vec<&HostProfile> =
-                    ids.iter().filter_map(|id| profiles.get(*id)).collect();
+                let hosts: Vec<&HostProfile> = ids
+                    .iter()
+                    .filter_map(|id| display_hosts.iter().find(|host| host.id == *id))
+                    .collect();
                 // A host can appear in both Recent and its group. Keep each row's or tile's
                 // widget/menu IDs stable and distinct as hover controls appear.
                 match view {
@@ -923,9 +944,12 @@ fn host_tile(
     }
     let address = fitted(ui, &host.endpoint(), theme::mono(12.0), inner.width());
     painter.galley(egui::pos2(inner.left(), name_y + 20.0), address, p.muted);
-    let detail = host
-        .os_label()
-        .unwrap_or_else(|| last_used(host.last_connected));
+    let detail = if host.credential_profile_id.is_some() {
+        host.account_label()
+    } else {
+        host.os_label()
+            .unwrap_or_else(|| last_used(host.last_connected))
+    };
     // On hover the Connect button takes the bottom right.
     let detail_w = inner.width() - if show_actions { 96.0 } else { 0.0 };
     let detail = fitted(ui, &detail, theme::font(size::SMALL), detail_w);
@@ -1015,6 +1039,54 @@ fn last_used(when: Option<DateTime<Utc>>) -> String {
 mod tests {
     use super::*;
     use egui::{Context, Event, Id, Modifiers, PointerButton, Pos2, Rect, Shape, pos2};
+
+    #[test]
+    fn passwords_button_sits_below_new_host_and_opens_management() {
+        let ctx = Context::default();
+        theme::install_fonts(&ctx);
+        let mut state = HomeState::default();
+        let profiles = ProfileStore::default();
+        let mut render = |events| {
+            let mut actions = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(720.0, 480.0))),
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::Panel::left("test-rail")
+                        .exact_size(RAIL_WIDTH)
+                        .show(root, |ui| {
+                            rail(ui, &mut state, &profiles, &mut actions);
+                        });
+                },
+            );
+            output.textures_delta.clear();
+            (output, actions)
+        };
+        let (output, _) = render(vec![]);
+        let label_pos = |label| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing sidebar entry: {label}"))
+        };
+        let new_host = label_pos("New host");
+        let passwords = label_pos("Passwords");
+        let import = label_pos("Import .rdp file");
+        assert!(new_host.y < passwords.y && passwords.y < import.y);
+        render(vec![Event::PointerMoved(passwords)]);
+        render(vec![pointer_button(passwords, true)]);
+        let (_, actions) = render(vec![pointer_button(passwords, false)]);
+        assert!(matches!(actions.as_slice(), [Action::OpenPasswords]));
+    }
 
     struct MenuFrame {
         menu: Id,

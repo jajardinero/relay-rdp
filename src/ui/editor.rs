@@ -5,8 +5,10 @@ use egui_phosphor::regular as icon;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::credentials as credential_ui;
 use super::theme::{self, Palette, radius, size};
 use super::widgets;
+use crate::store::credentials::CredentialStore;
 use crate::store::profiles::{
     AudioMode, GraphicsMode, HostProfile, OsChoice, ProfileStore, Quality, ResolutionMode,
     SharedFolder,
@@ -149,6 +151,9 @@ impl EditorState {
     }
 
     fn password_change(&self) -> PasswordChange {
+        if self.draft.credential_profile_id.is_some() {
+            return PasswordChange::Keep;
+        }
         if self.draft.save_password && !self.password.is_empty() {
             PasswordChange::Set(self.password.clone())
         } else if self.forget_password {
@@ -157,12 +162,25 @@ impl EditorState {
             PasswordChange::Keep
         }
     }
+
+    pub fn unassign_credentials(&mut self, id: Uuid) {
+        if self.draft.credential_profile_id == Some(id) {
+            self.draft.credential_profile_id = None;
+            self.draft.save_password = false;
+            self.password.clear();
+        }
+    }
 }
 
 /// Outer width, including the frame's margins.
 pub const DRAWER_WIDTH: f32 = 468.0;
 
-pub fn show(ui: &mut Ui, state: &mut EditorState, profiles: &ProfileStore) -> Vec<Action> {
+pub fn show(
+    ui: &mut Ui,
+    state: &mut EditorState,
+    profiles: &ProfileStore,
+    credentials: &CredentialStore,
+) -> Vec<Action> {
     let mut actions = Vec::new();
     let p = Palette::of(ui);
 
@@ -200,7 +218,7 @@ pub fn show(ui: &mut Ui, state: &mut EditorState, profiles: &ProfileStore) -> Ve
                 .max_height(body_height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| match state.section {
-                    Section::Connection => connection(ui, state, profiles),
+                    Section::Connection => connection(ui, state, profiles, credentials),
                     Section::Display => display(ui, state),
                     Section::Experience => experience(ui, state),
                     Section::Devices => devices(ui, state),
@@ -274,7 +292,12 @@ fn section_tabs(ui: &mut Ui, current: &mut Section) {
     });
 }
 
-fn connection(ui: &mut Ui, state: &mut EditorState, profiles: &ProfileStore) {
+fn connection(
+    ui: &mut Ui,
+    state: &mut EditorState,
+    profiles: &ProfileStore,
+    credentials: &CredentialStore,
+) {
     let p = Palette::of(ui);
 
     let address = widgets::field(
@@ -302,42 +325,62 @@ fn connection(ui: &mut Ui, state: &mut EditorState, profiles: &ProfileStore) {
     ui.add_space(14.0);
     widgets::section_label(ui, "Sign-in");
     ui.add_space(2.0);
-    pair(
-        ui,
-        0.5,
-        |ui| {
-            widgets::field(ui, "User name", &mut state.draft.username, "jdoe");
-        },
-        |ui| {
-            widgets::field(ui, "Domain", &mut state.draft.domain, "Optional");
-        },
-    );
+    if credential_ui::selector(ui, &mut state.draft.credential_profile_id, credentials) {
+        state.password.clear();
+    }
     ui.add_space(6.0);
-
-    let had_saved = state.draft.save_password && !state.is_new && !state.forget_password;
-    ui.label(RichText::new("Password").size(size::SMALL).color(p.muted));
-    let hint = if had_saved {
-        "Saved in your keyring — type to replace"
+    if let Some(id) = state.draft.credential_profile_id {
+        if let Some(profile) = credentials.get(id) {
+            ui.label(profile.account_label());
+            ui.label(
+                RichText::new("Manage this account in Passwords in the sidebar.")
+                    .size(size::SMALL)
+                    .color(p.muted),
+            );
+        } else {
+            ui.colored_label(
+                p.poor,
+                "This profile is missing. Choose another profile or Manual.",
+            );
+        }
     } else {
-        "Asked when you connect"
-    };
-    widgets::text_input(ui, &mut state.password, hint, true);
-    ui.add_space(4.0);
-    widgets::setting_row(
-        ui,
-        "Remember password",
-        Some("Stored in the system keyring, never in a file."),
-        |ui| {
-            let before = state.draft.save_password;
-            widgets::toggle(ui, &mut state.draft.save_password);
-            if before && !state.draft.save_password {
-                state.forget_password = true;
-            }
-            if !before && state.draft.save_password {
-                state.forget_password = false;
-            }
-        },
-    );
+        pair(
+            ui,
+            0.5,
+            |ui| {
+                widgets::field(ui, "User name", &mut state.draft.username, "jdoe");
+            },
+            |ui| {
+                widgets::field(ui, "Domain", &mut state.draft.domain, "Optional");
+            },
+        );
+        ui.add_space(6.0);
+
+        let had_saved = state.draft.save_password && !state.is_new && !state.forget_password;
+        ui.label(RichText::new("Password").size(size::SMALL).color(p.muted));
+        let hint = if had_saved {
+            "Saved in your keyring — type to replace"
+        } else {
+            "Asked when you connect"
+        };
+        widgets::text_input(ui, &mut state.password, hint, true);
+        ui.add_space(4.0);
+        widgets::setting_row(
+            ui,
+            "Remember password",
+            Some("Stored in the system keyring, never in a file."),
+            |ui| {
+                let before = state.draft.save_password;
+                widgets::toggle(ui, &mut state.draft.save_password);
+                if before && !state.draft.save_password {
+                    state.forget_password = true;
+                }
+                if !before && state.draft.save_password {
+                    state.forget_password = false;
+                }
+            },
+        );
+    }
 
     ui.add_space(14.0);
     widgets::section_label(ui, "Organize");
@@ -753,3 +796,64 @@ const KEYBOARD_LAYOUTS: &[(u32, &str)] = &[
     (0x0804, "Chinese (Simplified)"),
     (0x0404, "Chinese (Traditional)"),
 ];
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    use crate::store::credentials::CredentialProfile;
+
+    #[test]
+    fn linked_host_editor_displays_shared_account_without_manual_password_controls() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut credentials = CredentialStore::default();
+        let credential = CredentialProfile {
+            name: "Office".into(),
+            username: "alice".into(),
+            domain: "CORP".into(),
+            ..Default::default()
+        };
+        let id = credential.id;
+        credentials.upsert(credential).unwrap();
+        let mut host = HostProfile::new("host", 3389);
+        host.credential_profile_id = Some(id);
+        host.save_password = true;
+        let mut state = EditorState::edit(host.clone());
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(468.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    connection(ui, &mut state, &ProfileStore::default(), &credentials)
+                });
+            },
+        );
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"Office"));
+        assert!(labels.contains(&"CORP\\alice"));
+        assert!(!labels.contains(&"User name"));
+        assert!(!labels.contains(&"Remember password"));
+        output.textures_delta.clear();
+
+        *state.password = "dormant-password".into();
+        assert!(matches!(state.password_change(), PasswordChange::Keep));
+        let duplicate = EditorState::new(host);
+        assert_eq!(duplicate.draft.credential_profile_id, Some(id));
+        state.unassign_credentials(id);
+        assert_eq!(state.draft.credential_profile_id, None);
+        assert!(!state.draft.save_password);
+        assert!(state.password.is_empty());
+    }
+}

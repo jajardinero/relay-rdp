@@ -1,24 +1,27 @@
-//! Sign-in and delete modals, and the settings drawer.
+//! Sign-in and delete modals, and the settings and password drawers.
 
 use egui::{Align, Color32, CornerRadius, Layout, RichText, Ui};
 use egui_phosphor::regular as icon;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::credentials as credential_ui;
 use super::tab::TabId;
 use super::theme::{self, Palette, radius, size};
 use super::widgets;
+use crate::store::credentials::CredentialStore;
 use crate::store::profiles::HostProfile;
 use crate::store::settings::{AppSettings, ShortcutCapture, ThemePreference};
 
 pub enum Dialog {
     Credentials(CredentialsDialog),
     ConfirmDelete { id: Uuid, name: String },
-    Settings(SettingsDrawer),
+    Settings(DrawerState),
+    Passwords(DrawerState),
 }
 
 #[derive(Default)]
-pub struct SettingsDrawer {
+pub struct DrawerState {
     closing: bool,
     animation_initialized: bool,
 }
@@ -29,9 +32,12 @@ pub struct CredentialsDialog {
     tab: Option<TabId>,
     password: Zeroizing<String>,
     remember: bool,
+    update_profile_password: bool,
+    use_stored_password: bool,
     /// Why we're asking again (e.g. the last attempt was rejected).
     reason: Option<String>,
     focus_pending: bool,
+    busy: bool,
 }
 
 impl CredentialsDialog {
@@ -48,9 +54,23 @@ impl CredentialsDialog {
             tab,
             password: Zeroizing::new(String::new()),
             remember,
+            update_profile_password: false,
+            use_stored_password: false,
             reason,
             focus_pending: true,
+            busy: false,
         }
+    }
+
+    pub fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+    }
+
+    pub fn password_save_failed(&mut self, password: Zeroizing<String>, reason: String) {
+        self.password = password;
+        self.update_profile_password = true;
+        self.reason = Some(reason);
+        self.busy = false;
     }
 }
 
@@ -63,8 +83,11 @@ pub enum Outcome {
         tab: Option<TabId>,
         password: Zeroizing<String>,
         remember: bool,
+        update_profile_password: bool,
+        use_stored_password: bool,
     },
     Delete(Uuid),
+    Credential(credential_ui::Action),
 }
 
 fn modal_frame(p: &Palette, ctx: &egui::Context) -> egui::Frame {
@@ -76,9 +99,25 @@ fn modal_frame(p: &Palette, ctx: &egui::Context) -> egui::Frame {
         .shadow(ctx.global_style().visuals.window_shadow)
 }
 
-pub fn show(ctx: &egui::Context, dialog: &mut Dialog, settings: &mut AppSettings) -> Outcome {
-    if let Dialog::Settings(state) = dialog {
-        return settings_drawer(ctx, state, settings);
+pub fn show(
+    ctx: &egui::Context,
+    dialog: &mut Dialog,
+    settings: &mut AppSettings,
+    credential_store: &CredentialStore,
+    hosts: &[HostProfile],
+    credential_manager: &mut credential_ui::Manager,
+) -> Outcome {
+    let passwords = matches!(dialog, Dialog::Passwords(_));
+    if let Dialog::Settings(state) | Dialog::Passwords(state) = dialog {
+        return side_drawer(
+            ctx,
+            state,
+            settings,
+            credential_store,
+            hosts,
+            credential_manager,
+            passwords,
+        );
     }
 
     let p = Palette::of_ctx(ctx);
@@ -89,20 +128,39 @@ pub fn show(ctx: &egui::Context, dialog: &mut Dialog, settings: &mut AppSettings
         .backdrop_color(backdrop);
 
     let response = modal.show(ctx, |ui| match dialog {
-        Dialog::Credentials(state) => credentials(ui, state),
+        Dialog::Credentials(state) => {
+            ui.set_width(380.0);
+            let height = (ctx.content_rect().height() - 50.0).max(100.0);
+            ui.set_max_height(height);
+            egui::ScrollArea::vertical()
+                .id_salt("sign-in-body")
+                .max_height(height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| credentials(ui, state, credential_store))
+                .inner
+        }
         Dialog::ConfirmDelete { id, name } => confirm_delete(ui, *id, name),
-        Dialog::Settings(_) => unreachable!("settings use the drawer"),
+        Dialog::Settings(_) | Dialog::Passwords(_) => unreachable!("drawers are handled above"),
     });
 
     match response.inner {
-        Outcome::Open if response.should_close() => Outcome::Close,
+        Outcome::Open
+            if !matches!(dialog, Dialog::Credentials(state) if state.busy)
+                && response.should_close() =>
+        {
+            Outcome::Close
+        }
         other => other,
     }
 }
 
-fn credentials(ui: &mut Ui, state: &mut CredentialsDialog) -> Outcome {
+fn credentials(ui: &mut Ui, state: &mut CredentialsDialog, store: &CredentialStore) -> Outcome {
     let p = Palette::of(ui);
     ui.set_width(380.0);
+    if state.busy {
+        ui.disable();
+        ui.label("Updating profile password…");
+    }
 
     ui.label(RichText::new("Sign in").font(theme::font_semibold(size::HEADING)));
     ui.add_space(2.0);
@@ -127,28 +185,68 @@ fn credentials(ui: &mut Ui, state: &mut CredentialsDialog) -> Outcome {
     }
 
     ui.add_space(14.0);
-    let user = widgets::field(
-        ui,
-        "User name",
-        &mut state.profile.username,
-        "jdoe or CORP\\jdoe",
-    );
+    if credential_ui::selector(ui, &mut state.profile.credential_profile_id, store) {
+        state.password.clear();
+        state.update_profile_password = false;
+        state.use_stored_password = state.profile.credential_profile_id.is_some();
+        state.focus_pending = true;
+    }
     ui.add_space(6.0);
-    widgets::field(ui, "Domain", &mut state.profile.domain, "Optional");
+    let linked = state.profile.credential_profile_id;
+    let user = if let Some(id) = linked {
+        if let Some(profile) = store.get(id) {
+            ui.label(profile.account_label());
+        } else {
+            ui.colored_label(p.poor, "Choose an available profile or Manual.");
+        }
+        None
+    } else {
+        let response = widgets::field(
+            ui,
+            "User name",
+            &mut state.profile.username,
+            "jdoe or CORP\\jdoe",
+        );
+        ui.add_space(6.0);
+        widgets::field(ui, "Domain", &mut state.profile.domain, "Optional");
+        Some(response)
+    };
     ui.add_space(6.0);
     ui.label(RichText::new("Password").size(size::SMALL).color(p.muted));
-    let password = widgets::text_input(ui, &mut state.password, "", true);
+    let hint = if linked.is_some() && state.use_stored_password {
+        "Leave blank to use profile password"
+    } else {
+        "Enter password"
+    };
+    let password = widgets::text_input(ui, &mut state.password, hint, true);
 
     if state.focus_pending {
         state.focus_pending = false;
-        if state.profile.username.is_empty() {
+        if state.profile.username.is_empty()
+            && let Some(user) = user
+        {
             user.request_focus();
         } else {
             password.request_focus();
         }
     }
 
-    if state.saved {
+    if linked.is_some() {
+        if state.password.is_empty() {
+            state.update_profile_password = false;
+        }
+        ui.add_enabled_ui(!state.password.is_empty(), |ui| {
+            ui.checkbox(
+                &mut state.update_profile_password,
+                "Update profile password",
+            );
+        });
+        ui.label(
+            RichText::new("Updates future connections for every assigned host.")
+                .size(size::SMALL)
+                .color(p.muted),
+        );
+    } else if state.saved {
         ui.add_space(10.0);
         widgets::setting_row(
             ui,
@@ -161,7 +259,10 @@ fn credentials(ui: &mut Ui, state: &mut CredentialsDialog) -> Outcome {
     }
 
     ui.add_space(18.0);
-    let can_connect = !state.profile.username.trim().is_empty();
+    let can_connect = match linked {
+        Some(id) => store.get(id).is_some_and(|p| !p.username.trim().is_empty()),
+        None => !state.profile.username.trim().is_empty(),
+    };
     let submitted =
         password.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can_connect;
     let mut outcome = Outcome::Open;
@@ -176,6 +277,8 @@ fn credentials(ui: &mut Ui, state: &mut CredentialsDialog) -> Outcome {
                 tab: state.tab,
                 password: state.password.clone(),
                 remember: state.remember,
+                update_profile_password: state.update_profile_password,
+                use_stored_password: state.use_stored_password && state.password.is_empty(),
             };
         }
         if widgets::secondary_button(ui, "Cancel").clicked() {
@@ -212,13 +315,22 @@ fn confirm_delete(ui: &mut Ui, id: Uuid, name: &str) -> Outcome {
 const SETTINGS_DRAWER_WIDTH: f32 = 488.0;
 const SETTINGS_TRANSITION_TIME: f32 = 0.22;
 
-fn settings_drawer(
+fn side_drawer(
     ctx: &egui::Context,
-    state: &mut SettingsDrawer,
+    state: &mut DrawerState,
     settings: &mut AppSettings,
+    credential_store: &CredentialStore,
+    hosts: &[HostProfile],
+    credential_manager: &mut credential_ui::Manager,
+    passwords: bool,
 ) -> Outcome {
     let p = Palette::of_ctx(ctx);
-    let animation = egui::Id::new("settings-drawer-animation");
+    let id = egui::Id::new(if passwords {
+        "passwords-drawer"
+    } else {
+        "settings-drawer"
+    });
+    let animation = id.with("animation");
     if !state.animation_initialized {
         // Seed every opening, including the first one, at the offscreen position.
         ctx.animate_value_with_time(animation, 0.0, 0.0);
@@ -249,7 +361,7 @@ fn settings_drawer(
         });
     let content_size =
         (egui::vec2(width, screen.height()) - frame.total_margin().sum()).max(egui::Vec2::ZERO);
-    let area = egui::Area::new(egui::Id::new("settings-drawer"))
+    let area = egui::Area::new(id)
         .kind(egui::UiKind::Modal)
         .order(egui::Order::Foreground)
         .sense(egui::Sense::hover())
@@ -257,7 +369,7 @@ fn settings_drawer(
         .default_size(egui::vec2(width, screen.height()))
         .constrain(false)
         .fade_in(false);
-    let response = egui::Modal::new(egui::Id::new("settings-drawer"))
+    let response = egui::Modal::new(id)
         .area(area)
         .frame(frame)
         .backdrop_color(Color32::from_black_alpha(
@@ -272,25 +384,37 @@ fn settings_drawer(
             }
             let mut close = false;
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Settings").font(theme::font_semibold(size::HEADING)));
+                ui.label(
+                    RichText::new(if passwords { "Passwords" } else { "Settings" })
+                        .font(theme::font_semibold(size::HEADING)),
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     close = widgets::icon_button(ui, icon::X, "Close").clicked();
                 });
             });
             ui.add_space(14.0);
+            let mut action = None;
             egui::ScrollArea::vertical()
-                .id_salt("settings-body")
+                .id_salt(id.with("body"))
                 .max_height(ui.available_height())
                 .auto_shrink([false, false])
-                .show(ui, |ui| settings_contents(ui, settings));
-            close
+                .show(ui, |ui| {
+                    if passwords {
+                        action = credential_manager.show(ui, credential_store, hosts);
+                    } else {
+                        settings_contents(ui, settings);
+                    }
+                });
+            (close, action)
         });
 
-    if response.inner || response.should_close() {
+    if response.inner.0 || response.should_close() {
         state.closing = true;
         ctx.request_repaint();
     }
-    if state.closing && settings.reduce_motion {
+    if let Some(action) = response.inner.1 {
+        Outcome::Credential(action)
+    } else if state.closing && settings.reduce_motion {
         Outcome::Close
     } else {
         Outcome::Open
@@ -508,6 +632,8 @@ mod tests {
         ctx: Context,
         dialog: Dialog,
         settings: AppSettings,
+        credential_store: CredentialStore,
+        credential_manager: credential_ui::Manager,
         screen: Rect,
         time: f64,
         background_clicks: usize,
@@ -519,11 +645,13 @@ mod tests {
             theme::install_fonts(&ctx);
             Self {
                 ctx,
-                dialog: Dialog::Settings(SettingsDrawer::default()),
+                dialog: Dialog::Settings(DrawerState::default()),
                 settings: AppSettings {
                     reduce_motion,
                     ..Default::default()
                 },
+                credential_store: CredentialStore::default(),
+                credential_manager: credential_ui::Manager::default(),
                 screen: Rect::from_min_size(Pos2::ZERO, vec2(720.0, 480.0)),
                 time: 0.0,
                 background_clicks: 0,
@@ -558,7 +686,14 @@ mod tests {
                             self.background_clicks += 1;
                         }
                     });
-                    outcome = show(root.ctx(), &mut self.dialog, &mut self.settings);
+                    outcome = show(
+                        root.ctx(),
+                        &mut self.dialog,
+                        &mut self.settings,
+                        &self.credential_store,
+                        &[],
+                        &mut self.credential_manager,
+                    );
                 },
             );
             output.textures_delta.clear();
@@ -568,8 +703,7 @@ mod tests {
                     &self.ctx,
                     egui::Id::new("settings-drawer"),
                 )
-                .expect("drawer area")
-                .rect(),
+                .map_or(self.screen, |state| state.rect()),
                 shapes: output.shapes,
             }
         }
@@ -587,7 +721,7 @@ mod tests {
             self.frame(vec![pointer_button(pos, false)])
         }
 
-        fn state(&self) -> &SettingsDrawer {
+        fn state(&self) -> &DrawerState {
             let Dialog::Settings(state) = &self.dialog else {
                 unreachable!()
             };
@@ -645,7 +779,7 @@ mod tests {
         assert!(matches!(closing.outcome, Outcome::Open));
         assert!(matches!(h.settle().outcome, Outcome::Close));
 
-        h.dialog = Dialog::Settings(SettingsDrawer::default());
+        h.dialog = Dialog::Settings(DrawerState::default());
         assert_eq!(h.frame(vec![]).rect.left(), h.screen.right());
         assert_eq!(h.settle().rect.right(), h.screen.right());
     }
@@ -751,5 +885,129 @@ mod tests {
         assert_ne!(h.settings, before);
         assert_eq!(h.settings.theme, ThemePreference::Light);
         assert!(matches!(closed.outcome, Outcome::Close));
+    }
+
+    #[test]
+    fn password_management_opens_in_its_own_drawer() {
+        let mut h = Harness::new(true);
+        let settings = h.settle();
+        assert!(settings.find_text_rect("Credential profiles").is_none());
+        assert!(settings.find_text_rect("Add profile").is_none());
+
+        h.dialog = Dialog::Passwords(DrawerState::default());
+        let passwords = h.settle();
+        assert!(passwords.find_text_rect("Passwords").is_some());
+        assert!(passwords.find_text_rect("Credential profiles").is_some());
+        assert!(passwords.find_text_rect("Appearance").is_none());
+        let rect = egui::containers::AreaState::load(&h.ctx, egui::Id::new("passwords-drawer"))
+            .unwrap()
+            .rect();
+        assert_eq!(rect.right(), h.screen.right());
+        assert_eq!(rect.height(), h.screen.height());
+        h.click(passwords.text_rect("Add profile").center());
+        assert!(h.credential_manager.draft.is_some());
+        assert!(matches!(h.frame(escape()).outcome, Outcome::Close));
+    }
+
+    fn sign_in_harness() -> (Harness, Uuid) {
+        let mut h = Harness::new(true);
+        h.screen = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 800.0));
+        let credential = crate::store::credentials::CredentialProfile {
+            name: "Office".into(),
+            username: "alice".into(),
+            domain: "CORP".into(),
+            ..Default::default()
+        };
+        let id = credential.id;
+        h.credential_store.upsert(credential).unwrap();
+        h.dialog = Dialog::Credentials(CredentialsDialog::new(
+            HostProfile::new("host", 3389),
+            true,
+            None,
+            None,
+        ));
+        let open = h.settle();
+        h.click(open.text_rect("Manual").center());
+        let menu = h.frame(vec![]);
+        h.click(menu.text_rect("Office").center());
+        h.settle();
+        (h, id)
+    }
+
+    #[test]
+    fn sign_in_selects_a_shared_profile_and_uses_its_stored_password() {
+        let (mut h, id) = sign_in_harness();
+        let open = h.settle();
+        assert!(open.find_text_rect("CORP\\alice").is_some());
+        assert!(open.find_text_rect("User name").is_none());
+        let connected = h.click(open.text_rect("Connect").center());
+        assert!(matches!(connected.outcome, Outcome::Connect {
+            profile, saved: true, use_stored_password: true, update_profile_password: false, ..
+        } if profile.credential_profile_id == Some(id)));
+    }
+
+    #[test]
+    fn sign_in_password_updates_require_explicit_selection_and_remain_masked() {
+        for update in [false, true] {
+            let (mut h, _) = sign_in_harness();
+            let open = h.frame(vec![Event::Text("replacement-secret".into())]);
+            assert!(open.find_text_rect("replacement-secret").is_none());
+            let Dialog::Credentials(state) = &h.dialog else {
+                unreachable!()
+            };
+            assert_eq!(&**state.password, "replacement-secret");
+            assert!(!state.update_profile_password);
+            if update {
+                h.click(open.text_rect("Update profile password").center());
+            }
+            let open = h.settle();
+            let connected = h.click(open.text_rect("Connect").center());
+            assert!(matches!(connected.outcome, Outcome::Connect {
+                update_profile_password, use_stored_password: false, password, ..
+            } if update_profile_password == update && &**password == "replacement-secret"));
+        }
+    }
+
+    #[test]
+    fn sign_in_retains_password_after_a_failed_shared_update() {
+        let mut dialog = CredentialsDialog::new(HostProfile::new("host", 3389), true, None, None);
+        dialog.set_busy(true);
+        dialog.password_save_failed(
+            Zeroizing::new("retry-secret".into()),
+            "keyring locked".into(),
+        );
+        assert!(!dialog.busy);
+        assert_eq!(&**dialog.password, "retry-secret");
+        assert!(dialog.update_profile_password);
+        assert_eq!(dialog.reason.as_deref(), Some("keyring locked"));
+    }
+
+    #[test]
+    fn sign_in_controls_remain_reachable_at_minimum_window_height() {
+        let mut h = Harness::new(true);
+        let mut host = HostProfile::new("host", 3389);
+        host.username = "alice".into();
+        h.dialog = Dialog::Credentials(CredentialsDialog::new(host, true, None, None));
+        h.settle();
+        let rect = egui::containers::AreaState::load(&h.ctx, egui::Id::new("dialog"))
+            .unwrap()
+            .rect();
+        assert!(rect.height() <= h.screen.height());
+        h.frame(vec![
+            Event::PointerMoved(rect.center()),
+            Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, -1000.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            },
+        ]);
+        let scrolled = h.settle();
+        let connect = scrolled.text_rect("Connect");
+        assert!(h.screen.contains(connect.center()));
+        assert!(matches!(
+            h.click(connect.center()).outcome,
+            Outcome::Connect { .. }
+        ));
     }
 }
