@@ -1,8 +1,7 @@
-//! H.264 (AVC420) decoding through the system's OpenH264 library, loaded at runtime.
+//! H.264 (AVC420) decoding through OpenH264, loaded at runtime.
 //!
-//! Loading the distribution's library avoids compiling OpenH264 (and needing NASM) and keeps
-//! the codec patched by the system's package manager. The Rust bindings target OpenH264 2.6
-//! (soname `libopenh264.so.8`); only that ABI is loaded.
+//! Native packages use the distribution's library; AppImages bundle a matching build.
+//! The Rust bindings target OpenH264 2.6 (soname `libopenh264.so.8`); only that ABI is loaded.
 //!
 //! Auto mode uses [`SystemH264`] through IronRDP's decoder hook (4:2:0 only). Full color mode
 //! uses [`SoftVideo`], which keeps per-surface decoders and 4:4:4 pictures.
@@ -62,11 +61,21 @@ pub fn locate() -> anyhow::Result<PathBuf> {
         OpenH264API::from_blob_path(&path)?;
         return Ok(path);
     }
-    SEARCH_DIRS
-        .iter()
-        .map(|dir| Path::new(dir).join(SONAME))
+    // AppImages keep the supported codec next to the executable's bin directory.
+    // Prefer it over a host codec so the bundle remains independent of the distro ABI.
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| bundled_library(&exe));
+    bundled
+        .into_iter()
+        .chain(SEARCH_DIRS.iter().map(|dir| Path::new(dir).join(SONAME)))
         .find(|p| p.exists())
         .ok_or_else(|| anyhow::anyhow!("{SONAME} not found (install the openh264 package)"))
+}
+
+fn bundled_library(executable: &Path) -> Option<PathBuf> {
+    let library = executable.parent()?.parent()?.join("lib").join(SONAME);
+    library.is_file().then_some(library)
 }
 
 pub fn open(library: &Path) -> anyhow::Result<Decoder> {

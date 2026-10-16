@@ -1,0 +1,14 @@
+Relay
+Copyright (c) 2026 Jerome Jardinero
+Upstream: https://github.com/jajardinero/rust-rdp
+
+Relay is licensed under either the MIT license or the Apache License, Version
+2.0, at your option. Full texts are in LICENSE-MIT and LICENSE-APACHE alongside
+this file.
+
+The bundled IBM Plex fonts are Copyright 2017 IBM Corp. and licensed under the
+SIL Open Font License, Version 1.1. See fonts-OFL.txt alongside this file.
+
+License texts and third-party notices for the patched IronRDP and SSPI crates
+are in the corresponding subdirectories alongside this file. Documentation of
+the local changes is in vendor/ under this documentation directory.

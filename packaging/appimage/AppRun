@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+APPDIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+export APPDIR
+# Bundled OpenSSL must use the host's trust store across distro layouts.
+if [ "${SSL_CERT_FILE+x}" != x ]; then
+  for _relay_ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+    if [ -r "$_relay_ca" ]; then
+      SSL_CERT_FILE=$_relay_ca
+      export SSL_CERT_FILE
+      break
+    fi
+  done
+fi
+# linuxdeploy sets relative RPATHs, so child processes keep their system libraries.
+exec "$APPDIR/usr/bin/relay" "$@"

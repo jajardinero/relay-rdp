@@ -48,6 +48,9 @@ prepare() {
 build() {
   cd "$srcdir/$pkgname-$pkgver"
   export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
+  source scripts/package-common.sh
+  _relay_source=$PWD
+  relay_refresh_cargo_sources
   cargo build --release --frozen --bin relay
 }
 
@@ -55,32 +58,14 @@ check() {
   cd "$srcdir/$pkgname-$pkgver"
   export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
   cargo test --release --frozen --bin relay
-  desktop-file-validate packaging/arch/relay.desktop
+  source scripts/package-common.sh
+  _relay_source=$PWD
+  relay_record_cargo_sources
+  desktop-file-validate packaging/common/relay.desktop
 }
 
 package() {
   cd "$srcdir/$pkgname-$pkgver"
   export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$srcdir/target}"
-  install -Dm755 "$CARGO_TARGET_DIR/release/relay" "$pkgdir/usr/bin/relay"
-  install -Dm644 packaging/arch/relay.desktop "$pkgdir/usr/share/applications/relay.desktop"
-  install -Dm644 packaging/arch/relay.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/relay.svg"
-  install -Dm644 README.md "$pkgdir/usr/share/doc/relay/README.md"
-  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/relay/LICENSE-MIT"
-  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/relay/LICENSE-APACHE"
-  install -Dm644 assets/fonts/OFL.txt "$pkgdir/usr/share/licenses/relay/fonts-OFL.txt"
-  local crate file
-  for crate in ironrdp-connector ironrdp-egfx ironrdp-graphics ironrdp-pdu ironrdp-session sspi; do
-    for file in LICENSE-MIT LICENSE-APACHE; do
-      install -Dm644 "vendor/$crate/$file" "$pkgdir/usr/share/licenses/relay/$crate/$file"
-    done
-    if [[ -f "vendor/$crate/THIRD_PARTY_NOTICES" ]]; then
-      install -Dm644 "vendor/$crate/THIRD_PARTY_NOTICES" \
-        "$pkgdir/usr/share/licenses/relay/$crate/THIRD_PARTY_NOTICES"
-    fi
-    # What Relay changed in the vendored crate.
-    if [[ -f "vendor/$crate/RELAY-PATCH.md" ]]; then
-      install -Dm644 "vendor/$crate/RELAY-PATCH.md" \
-        "$pkgdir/usr/share/doc/relay/vendor/$crate/RELAY-PATCH.md"
-    fi
-  done
+  bash scripts/install-package.sh "$CARGO_TARGET_DIR/release/relay" "$pkgdir" /usr/share/licenses/relay
 }

@@ -55,11 +55,11 @@ _relay_archive="relay-$_relay_version.tar.gz"
 _relay_sources=(
   Cargo.toml Cargo.lock build.rs rust-toolchain.toml
   src assets examples vendor README.md LICENSE-MIT LICENSE-APACHE
-  packaging/arch scripts/package-arch.sh
+  packaging scripts
 )
 # Normalize ownership and timestamps without exporting an artificial package
 # build date. Only explicitly listed project sources enter the archive.
-tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
+tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner --exclude=__pycache__ \
   --transform="s|^|relay-$_relay_version/|" \
   -C "$_relay_root" -cf - "${_relay_sources[@]}" | gzip -n > "$_relay_output/$_relay_archive"
 _relay_digest=$(sha256sum "$_relay_output/$_relay_archive" | awk '{print $1}')
@@ -74,6 +74,7 @@ mkdir -p -- "$BUILDDIR"
 cd -- "$_relay_output"
 # Source our own generated recipe to inspect the exact dependency lists and
 # avoid skipping runtime dependencies when a compiler is managed outside pacman.
+# shellcheck source=/dev/null
 source ./PKGBUILD
 makepkg --printsrcinfo > .SRCINFO
 # --force: a rebuild of the same version replaces the previous package.
@@ -83,6 +84,8 @@ _relay_makepkg_flags=(--force --cleanbuild --check --nosign)
 if ! pacman -T cargo >/dev/null; then
   # Mise/rustup can provide working tools without registering Arch's virtual
   # cargo package. Validate every other dependency before using --nodeps.
+  # Dependency arrays come from the generated PKGBUILD above.
+  # shellcheck disable=SC2154
   pacman -T "${depends[@]}" "${checkdepends[@]}" pkgconf base-devel || {
     printf 'Install the missing Arch dependencies above before building.\n' >&2
     exit 1

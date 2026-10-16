@@ -1,0 +1,83 @@
+# Local-source recipe. Generate with scripts/package-fedora.sh.
+Name:           relay
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        Native Wayland RDP client with GPU video decoding
+License:        (MIT OR Apache-2.0) AND OFL-1.1
+URL:            https://github.com/jajardinero/rust-rdp
+Source0:        %{name}-%{version}.tar.gz
+ExclusiveArch:  x86_64
+
+BuildRequires:  cargo >= @MIN_RUST@
+BuildRequires:  rust >= @MIN_RUST@
+BuildRequires:  gcc
+BuildRequires:  gcc-c++
+BuildRequires:  pkgconfig
+BuildRequires:  pkgconfig(libavcodec)
+BuildRequires:  pkgconfig(libavutil)
+BuildRequires:  pkgconfig(libva)
+BuildRequires:  pkgconfig(libva-drm)
+BuildRequires:  pkgconfig(wayland-client)
+BuildRequires:  pkgconfig(xkbcommon)
+BuildRequires:  pkgconfig(alsa)
+BuildRequires:  pkgconfig(openssl)
+BuildRequires:  desktop-file-utils
+BuildRequires:  findutils
+
+# These are loaded at runtime and cannot be found by automatic ELF dependency scanning.
+Requires:       libwayland-client%{?_isa}
+Requires:       libxkbcommon%{?_isa}
+Requires:       vulkan-loader%{?_isa}
+Requires:       libglvnd-egl%{?_isa}
+Requires:       libglvnd-glx%{?_isa}
+Requires:       hicolor-icon-theme
+# Require the real codec by name: Fedora's noopenh264 stub also provides its soname.
+Recommends:     (openh264%{?_isa} with libopenh264.so.8()(64bit))
+Suggests:       fuse3
+Suggests:       gnome-keyring
+Suggests:       mesa-vulkan-drivers%{?_isa}
+
+# Cargo.toml enables thin LTO. Do not add native LTO or a separate debug package.
+%global _lto_cflags %{nil}
+%global debug_package %{nil}
+
+%description
+Relay connects to remote desktops over RDP, with saved hosts, credential profiles,
+clipboard sharing, and GPU-accelerated graphics. Hardware H.264 decoding uses
+VA-API and Vulkan when supported. A Wayland session is required.
+
+%prep
+%autosetup
+
+%build
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+source scripts/package-common.sh
+_relay_source=$PWD
+relay_refresh_cargo_sources
+cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+cargo build --release --frozen --bin relay
+
+%check
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+cargo test --release --frozen --bin relay
+source scripts/package-common.sh
+_relay_source=$PWD
+relay_record_cargo_sources
+desktop-file-validate packaging/common/relay.desktop
+
+%install
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+bash scripts/install-package.sh "$CARGO_TARGET_DIR/release/relay" "%{buildroot}" "%{_licensedir}/%{name}"
+
+%files
+%{_bindir}/relay
+%{_datadir}/applications/relay.desktop
+%{_datadir}/icons/hicolor/scalable/apps/relay.svg
+%doc %{_docdir}/%{name}
+%license %{_licensedir}/%{name}
+
+%changelog
+* Fri Oct 16 2026 Jerome Jardinero <jajardinero@users.noreply.github.com> - @VERSION@-1
+- Add local-source Fedora packaging.

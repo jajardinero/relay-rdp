@@ -220,6 +220,7 @@ cargo check --all-targets
 cargo test --all-targets
 cargo test --package ironrdp-egfx --lib
 cargo clippy --all-targets
+bash scripts/test-package-cache.sh
 ```
 
 The following tests require actual GPU access. The RDP integration test also
@@ -249,7 +250,150 @@ and recovery after an injected hardware failure. A synthetic 1080p test also
 reports elapsed frame time and decoding-thread CPU time for both paths.
 GPU readback exists only in the test helpers, for pixel comparisons.
 
-## Arch Linux package
+## Linux packages
+
+Local package builders are available for these distributions on x86_64:
+
+| Distribution | Build command | Output |
+| --- | --- | --- |
+| Debian / Ubuntu | `scripts/package-deb.sh` | `dist/deb/*.deb` |
+| Fedora | `scripts/package-fedora.sh` | `dist/fedora/*.rpm` (binary and source RPMs) |
+| Arch Linux | `scripts/package-arch.sh` | `dist/arch/*.pkg.tar.zst` |
+| AppImage | `scripts/package-appimage.sh` | `dist/appimage/*.AppImage` |
+
+Run each native package builder on the destination distribution and release (a container or VM
+works). The packages link to that distribution's FFmpeg, OpenSSL and other
+system libraries; an Arch-built binary cannot be repackaged for Debian or Fedora.
+Build a separate package for each distribution/release you intend to distribute.
+
+All builders use the locked Cargo dependencies, run the normal tests in release
+mode, validate the desktop entry, and include the launcher, SVG icon, README,
+font license and vendored license notices. They leave the resulting packages in
+`dist/` and build intermediates in `target/`, without installing the application
+or dependencies. Compilation defaults to two jobs; set `CARGO_BUILD_JOBS` to
+override it. Hardware tests remain opt-in.
+
+The helpers accept `--offline` when Cargo dependencies are already cached and
+`--prepare-only` to generate the source archive and packaging metadata without
+compiling. Debian, Fedora and AppImage preparation works on any Linux distribution and
+needs only Bash and the usual GNU file/archive utilities. The source archives
+include the packaging scripts and patched vendored crates, and exclude Git
+metadata, private configuration and build caches. Extract an archive and run its
+builder to rebuild it. Each output directory includes `SHA256SUMS` for that run's
+artifacts.
+
+### AppImage
+
+Build on the oldest distribution you want to support. Ubuntu 24.04 is a suitable
+baseline for current Ubuntu, Debian and Fedora desktops. Building on a newer
+system raises the AppImage's glibc requirement; AppImage does not bundle glibc.
+See the [AppImage packaging guide](https://docs.appimage.org/packaging-guide/from-source/native-binaries.html).
+
+Install the normal native build dependencies listed below, Rust 1.95 or later,
+and these extra packaging tools (Ubuntu/Debian example):
+
+```sh
+sudo apt install curl python3 nasm make g++
+scripts/package-appimage.sh
+```
+
+The builder downloads fixed, SHA-256-verified releases of linuxdeploy,
+appimagetool, the AppImage runtime, and OpenH264 source. It builds OpenH264 2.6.0
+alongside Relay, so software H.264 also works on hosts with an older codec ABI.
+The input versions, URLs and hashes are in `packaging/appimage/inputs.lock`.
+Inputs are cached under `target/appimage-package/inputs`; `--offline` needs that
+cache as well as the Cargo cache. `--prepare-only` needs neither and does not
+download or compile anything. `CARGO_TARGET_DIR` can select an existing build
+cache on the same build system.
+
+linuxdeploy bundles FFmpeg, OpenSSL, OpenH264 and their application libraries,
+with relative library paths. The image includes distro library copyright and
+license notices plus a `BUNDLED-LIBRARIES.txt` inventory, also copied to `dist/appimage`.
+License collection supports Debian/Ubuntu, Arch and Fedora build hosts.
+
+The host supplies Wayland, ALSA, VA-API, the Vulkan loader and GPU drivers. A
+Wayland desktop with those platform libraries is required; hardware H.264 still
+needs a suitable VA-API driver and Vulkan support. These platform libraries are
+kept outside the bundle so the host's drivers and audio plugins use matching
+versions. System certificate stores and desktop portals are used normally.
+
+```sh
+(cd dist/appimage && sha256sum --check SHA256SUMS)
+chmod +x dist/appimage/Relay-0.1.2-x86_64.AppImage
+./dist/appimage/Relay-0.1.2-x86_64.AppImage
+```
+
+On a system without usable FUSE support, run it with
+`--appimage-extract-and-run` before Relay's arguments, or use
+`--appimage-extract` and launch `squashfs-root/AppRun`. The build itself uses
+extraction and does not need `/dev/fuse`.
+
+### Debian and Ubuntu
+
+Install the native build dependencies:
+
+```sh
+sudo apt install build-essential pkg-config dpkg-dev desktop-file-utils \
+  libavcodec-dev libavutil-dev libva-dev libwayland-dev libxkbcommon-dev \
+  libasound2-dev libssl-dev
+```
+
+Provide Rust 1.95 or later (for example, a current stable rustup toolchain), then
+build and install:
+
+```sh
+scripts/package-deb.sh
+(cd dist/deb && sha256sum --check SHA256SUMS)
+sudo apt install ./dist/deb/relay_0.1.2-1_amd64.deb
+```
+
+The builder derives shared-library dependencies with `dpkg-shlibdeps`, including
+the FFmpeg ABIs on the build system. Libraries loaded at runtime, including
+Wayland and Vulkan, are listed explicitly. The package recommends
+`libopenh264-8` for software H.264 decoding and suggests `fuse3` for clipboard
+file transfers and `gnome-keyring` for saved passwords.
+
+Debian 13 and Ubuntu 26.04 provide the supported OpenH264 ABI. Ubuntu 24.04 ships
+`libopenh264-7`, which Relay cannot load; the `.deb` can still be built and used
+with hardware decoding or lossless graphics, but software H.264 needs
+`libopenh264.so.8`. See the [Debian package](https://packages.debian.org/trixie/libopenh264-8)
+and [Ubuntu package versions](https://packages.ubuntu.com/search?keywords=openh264&searchon=names).
+
+### Fedora
+
+Install the native build dependencies:
+
+```sh
+sudo dnf install rust cargo gcc gcc-c++ rpm-build redhat-rpm-config pkgconf-pkg-config \
+  desktop-file-utils libavcodec-free-devel libavutil-free-devel libva-devel \
+  wayland-devel libxkbcommon-devel alsa-lib-devel openssl-devel
+```
+
+The Rust and Cargo packages must be version 1.95 or later. If you use a full
+FFmpeg installation instead of Fedora's `ffmpeg-free` libraries, use its matching
+development package (such as `ffmpeg-devel`) instead of the two `-free-devel`
+packages. The spec uses `pkgconfig` requirements to accept either provider.
+
+```sh
+scripts/package-fedora.sh
+(cd dist/fedora && sha256sum --check SHA256SUMS)
+sudo dnf install ./dist/fedora/relay-0.1.2-1.fc*.x86_64.rpm
+```
+
+RPM records the linked library ABIs automatically. Runtime-loaded libraries are
+listed explicitly. The package recommends the real `openh264` codec providing
+`libopenh264.so.8` from Fedora's Cisco repository; the `noopenh264` stub cannot decode
+video. See [Fedora's OpenH264 documentation](https://fedoraproject.org/wiki/OpenH264).
+Hardware decoding also needs an FFmpeg build with an H.264 decoder and a VA-API
+driver with H.264 support.
+
+The generated `relay.spec` and source archive can be used directly with
+`rpmbuild -ba`: set RPM's `_sourcedir` to the directory containing the archive.
+The spec fetches locked Cargo dependencies before building, so this local
+recipe needs network access or a populated Cargo cache. It is not a Fedora
+repository submission with all Cargo sources vendored for offline builders.
+
+### Arch Linux
 
 From the project root, build a local x86_64 package with:
 
@@ -258,7 +402,7 @@ scripts/package-arch.sh
 ```
 
 The helper requires Arch's `base-devel`, `pkgconf`, and `desktop-file-utils`,
-Rust 1.90 or later, and the runtime dependencies listed in
+Rust 1.95 or later, and the runtime dependencies listed in
 `packaging/arch/PKGBUILD.in`. A working Mise-managed compiler is supported:
 the helper checks all other dependencies before bypassing makepkg's check for
 Arch's virtual `cargo` package. It does not install dependencies or the app.
@@ -278,11 +422,11 @@ PKGBUILD and source archive together to rebuild with `makepkg` on an Arch system
 with the listed dependencies installed. Build intermediates stay under
 `target/arch-package`. These generated directories are ignored by Git.
 
-For version 0.1.0, verify and install with:
+For version 0.1.2, verify and install with:
 
 ```sh
 (cd dist/arch && sha256sum --check SHA256SUMS)
-sudo pacman -U dist/arch/relay-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U dist/arch/relay-0.1.2-1-x86_64.pkg.tar.zst
 ```
 
 The package installs `/usr/bin/relay` and a **Relay** application-menu entry with

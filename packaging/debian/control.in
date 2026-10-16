@@ -1,0 +1,15 @@
+Package: relay
+Version: @VERSION@-1
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: Jerome Jardinero <jajardinero@users.noreply.github.com>
+Homepage: https://github.com/jajardinero/rust-rdp
+Installed-Size: @INSTALLED_SIZE@
+Depends: @SHLIBS@, libwayland-client0, libxkbcommon0, libvulkan1, libegl1, libgl1, hicolor-icon-theme
+Recommends: libopenh264-8
+Suggests: fuse3, gnome-keyring, mesa-vulkan-drivers, va-driver-all
+Description: Native Wayland RDP client with GPU video decoding
+ Relay connects to remote desktops over RDP, with saved hosts, credential
+ profiles, clipboard sharing, and GPU-accelerated graphics. Hardware H.264
+ decoding uses VA-API and Vulkan when supported. A Wayland session is required.
