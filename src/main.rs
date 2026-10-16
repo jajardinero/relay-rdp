@@ -42,6 +42,20 @@ fn main() -> anyhow::Result<()> {
     let _log_guard = init_tracing();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting {APP_NAME}");
 
+    // Session panics are caught and shown by their message; the log also gets where they were.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info.location().map(|l| l.to_string()).unwrap_or_default();
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic");
+        tracing::error!(%location, %message, "panic");
+        default_hook(info);
+    }));
+
     // Pin the TLS crypto backend. If a dependency ever enables a second one, rustls can no
     // longer pick automatically and would panic on the first connection.
     let _ = rustls::crypto::ring::default_provider().install_default();
