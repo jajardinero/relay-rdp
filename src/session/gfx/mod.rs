@@ -1926,6 +1926,111 @@ mod tests {
         }
     }
 
+    /// Graphics PDUs as Windows compressed them (ironrdp-graphics' captures), and Relay's codec
+    /// fixtures through the compressor, decompress exactly, in one shared history.
+    #[test]
+    fn zgfx_decompresses_captured_and_compressed_pdus() {
+        use ironrdp_graphics::zgfx::{
+            CompressionMode, Compressor, Decompressor, compress_and_wrap_egfx,
+        };
+        macro_rules! capture {
+            ($n:literal) => {
+                (
+                    &include_bytes!(concat!(
+                        "../../../vendor/ironrdp-graphics/src/zgfx/test_assets/encoded.",
+                        $n,
+                        ".bin"
+                    ))[..],
+                    &include_bytes!(concat!(
+                        "../../../vendor/ironrdp-graphics/src/zgfx/test_assets/decoded.",
+                        $n,
+                        ".bin"
+                    ))[..],
+                )
+            };
+        }
+        let mut decompressor = Decompressor::new();
+        for (encoded, decoded) in [
+            capture!("0"),
+            capture!("1"),
+            capture!("2"),
+            capture!("3"),
+            capture!("4"),
+        ] {
+            let mut output = Vec::new();
+            let written = decompressor.decompress(encoded, &mut output).unwrap();
+            assert_eq!(written, decoded.len());
+            assert!(output == decoded);
+        }
+        let mut compressor = Compressor::new();
+        let mut decompressor = Decompressor::new();
+        for data in [
+            &include_bytes!("testdata/clearcodec.streams")[..],
+            include_bytes!("testdata/clearcodec-nsc.streams"),
+            include_bytes!("testdata/progressive-160x96.rgba"),
+        ] {
+            for chunk in data.chunks(60_000) {
+                let wrapped =
+                    compress_and_wrap_egfx(chunk, &mut compressor, CompressionMode::Always)
+                        .unwrap();
+                let mut output = Vec::new();
+                decompressor.decompress(&wrapped, &mut output).unwrap();
+                assert!(output == chunk);
+            }
+        }
+    }
+
+    /// ZGFX decompression speed on compressible graphics data (the codec fixtures) and on
+    /// incompressible data (a progressive picture).
+    #[test]
+    #[ignore = "reports ZGFX decompression speed"]
+    fn zgfx_decompression_throughput() {
+        use ironrdp_graphics::zgfx::{
+            CompressionMode, Compressor, Decompressor, compress_and_wrap_egfx,
+        };
+        let inputs = [
+            (
+                "ClearCodec streams",
+                include_bytes!("testdata/clearcodec.streams").to_vec(),
+            ),
+            (
+                "ClearCodec NSCodec streams",
+                include_bytes!("testdata/clearcodec-nsc.streams").to_vec(),
+            ),
+            ("1080p progressive picture", progressive_screen(true)),
+        ];
+        for (name, data) in inputs {
+            let mut compressor = Compressor::new();
+            let wrapped: Vec<Vec<u8>> = data
+                .chunks(60_000)
+                .map(|chunk| {
+                    compress_and_wrap_egfx(chunk, &mut compressor, CompressionMode::Always).unwrap()
+                })
+                .collect();
+            let runs = 20;
+            // A session creates its decompressor once.
+            let mut decompressors: Vec<Decompressor> =
+                (0..runs).map(|_| Decompressor::new()).collect();
+            let mut output = Vec::with_capacity(data.len());
+            let start = std::time::Instant::now();
+            for decompressor in &mut decompressors {
+                output.clear();
+                for pdu in &wrapped {
+                    decompressor.decompress(pdu, &mut output).unwrap();
+                }
+            }
+            let seconds = start.elapsed().as_secs_f64() / f64::from(runs);
+            assert!(output == data);
+            eprintln!(
+                "{name}: {} KiB from {} KiB in {:.2} ms, {:.0} MB/s",
+                data.len() / 1024,
+                wrapped.iter().map(Vec::len).sum::<usize>() / 1024,
+                seconds * 1000.0,
+                data.len() as f64 / seconds / 1e6,
+            );
+        }
+    }
+
     /// A 1920x1080 picture as 510 TILE_SIMPLE tiles at Windows' lossless quantization (6):
     /// gradients with dense glyph-like detail, the bottom tile row clipped by the region.
     fn progressive_screen(extrapolate: bool) -> Vec<u8> {

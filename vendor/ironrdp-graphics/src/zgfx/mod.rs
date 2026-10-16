@@ -1,12 +1,11 @@
 //! ZGFX (RDP8) Bulk Data Compression
 
 mod api;
-mod circular_buffer;
 mod compressor;
 mod control_messages;
 mod wrapper;
 
-use std::io::{self, Write as _};
+use std::io;
 use std::sync::LazyLock;
 
 pub use api::{CompressionMode, compress_and_wrap_egfx};
@@ -14,26 +13,26 @@ use bitvec::bits;
 use bitvec::field::BitField as _;
 use bitvec::order::Msb0;
 use bitvec::slice::BitSlice;
-use byteorder::WriteBytesExt as _;
 pub use compressor::Compressor;
 pub use wrapper::{wrap_compressed, wrap_uncompressed};
 
-use self::circular_buffer::FixedCircularBuffer;
 use self::control_messages::{BulkEncodedData, CompressionFlags, SegmentedDataPdu};
-use crate::utils::Bits;
 
 /// Sliding window size shared by compressor and decompressor.
 pub(crate) const HISTORY_SIZE: usize = 2_500_000;
 
 pub struct Decompressor {
-    history: FixedCircularBuffer,
+    /// Everything decompressed, oldest first, back to at least `HISTORY_SIZE` bytes ago. It
+    /// starts as `HISTORY_SIZE` zeros, as the protocol's history buffer does, and grows to
+    /// twice that before the oldest bytes are dropped, so a match is one copy within it.
+    history: Vec<u8>,
 }
 
 impl Decompressor {
     pub fn new() -> Self {
-        Self {
-            history: FixedCircularBuffer::new(HISTORY_SIZE),
-        }
+        let mut history = Vec::with_capacity(2 * HISTORY_SIZE + usize::from(u16::MAX));
+        history.resize(HISTORY_SIZE, 0);
+        Self { history }
     }
 
     pub fn decompress(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<usize, ZgfxError> {
@@ -68,7 +67,8 @@ impl Decompressor {
             if segment.compression_flags.contains(CompressionFlags::COMPRESSED) {
                 self.decompress_segment(segment.data, output)
             } else {
-                self.history.write_all(segment.data)?;
+                self.history.extend_from_slice(segment.data);
+                self.trim_history();
                 output.extend_from_slice(segment.data);
 
                 Ok(segment.data.len())
@@ -79,54 +79,94 @@ impl Decompressor {
     }
 
     fn decompress_segment(&mut self, encoded_data: &[u8], output: &mut Vec<u8>) -> Result<usize, ZgfxError> {
-        if encoded_data.is_empty() {
-            return Ok(0);
-        }
-
-        let mut bits = BitSlice::from_slice(encoded_data);
-
         // The value of the last byte indicates the number of unused bits in the final byte
-        bits = &bits
-            [..8 * (encoded_data.len() - 1) - usize::from(*encoded_data.last().expect("encoded_data is not empty"))];
-        let mut bits = Bits::new(bits);
-        let mut bytes_written = 0;
+        let Some((&unused_bits, data)) = encoded_data.split_last() else {
+            return Ok(0);
+        };
+        let end = (data.len() * 8)
+            .checked_sub(usize::from(unused_bits))
+            .ok_or(ZgfxError::UnexpectedEnd)?;
+        let mut bits = BitReader { data, position: 0, end };
+        let tokens = &*TOKEN_LOOKUP;
+        let start = self.history.len();
 
-        while !bits.is_empty() {
-            let token = TOKEN_TABLE
-                .iter()
-                .find(|token| token.prefix == bits[..token.prefix.len()])
-                .ok_or(ZgfxError::TokenBitsNotFound)?;
-            let _prefix = bits.split_to(token.prefix.len());
+        while bits.remaining() > 0 {
+            let Some((prefix_length, token)) =
+                tokens[usize::try_from(bits.peek() >> (32 - TOKEN_PREFIX_BITS)).expect("a 9-bit index fits usize")]
+            else {
+                return Err(ZgfxError::TokenBitsNotFound);
+            };
+            bits.skip(usize::from(prefix_length))?;
 
-            match token.ty {
-                TokenType::NullLiteral => {
-                    // The prefix value is encoded with a "0" prefix,
-                    // then read 8 bits containing the byte to output.
-                    let value = bits.split_to(8).load_be::<u8>();
-
-                    self.history.write_u8(value)?;
-                    output.push(value);
-                    bytes_written += 1;
+            match token {
+                // The prefix value is encoded with a "0" prefix,
+                // then read 8 bits containing the byte to output.
+                DecodedToken::NullLiteral => {
+                    let value = u8::try_from(bits.read(8)?).expect("8 bits fit u8");
+                    self.history.push(value);
                 }
-                TokenType::Literal { literal_value } => {
-                    self.history
-                        .write_u8(literal_value)
-                        .expect("circular buffer does not fail");
-                    output.push(literal_value);
-                    bytes_written += 1;
-                }
-                TokenType::Match {
+                DecodedToken::Literal(value) => self.history.push(value),
+                DecodedToken::Match {
                     distance_value_size,
                     distance_base,
                 } => {
-                    let written =
-                        handle_match(&mut bits, distance_value_size, distance_base, &mut self.history, output)?;
-                    bytes_written += written;
+                    // Each token has been assigned a different base distance
+                    // and number of additional value bits to be added to compute the full distance.
+                    let distance = usize::try_from(distance_base + bits.read(usize::from(distance_value_size))?)
+                        .map_err(|_| ZgfxError::InvalidIntegralConversion("token's full distance"))?;
+                    if distance == 0 {
+                        self.read_unencoded_bytes(&mut bits)?;
+                    } else {
+                        let length = read_match_length(&mut bits)?;
+                        self.copy_match(distance, length)?;
+                    }
                 }
             }
         }
 
+        let bytes_written = self.history.len() - start;
+        output.extend_from_slice(&self.history[start..]);
+        self.trim_history();
+
         Ok(bytes_written)
+    }
+
+    fn read_unencoded_bytes(&mut self, bits: &mut BitReader<'_>) -> Result<(), ZgfxError> {
+        // A match distance of zero is a special case,
+        // which indicates that an unencoded run of bytes follows.
+        // The count of bytes is encoded as a 15-bit value, and the bytes start at the next byte boundary.
+        let length = usize::try_from(bits.read(15)?).expect("15 bits fit usize");
+        bits.skip(bits.position.next_multiple_of(8) - bits.position)?;
+        let first = bits.position / 8;
+        bits.skip(length * 8)?;
+        self.history.extend_from_slice(&bits.data[first..first + length]);
+
+        Ok(())
+    }
+
+    /// Appends `length` bytes from `distance` bytes back. When the match is longer than its
+    /// distance, the bytes it copies repeat with that period.
+    fn copy_match(&mut self, distance: usize, length: usize) -> Result<(), ZgfxError> {
+        if distance > HISTORY_SIZE {
+            return Err(ZgfxError::DistanceBeyondHistory { distance });
+        }
+        // The history always holds at least HISTORY_SIZE bytes.
+        let from = self.history.len() - distance;
+        let mut left = length;
+        while left > 0 {
+            let chunk = left.min(self.history.len() - from);
+            self.history.extend_from_within(from..from + chunk);
+            left -= chunk;
+        }
+
+        Ok(())
+    }
+
+    /// Drops the oldest bytes once the history has doubled, keeping `HISTORY_SIZE` of them.
+    fn trim_history(&mut self) {
+        if self.history.len() > 2 * HISTORY_SIZE {
+            self.history.drain(..self.history.len() - HISTORY_SIZE);
+        }
     }
 }
 
@@ -136,88 +176,115 @@ impl Default for Decompressor {
     }
 }
 
-fn handle_match(
-    bits: &mut Bits<'_>,
-    distance_value_size: usize,
-    distance_base: u32,
-    history: &mut FixedCircularBuffer,
-    output: &mut Vec<u8>,
-) -> Result<usize, ZgfxError> {
-    // Each token has been assigned a different base distance
-    // and number of additional value bits to be added to compute the full distance.
-
-    let distance = usize::try_from(distance_base + bits.split_to(distance_value_size).load_be::<u32>())
-        .map_err(|_| ZgfxError::InvalidIntegralConversion("token's full distance"))?;
-
-    if distance == 0 {
-        read_unencoded_bytes(bits, history, output).map_err(ZgfxError::from)
-    } else {
-        read_encoded_bytes(bits, distance, history, output)
+/// A match length prefix follows the token and indicates how many additional bits will be
+/// needed to get the full length (the number of bytes to be copied).
+fn read_match_length(bits: &mut BitReader<'_>) -> Result<usize, ZgfxError> {
+    let length_token_size = bits.peek().leading_ones();
+    // Longer prefixes can't describe a length that fits 32 bits.
+    if length_token_size > 30 {
+        return Err(ZgfxError::InvalidIntegralConversion("length of the token size"));
     }
-}
+    let length_token_size = usize::try_from(length_token_size).expect("at most 30");
+    bits.skip(length_token_size + 1)?; // length token + zero bit
 
-fn read_unencoded_bytes(
-    bits: &mut Bits<'_>,
-    history: &mut FixedCircularBuffer,
-    output: &mut Vec<u8>,
-) -> io::Result<usize> {
-    // A match distance of zero is a special case,
-    // which indicates that an unencoded run of bytes follows.
-    // The count of bytes is encoded as a 15-bit value
-    let length = bits.split_to(15).load_be::<usize>();
-
-    if bits.remaining_bits_of_last_byte() > 0 {
-        let pad_to_byte_boundary = 8 - bits.remaining_bits_of_last_byte();
-        bits.split_to(pad_to_byte_boundary);
-    }
-
-    let unencoded_bits = bits.split_to(length * 8);
-
-    // FIXME: not very efficient, but we need to rework the `Bits` helper and refactor a bit otherwise
-    let unencoded_bits = unencoded_bits.to_bitvec();
-    let unencoded_bytes = unencoded_bits.as_raw_slice();
-    history.write_all(unencoded_bytes)?;
-    output.extend_from_slice(unencoded_bytes);
-
-    Ok(unencoded_bytes.len())
-}
-
-fn read_encoded_bytes(
-    bits: &mut Bits<'_>,
-    distance: usize,
-    history: &mut FixedCircularBuffer,
-    output: &mut Vec<u8>,
-) -> Result<usize, ZgfxError> {
-    // A match length prefix follows the token and indicates
-    // how many additional bits will be needed to get the full length
-    // (the number of bytes to be copied).
-
-    let length_token_size = bits.leading_ones();
-    bits.split_to(length_token_size + 1); // length token + zero bit
-
-    let length = if length_token_size == 0 {
+    if length_token_size == 0 {
         // special case
+        return Ok(3);
+    }
+    let length = usize::try_from(bits.read(length_token_size + 1)?).expect("u32 fits usize");
 
-        3
-    } else {
-        let length = bits.split_to(length_token_size + 1).load_be::<usize>();
-
-        let length_token_size = u32::try_from(length_token_size)
-            .map_err(|_| ZgfxError::InvalidIntegralConversion("length of the token size"))?;
-
-        let base = 2usize.pow(length_token_size + 1);
-
-        base + length
-    };
-
-    let output_length = output.len();
-    history.read_with_offset(distance, length, output)?;
-    history
-        .write_all(&output[output_length..])
-        .expect("circular buffer does not fail");
-
-    Ok(length)
+    Ok((1 << (length_token_size + 1)) + length)
 }
+
+/// Reads a segment's bits, most significant first.
+struct BitReader<'a> {
+    data: &'a [u8],
+    /// The next bit to read.
+    position: usize,
+    /// The number of bits in the stream: the rest of the last byte is padding.
+    end: usize,
+}
+
+impl BitReader<'_> {
+    fn remaining(&self) -> usize {
+        self.end - self.position
+    }
+
+    /// The next 32 bits, MSB first. Bits past the end of the stream are padding or zeros:
+    /// callers only use as many bits as remain.
+    fn peek(&self) -> u32 {
+        let byte = self.position / 8;
+        let window = match self.data.get(byte..byte + 8) {
+            Some(bytes) => u64::from_be_bytes(bytes.try_into().expect("8 bytes")),
+            None => {
+                let mut bytes = [0; 8];
+                let tail = self.data.get(byte..).unwrap_or_default();
+                bytes[..tail.len()].copy_from_slice(tail);
+                u64::from_be_bytes(bytes)
+            }
+        };
+        u32::try_from((window << (self.position % 8)) >> 32).expect("the upper 32 bits")
+    }
+
+    fn skip(&mut self, count: usize) -> Result<(), ZgfxError> {
+        if count > self.remaining() {
+            return Err(ZgfxError::UnexpectedEnd);
+        }
+        self.position += count;
+
+        Ok(())
+    }
+
+    /// Reads `count` (at most 32) bits as a big-endian number.
+    fn read(&mut self, count: usize) -> Result<u32, ZgfxError> {
+        debug_assert!(count <= 32);
+        let value = match count {
+            0 => 0,
+            _ => self.peek() >> (32 - count),
+        };
+        self.skip(count)?;
+
+        Ok(value)
+    }
+}
+
+/// Token prefixes are at most this long.
+const TOKEN_PREFIX_BITS: u32 = 9;
+
+#[derive(Clone, Copy)]
+enum DecodedToken {
+    NullLiteral,
+    Literal(u8),
+    Match {
+        distance_value_size: u8,
+        distance_base: u32,
+    },
+}
+
+/// The token every 9-bit window starts with, and the length of its prefix; none when no
+/// token's prefix matches. Built from `TOKEN_TABLE`, whose prefixes are a prefix code.
+static TOKEN_LOOKUP: LazyLock<[Option<(u8, DecodedToken)>; 1 << TOKEN_PREFIX_BITS]> = LazyLock::new(|| {
+    let mut lookup = [None; 1 << TOKEN_PREFIX_BITS];
+    for token in TOKEN_TABLE.iter() {
+        let length = token.prefix.len();
+        let free_bits = usize::try_from(TOKEN_PREFIX_BITS).expect("9 fits usize") - length;
+        let first = token.prefix.load_be::<usize>() << free_bits;
+        let decoded = match token.ty {
+            TokenType::NullLiteral => DecodedToken::NullLiteral,
+            TokenType::Literal { literal_value } => DecodedToken::Literal(literal_value),
+            TokenType::Match {
+                distance_value_size,
+                distance_base,
+            } => DecodedToken::Match {
+                distance_value_size: u8::try_from(distance_value_size).expect("at most 24 bits"),
+                distance_base,
+            },
+        };
+        let length = u8::try_from(length).expect("at most 9 bits");
+        lookup[first..first + (1 << free_bits)].fill(Some((length, decoded)));
+    }
+    lookup
+});
 
 struct Token {
     prefix: &'static BitSlice<u8, Msb0>,
@@ -453,6 +520,12 @@ pub enum ZgfxError {
     },
     TokenBitsNotFound,
     InvalidIntegralConversion(&'static str),
+    /// The compressed bits end inside a token.
+    UnexpectedEnd,
+    /// A match reaches further back than the history buffer.
+    DistanceBeyondHistory {
+        distance: usize,
+    },
 }
 
 impl core::fmt::Display for ZgfxError {
@@ -472,6 +545,10 @@ impl core::fmt::Display for ZgfxError {
             Self::InvalidIntegralConversion(type_name) => {
                 write!(f, "invalid `{type_name}`: out of range integral type conversion")
             }
+            Self::UnexpectedEnd => write!(f, "compressed data ends inside a token"),
+            Self::DistanceBeyondHistory { distance } => {
+                write!(f, "match distance {distance} reaches beyond the history buffer")
+            }
         }
     }
 }
@@ -485,6 +562,8 @@ impl core::error::Error for ZgfxError {
             Self::InvalidDecompressedSize { .. } => None,
             Self::TokenBitsNotFound => None,
             Self::InvalidIntegralConversion(_) => None,
+            Self::UnexpectedEnd => None,
+            Self::DistanceBeyondHistory { .. } => None,
         }
     }
 }

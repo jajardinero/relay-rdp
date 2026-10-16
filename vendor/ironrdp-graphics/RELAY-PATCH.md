@@ -33,6 +33,15 @@ order, so output matches sequential decoding. `decode_bitmap_as` can return a
 tile's DWT coefficients instead of RGBA pixels, letting Relay run the inverse
 DWT and color conversion on the GPU.
 
+ZGFX decompression decodes each token with one lookup in a 512-entry table
+(built from the token table) on a 64-bit bit window, instead of comparing
+prefixes bit by bit, and keeps its history in one flat buffer, so a match is a
+single copy. It runs about 15 times faster with identical output: it was
+tested against the previous decoder on compressor output, hand-encoded streams
+reaching across the whole history, and corrupted streams. Truncated tokens,
+truncated multipart segments, and matches beyond the history now return errors
+instead of panicking or copying from the wrong place.
+
 Relay's application tests compare these paths with FreeRDP reference decodes
 in `src/session/gfx/testdata`. Remove these patches when equivalent fixes are
 available in an upstream release.

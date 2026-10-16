@@ -1247,9 +1247,11 @@ impl ProgressiveDecoder {
         let mut rest = jobs.as_slice();
         while let Some(first) = rest.first() {
             let (group, tail) = rest.split_at(rest.iter().take_while(|job| job.index == first.index).count());
-            let (_, slot) = slots
-                .find(|(index, _)| *index == first.index)
-                .expect("job indices are in bounds and sorted");
+            // Indices are in bounds and sorted, so the slot is ahead.
+            let Some((_, slot)) = slots.find(|(index, _)| *index == first.index) else {
+                let (x_idx, y_idx) = tile_position(first.tile);
+                return Err(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx });
+            };
             let state = slot.get_or_insert_with(|| {
                 let mut tile = Box::new(TileState::new());
                 tile.use_reduce_extrapolate = default_extrapolate;
