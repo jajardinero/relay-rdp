@@ -35,6 +35,8 @@ pub enum Action {
     SendKeys(Vec<Scancode>),
     SwitchTo(TabId),
     GoHome,
+    /// Leave the session running in its tab and go back to the host library.
+    Minimize,
 }
 
 pub struct ViewContext<'a> {
@@ -773,6 +775,10 @@ fn bar_contents(
             }
         }
     });
+
+    if widgets::icon_button(ui, icon::MINUS, "Minimize to tab").clicked() {
+        actions.push(Action::Minimize);
+    }
 
     let (glyph, tip) = if cx.fullscreen {
         (icon::CORNERS_IN, "Exit fullscreen (Ctrl+Alt+Enter)")

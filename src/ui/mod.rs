@@ -1263,6 +1263,10 @@ impl Ui {
             }
             Action::SwitchTo(other) => self.active = ActiveTab::Session(other),
             Action::GoHome => self.active = ActiveTab::Home,
+            Action::Minimize => {
+                self.capture_preview(id);
+                self.active = ActiveTab::Home;
+            }
         }
     }
 
