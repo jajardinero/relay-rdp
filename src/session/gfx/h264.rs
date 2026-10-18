@@ -3,15 +3,14 @@
 //! Native packages use the distribution's library; AppImages bundle a matching build.
 //! The Rust bindings target OpenH264 2.6 (soname `libopenh264.so.8`); only that ABI is loaded.
 //!
-//! Auto mode uses [`SystemH264`] through IronRDP's decoder hook (4:2:0 only). Full color mode
-//! uses [`SoftVideo`], which keeps per-surface decoders and 4:4:4 pictures.
+//! Both H.264 modes decode in software through [`SoftVideo`], which keeps per-surface decoders
+//! and 4:4:4 pictures (4:2:0 pictures fill them as main views), so only the regions the server
+//! updated are drawn.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use ironrdp_egfx::decode::{DecodedFrame, DecoderError, DecoderResult, H264Decoder};
 use openh264::OpenH264API;
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::formats::YUVSource as _;
@@ -28,30 +27,6 @@ const SEARCH_DIRS: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu",
     "/usr/local/lib",
 ];
-
-pub struct SystemH264 {
-    library: PathBuf,
-    decoder: Decoder,
-    annex_b: Vec<u8>,
-    /// A broken H.264 stream can't recover until the next keyframe, which the server only sends
-    /// when asked. Failures are reported here so the session reconnects (getting a keyframe)
-    /// instead of ending.
-    health: Arc<super::GfxShared>,
-}
-
-impl SystemH264 {
-    pub fn load(health: Arc<super::GfxShared>) -> anyhow::Result<Self> {
-        let library = locate()?;
-        let decoder = open(&library)?;
-        tracing::info!(library = %library.display(), "H.264 decoder ready");
-        Ok(Self {
-            library,
-            decoder,
-            annex_b: Vec::new(),
-            health,
-        })
-    }
-}
 
 /// Finds OpenH264. `RELAY_OPENH264` may point at a Cisco binary instead, which is verified
 /// against its published hash before it is used.
@@ -174,39 +149,5 @@ impl SoftVideo {
         let surface = self.surfaces.get(&surface_id)?;
         let rect = surface.store.to_rgba(rect, &mut self.rgba)?;
         Some((rect, &self.rgba))
-    }
-}
-
-impl H264Decoder for SystemH264 {
-    fn decode(&mut self, data: &[u8]) -> DecoderResult<DecodedFrame> {
-        if let Err(error) = super::vaapi::annex_b(data, &mut self.annex_b) {
-            self.health.fail(error.to_string());
-            return Err(DecoderError::msg(error.to_string()));
-        }
-        let yuv = match self.decoder.decode(&self.annex_b) {
-            Ok(Some(yuv)) => yuv,
-            Ok(None) => {
-                self.health
-                    .fail("H.264 decoder produced no picture".to_owned());
-                return Err(DecoderError::msg("H.264 decoder produced no picture"));
-            }
-            Err(e) => {
-                self.health.fail(format!("H.264 decode: {e}"));
-                return Err(DecoderError::new("H.264 decode", e));
-            }
-        };
-
-        let (width, height) = yuv.dimensions();
-        let mut rgba = vec![0u8; width * height * 4];
-        yuv.write_rgba8(&mut rgba);
-        self.health.note_h264(false);
-        Ok(DecodedFrame::new(rgba, width as u32, height as u32))
-    }
-
-    fn reset(&mut self) {
-        match open(&self.library) {
-            Ok(decoder) => self.decoder = decoder,
-            Err(e) => tracing::warn!(error = %e, "couldn't reset the H.264 decoder; reusing it"),
-        }
     }
 }

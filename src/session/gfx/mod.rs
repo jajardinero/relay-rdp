@@ -20,7 +20,6 @@ use ironrdp_core::Decode as _;
 use ironrdp_egfx::client::{
     BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler, Surface as GfxSurface,
 };
-use ironrdp_egfx::decode::H264Decoder;
 use ironrdp_egfx::pdu::{
     Avc420BitmapStream, Avc444BitmapStream, CacheToSurfacePdu, CapabilitiesV8Flags,
     CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, Codec2Type,
@@ -248,6 +247,8 @@ struct GfxState {
     rfx: ironrdp_session::rfx::DecodingContext,
     scratch: Vec<u8>,
     warned_alpha: bool,
+    /// How the last H.264 regions were read (surface coordinates or not), logged on change.
+    region_coordinates: Option<bool>,
 }
 
 impl GfxShared {
@@ -310,6 +311,7 @@ impl GfxShared {
                 rfx: ironrdp_session::rfx::DecodingContext::new(),
                 scratch: Vec::new(),
                 warned_alpha: false,
+                region_coordinates: None,
             }),
             frame,
             events,
@@ -324,20 +326,7 @@ impl GfxShared {
 
     /// The DVC processor to register on the dynamic channel.
     pub(super) fn client(self: &Arc<Self>) -> GraphicsPipelineClient {
-        let decoder: Option<Box<dyn H264Decoder>> =
-            if self.mode == GraphicsMode::Auto && !self.hardware_active() {
-                match h264::SystemH264::load(Arc::clone(self)) {
-                    Ok(decoder) => Some(Box::new(decoder)),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "H.264 unavailable; using lossless codecs only");
-                        *self.fallback.lock() = Some(e.to_string());
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-        if self.mode == GraphicsMode::FullColor && !self.hardware_active() {
+        if self.mode.uses_h264() && !self.hardware_active() {
             match SoftVideo::new() {
                 Ok(soft) => self.state.lock().soft = Some(soft),
                 Err(e) => {
@@ -346,7 +335,7 @@ impl GfxShared {
                 }
             }
         }
-        GraphicsPipelineClient::new(Box::new(Handler(Arc::clone(self))), decoder)
+        GraphicsPipelineClient::new(Box::new(Handler(Arc::clone(self))), None)
     }
 
     pub fn presented(&self) -> u64 {
@@ -492,12 +481,12 @@ impl GraphicsPipelineHandler for Handler {
         let started = Instant::now();
         // Recording the failure lets the outer session loop reconnect with
         // software. Never attempt a midstream decoder swap without a keyframe.
-        let result = if self.0.mode == GraphicsMode::FullColor {
-            // Plain 4:2:0 pictures update the 4:4:4 picture as main views, so the
-            // surface's single H.264 stream stays consistent.
-            self.full_color_frame(surface_id, dest, &[(stream, View::Luma)], false)
-        } else {
+        let result = if self.0.mode == GraphicsMode::Auto && self.0.hardware_active() {
             self.hardware_frame(surface_id, dest, stream)
+        } else {
+            // Plain 4:2:0 pictures update the 4:4:4 picture as main views, so the
+            // surface's single H.264 stream stays consistent in Full color mode.
+            self.full_color_frame(surface_id, dest, &[(stream, View::Luma)], false)
         };
         if let Err(error) = result {
             self.0.fail_video(error.to_string());
@@ -836,25 +825,58 @@ impl GraphicsPipelineHandler for Handler {
     }
 }
 
-/// AVC420 region rectangles (inclusive) as picture rects; none means the whole picture.
-fn picture_rects(regions: &[InclusiveRectangle], width: u32, height: u32) -> Vec<Rect> {
-    let rects: Vec<Rect> = regions
+/// AVC420 region rectangles (inclusive) as rects of the picture, whose (0, 0) is the corner of
+/// `dest`. Windows gives them in surface coordinates and leaves the rest of the picture blank
+/// (which decodes as flat green), so only these rects may be drawn; IronRDP servers give them
+/// relative to `dest`, which reads the same while `dest` is at the surface origin. Returns
+/// whether they were read as surface coordinates. No regions means the whole picture.
+fn region_rects(regions: &[InclusiveRectangle], dest: Rect) -> (Vec<Rect>, bool) {
+    if regions.is_empty() {
+        return (vec![Rect::new(0, 0, dest.w, dest.h)], false);
+    }
+    let surface_coordinates = (dest.x, dest.y) != (0, 0)
+        && regions.iter().all(|r| {
+            let (x, y) = (u32::from(r.left), u32::from(r.top));
+            (dest.x..dest.x + dest.w).contains(&x) && (dest.y..dest.y + dest.h).contains(&y)
+        });
+    let (dx, dy) = if surface_coordinates {
+        (dest.x, dest.y)
+    } else {
+        (0, 0)
+    };
+    let rects = regions
         .iter()
         .filter_map(|r| {
             Rect::new(
-                u32::from(r.left),
-                u32::from(r.top),
+                u32::from(r.left).checked_sub(dx)?,
+                u32::from(r.top).checked_sub(dy)?,
                 u32::from(r.right.saturating_sub(r.left)) + 1,
                 u32::from(r.bottom.saturating_sub(r.top)) + 1,
             )
-            .clip(width, height)
+            .clip(dest.w, dest.h)
         })
         .collect();
-    if rects.is_empty() {
-        vec![Rect::new(0, 0, width, height)]
-    } else {
-        rects
+    (rects, surface_coordinates)
+}
+
+/// [`region_rects`], logging how the regions are read whenever that changes.
+fn placed_regions(
+    seen: &mut Option<bool>,
+    regions: &[InclusiveRectangle],
+    dest: Rect,
+) -> Vec<Rect> {
+    let (rects, surface_coordinates) = region_rects(regions, dest);
+    if *seen != Some(surface_coordinates) {
+        *seen = Some(surface_coordinates);
+        tracing::debug!(
+            surface_coordinates,
+            ?dest,
+            regions = regions.len(),
+            first = ?regions.first(),
+            "H.264 region rectangles"
+        );
     }
+    rects
 }
 
 fn apply_progressive_tiles(surface: &mut Surface, tiles: Vec<DecodedTile>) {
@@ -965,6 +987,7 @@ impl Handler {
             gpu,
             soft,
             surfaces,
+            region_coordinates,
             ..
         } = &mut *state;
         let Some(surface) = surfaces.get_mut(&surface_id) else {
@@ -996,7 +1019,7 @@ impl Handler {
             }
             let store = stores.get_mut(&surface_id).expect("just inserted");
             for (stream, view) in views {
-                let rects = picture_rects(&stream.rectangles, dest.w, dest.h);
+                let rects = placed_regions(region_coordinates, &stream.rectangles, dest);
                 vaapi::annex_b(stream.data, annex_b)?;
                 let frame = decoder
                     .decode(annex_b)?
@@ -1026,7 +1049,7 @@ impl Handler {
         } else if let Some(soft) = soft {
             let size = (dest.w as usize, dest.h as usize);
             for (stream, view) in views {
-                let rects = picture_rects(&stream.rectangles, dest.w, dest.h);
+                let rects = placed_regions(region_coordinates, &stream.rectangles, dest);
                 soft.decode(surface_id, size, stream.data, &rects, *view)?;
                 updated.extend(rects);
             }
@@ -1057,7 +1080,12 @@ impl Handler {
             return Ok(());
         }
         let mut state = self.0.state.lock();
-        let GfxState { gpu, surfaces, .. } = &mut *state;
+        let GfxState {
+            gpu,
+            surfaces,
+            region_coordinates,
+            ..
+        } = &mut *state;
         let Some(gpu) = gpu else { return Ok(()) };
         let Some(surface) = surfaces.get_mut(&surface_id) else {
             return Ok(());
@@ -1080,9 +1108,11 @@ impl Handler {
             "H.264 picture smaller than destination rectangle"
         );
         let image = gpu.context.convert(frame)?;
-        // Match IronRDP's AVC420 destination behavior: decoded images may be
-        // macroblock padded, and the wire destination selects the visible area.
-        surface.copy_gpu(&image, Rect::new(0, 0, dest.w, dest.h), dest.x, dest.y);
+        // Decoded images may be macroblock padded; the picture's (0, 0) is the destination's
+        // corner, and only the updated regions hold picture data.
+        for rect in placed_regions(region_coordinates, &stream.rectangles, dest) {
+            surface.copy_gpu(&image, rect, dest.x + rect.x, dest.y + rect.y);
+        }
         if !gpu.announced {
             gpu.announced = true;
             let node = gpu.context.render_node.as_deref().unwrap_or_default();
@@ -1474,6 +1504,59 @@ mod tests {
             crate::gpu::tests::read(&context, &surface.gpu.as_ref().unwrap().image)
         });
         assert!(error.lock().is_none(), "{:?}", error.lock());
+    }
+
+    fn region(left: u16, top: u16, right: u16, bottom: u16) -> InclusiveRectangle {
+        InclusiveRectangle {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn windows_regions_are_read_in_surface_coordinates() {
+        // As 10.1.1.45 sent them: a destination away from the origin, regions inside it.
+        let dest = Rect::new(734, 175, 448, 830);
+        let (rects, surface) = region_rects(
+            &[region(766, 175, 1149, 494), region(734, 302, 765, 494)],
+            dest,
+        );
+        assert!(surface);
+        assert_eq!(
+            rects,
+            [Rect::new(32, 0, 384, 320), Rect::new(0, 127, 32, 193)]
+        );
+    }
+
+    #[test]
+    fn destination_relative_regions_still_work() {
+        // IronRDP servers: regions relative to an offset destination.
+        let dest = Rect::new(734, 175, 448, 830);
+        let (rects, surface) = region_rects(&[region(0, 0, 99, 49)], dest);
+        assert!(!surface);
+        assert_eq!(rects, [Rect::new(0, 0, 100, 50)]);
+
+        // At the origin both readings agree.
+        let dest = Rect::new(0, 0, 640, 480);
+        let (rects, _) = region_rects(&[region(0, 0, 639, 479)], dest);
+        assert_eq!(rects, [Rect::new(0, 0, 640, 480)]);
+    }
+
+    #[test]
+    fn regions_are_clipped_and_never_widened_to_the_whole_picture() {
+        let dest = Rect::new(100, 100, 200, 200);
+        let (rects, surface) = region_rects(&[region(250, 250, 400, 400)], dest);
+        assert!(surface);
+        assert_eq!(rects, [Rect::new(150, 150, 50, 50)]);
+
+        // Regions that miss the picture draw nothing (the blank areas would show as green).
+        let (rects, _) = region_rects(&[region(5000, 5000, 5010, 5010)], dest);
+        assert!(rects.is_empty());
+
+        let (rects, _) = region_rects(&[], dest);
+        assert_eq!(rects, [Rect::new(0, 0, 200, 200)]);
     }
 
     #[test]
