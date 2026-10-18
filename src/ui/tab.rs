@@ -218,15 +218,13 @@ impl SessionTab {
                 }
             }
             SessionEvent::Ended(ended) => {
-                if let Ended::Failed(failure) = &ended {
-                    tracing::info!(title = %failure.title, detail = %failure.detail, "session failed");
-                    if let Some(active) = self
+                if matches!(ended, Ended::Failed(_))
+                    && let Some(active) = self
                         .stages
                         .iter_mut()
                         .find(|s| matches!(s, StageState::Active(_)))
-                    {
-                        *active = StageState::Failed;
-                    }
+                {
+                    *active = StageState::Failed;
                 }
                 self.cert_prompt = None;
                 self.phase = Phase::Ended(ended);

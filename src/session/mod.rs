@@ -330,12 +330,16 @@ impl SessionHandle {
         let thread = std::thread::Builder::new()
             .name(format!("rdp-{}", params.host))
             .spawn(move || {
+                // Everything this thread logs says which session it belongs to.
+                let _span =
+                    tracing::info_span!("session", id = id.0, host = %params.host).entered();
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
                     Ok(rt) => rt,
                     Err(e) => {
+                        tracing::error!(error = %e, "couldn't start the session runtime");
                         sink.send(SessionEvent::Ended(Ended::Failed(Failure::internal(e))));
                         return;
                     }

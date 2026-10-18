@@ -57,6 +57,7 @@ pub(super) async fn run_session(
     events: EventSink,
     frame: Arc<SharedFrame>,
 ) {
+    let started = Instant::now();
     let clipboard = params
         .devices
         .clipboard
@@ -181,19 +182,19 @@ pub(super) async fn run_session(
                 });
                 continue;
             }
-            Exit::Closed => return events.send(SessionEvent::Ended(Ended::Closed)),
+            Exit::Closed => return end(&events, Ended::Closed, started),
             Exit::ServerEnded(reason) => {
-                return events.send(SessionEvent::Ended(Ended::ServerEnded(reason)));
+                return end(&events, Ended::ServerEnded(reason), started);
             }
             Exit::Failed(failure) => {
-                return events.send(SessionEvent::Ended(Ended::Failed(failure)));
+                return end(&events, Ended::Failed(failure), started);
             }
             Exit::Lost(failure) => failure,
         };
 
         let since = *reconnecting_since.get_or_insert_with(Instant::now);
         if !params.advanced.auto_reconnect || since.elapsed() > RECONNECT_WINDOW {
-            return events.send(SessionEvent::Ended(Ended::Failed(failure)));
+            return end(&events, Ended::Failed(failure), started);
         }
 
         attempt += 1;
@@ -218,7 +219,7 @@ pub(super) async fn run_session(
                     break;
                 }
                 cmd = cmd_rx.recv() => match cmd {
-                    None | Some(SessionCmd::Disconnect) => return events.send(SessionEvent::Ended(Ended::Closed)),
+                    None | Some(SessionCmd::Disconnect) => return end(&events, Ended::Closed, started),
                     Some(SessionCmd::RetryNow) => break,
                     Some(SessionCmd::Resize(request)) => desktop = request,
                     Some(_) => {}
@@ -226,6 +227,19 @@ pub(super) async fn run_session(
             }
         }
     }
+}
+
+/// Logs how and after how long the session ended, then tells the UI.
+fn end(events: &EventSink, ended: Ended, started: Instant) {
+    let seconds = started.elapsed().as_secs();
+    match &ended {
+        Ended::Closed => tracing::info!(seconds, "session closed"),
+        Ended::ServerEnded(reason) => tracing::info!(seconds, %reason, "server ended the session"),
+        Ended::Failed(failure) => {
+            tracing::info!(seconds, title = %failure.title, detail = %failure.detail, "session failed");
+        }
+    }
+    events.send(SessionEvent::Ended(ended));
 }
 
 /// Starts a reconnect attempt over, keeping the reason the connection was lost on the card.
