@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, ensure};
 use ash::vk;
 use egui_wgpu::{RenderState, WgpuSetup, WgpuSetupExisting, wgpu};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use wgpu::util::DeviceExt;
 
 use crate::session::framebuffer::Rect;
@@ -59,6 +59,8 @@ pub struct GpuContext {
     progressive: Option<ProgressivePipelines>,
     avc444: Avc444Pipelines,
     failure: Arc<Mutex<Option<String>>>,
+    /// Held shared around each submission and exclusively by [`exclusive`](Self::exclusive).
+    submit_lock: RwLock<()>,
 }
 
 /// Commands recorded since the last submission. Surface operations append here; the session
@@ -528,7 +530,16 @@ impl GpuContext {
             progressive,
             avc444,
             failure,
+            submit_lock: RwLock::new(()),
         }
+    }
+
+    /// Runs `f` while no session submits GPU work. Reconfiguring the window's surface waits for
+    /// the queue to drain, and wgpu fails it if another thread submits meanwhile: the window
+    /// keeps its old size while egui draws at the new one, failing every frame.
+    pub fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _drained = self.submit_lock.write();
+        f()
     }
 
     pub fn image(&self, width: u32, height: u32) -> Arc<GpuImage> {
@@ -773,7 +784,10 @@ impl GpuContext {
                 timeout: Some(Duration::from_secs(5)),
             })?;
         }
-        let index = self.queue.submit(buffers);
+        let index = {
+            let _submitting = self.submit_lock.read();
+            self.queue.submit(buffers)
+        };
         self.queue.on_submitted_work_done(move || drop(hold));
         pending.push_back(index);
         self.device.poll(wgpu::PollType::Poll)?;
@@ -920,7 +934,9 @@ impl GpuContext {
         );
         // Straight to the queue, not through the batch: the copy sees the last finished frame
         // and leaves a frame the session is drawing alone.
-        self.queue.submit([encoder.finish()]);
+        let commands = encoder.finish();
+        let _submitting = self.submit_lock.read();
+        self.queue.submit([commands]);
         (buffer, stride)
     }
 

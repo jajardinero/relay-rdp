@@ -72,6 +72,8 @@ struct App {
     textures: gpu::RemoteTextures,
     modifiers: ModifiersState,
     next_repaint: Option<Instant>,
+    /// Reconfiguring the window's surface failed; try again before the next frame.
+    resize_retry: bool,
     cursor_cache: HashMap<usize, CustomCursor>,
     applied_cursor: AppliedCursor,
 }
@@ -87,6 +89,7 @@ impl App {
             textures: gpu::RemoteTextures::default(),
             modifiers: ModifiersState::empty(),
             next_repaint: None,
+            resize_retry: false,
             cursor_cache: HashMap::new(),
             applied_cursor: AppliedCursor::Egui,
         }
@@ -152,7 +155,30 @@ impl App {
         Ok(())
     }
 
+    /// Matches the window's surface to its current size, with session submissions held off
+    /// meanwhile (see `GpuContext::exclusive`). If it fails anyway, the next frame retries.
+    fn resize_surface(&mut self) {
+        let Some(gfx) = &mut self.gfx else { return };
+        let size = gfx.window.inner_size();
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            return;
+        };
+        let gpu = self.ui.gpu.as_deref();
+        let error = window_errors(&mut gfx.painter, |painter| match gpu {
+            Some(gpu) => gpu.exclusive(|| painter.on_window_resized(ViewportId::ROOT, w, h)),
+            None => painter.on_window_resized(ViewportId::ROOT, w, h),
+        });
+        if let Some(error) = error {
+            tracing::warn!(%error, "resizing the window's surface failed; retrying");
+            self.resize_retry = true;
+            gfx.window.request_redraw();
+        }
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if std::mem::take(&mut self.resize_retry) {
+            self.resize_surface();
+        }
         let Some(gfx) = &mut self.gfx else { return };
         self.next_repaint = None;
 
@@ -191,15 +217,23 @@ impl App {
             .egui_ctx
             .tessellate(output.shapes, output.pixels_per_point);
         let clear = self.ui.clear_color();
-        gfx.painter.paint_and_update_textures(
-            ViewportId::ROOT,
-            output.pixels_per_point,
-            clear,
-            &primitives,
-            &mut output.textures_delta,
-            Vec::new(),
-            &gfx.window,
-        );
+        let error = window_errors(&mut gfx.painter, |painter| {
+            painter.paint_and_update_textures(
+                ViewportId::ROOT,
+                output.pixels_per_point,
+                clear,
+                &primitives,
+                &mut output.textures_delta,
+                Vec::new(),
+                &gfx.window,
+            );
+        });
+        if let Some(error) = error {
+            // Typically the surface and egui disagree on the window size.
+            tracing::warn!(%error, "drawing the window failed; resizing its surface again");
+            self.resize_retry = true;
+            gfx.window.request_redraw();
+        }
 
         if let Some(inhibitor) = &mut gfx.inhibitor {
             inhibitor.set(self.ui.wants_shortcut_capture());
@@ -274,6 +308,19 @@ impl App {
     }
 }
 
+/// Runs `f` in a wgpu error scope. Scopes are per thread, so errors from drawing the window are
+/// handled here and never reach the device-wide handler, which would end GPU drawing for every
+/// session over a window glitch.
+fn window_errors(painter: &mut Painter, f: impl FnOnce(&mut Painter)) -> Option<wgpu::Error> {
+    let Some(device) = painter.render_state().map(|state| state.device) else {
+        f(painter);
+        return None;
+    };
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    f(painter);
+    pollster::block_on(scope.pop())
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gfx.is_none()
@@ -311,15 +358,7 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
                 return;
             }
-            WindowEvent::Resized(size) => {
-                if let (Some(gfx), Some(w), Some(h)) = (
-                    &mut self.gfx,
-                    NonZeroU32::new(size.width),
-                    NonZeroU32::new(size.height),
-                ) {
-                    gfx.painter.on_window_resized(ViewportId::ROOT, w, h);
-                }
-            }
+            WindowEvent::Resized(_) => self.resize_surface(),
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
