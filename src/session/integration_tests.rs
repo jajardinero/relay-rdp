@@ -12,11 +12,12 @@ struct Server {
 }
 impl Server {
     fn start() -> Self {
-        Self::launch("--gfx")
+        Self::launch(&["--gfx"])
     }
 
     /// `--gfx` streams H.264 4:2:0; `--gfx444` streams 4:4:4 to clients that accept it.
-    fn launch(graphics: &str) -> Self {
+    /// `--annex-b` frames H.264 with start codes, as Windows does.
+    fn launch(args: &[&str]) -> Self {
         let port = std::net::TcpListener::bind(("127.0.0.1", 0))
             .unwrap()
             .local_addr()
@@ -30,7 +31,8 @@ impl Server {
             .unwrap()
             .join("examples/test_server");
         let mut child = Command::new(binary)
-            .args([graphics, "--port", &port.to_string()])
+            .args(args)
+            .args(["--port", &port.to_string()])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -87,7 +89,12 @@ fn setup() -> winit::event_loop::EventLoopProxy<UserEvent> {
 fn wayland_rdp_sessions_resize_and_toggle() {
     let proxy = setup();
     let gpu = crate::gpu::tests::context().unwrap();
-    let servers: Vec<_> = (0..3).map(|_| Server::start()).collect();
+    // Session 0 decodes length-prefixed H.264 on the GPU; 1 (GPU) and 2 (CPU) get Annex B.
+    let servers = [
+        Server::start(),
+        Server::launch(&["--gfx", "--annex-b"]),
+        Server::launch(&["--gfx", "--annex-b"]),
+    ];
     let make_params = |port, hardware| ConnectParams {
         host: "127.0.0.1".to_owned(),
         port,
@@ -314,7 +321,14 @@ fn wayland_rdp_full_color() {
         (GraphicsMode::FullColor, false, Engine::Cpu, Codec::H264Full),
         (GraphicsMode::Auto, true, Engine::Gpu, Codec::H264),
     ];
-    let servers: Vec<_> = cases.iter().map(|_| Server::launch("--gfx444")).collect();
+    // The software case gets Annex B H.264, as Windows sends it.
+    let servers: Vec<_> = cases
+        .iter()
+        .map(|&(_, hardware, _, _)| match hardware {
+            true => Server::launch(&["--gfx444"]),
+            false => Server::launch(&["--gfx444", "--annex-b"]),
+        })
+        .collect();
     let sessions: Vec<_> = servers
         .iter()
         .zip(&cases)

@@ -10,7 +10,10 @@
 //! H.264 4:4:4 (AVC444 v1: a main and an auxiliary view per frame) to clients that accept it, as
 //! Windows does with its AVC 444 policy enabled, and H.264 4:2:0 to the others.
 //!
-//!     cargo run --example test_server -- [--port 3390] [--user test] [--pass test] [--gfx | --gfx444]
+//! H.264 goes out length-prefixed, as IronRDP frames it; `--annex-b` sends it with start codes
+//! instead, as Windows does.
+//!
+//!     cargo run --example test_server -- [--port 3390] [--user test] [--pass test] [--gfx | --gfx444] [--annex-b]
 
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::Arc;
@@ -452,7 +455,16 @@ fn avc444_views(
     }
 }
 
-/// Annex B (start codes) to AVC (4-byte big-endian lengths), the framing RDP uses.
+/// The encoder's Annex B output, as Windows sends it, or length-prefixed as IronRDP frames it.
+fn framed(annex_b: Vec<u8>, keep_annex_b: bool) -> Vec<u8> {
+    if keep_annex_b {
+        annex_b
+    } else {
+        annex_b_to_avc(&annex_b)
+    }
+}
+
+/// Annex B (start codes) to AVC (4-byte big-endian lengths), the framing IronRDP uses.
 fn annex_b_to_avc(annex_b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(annex_b.len() + 16);
     for nal in openh264::nal_units(annex_b) {
@@ -467,7 +479,12 @@ fn annex_b_to_avc(annex_b: &[u8]) -> Vec<u8> {
     out
 }
 
-async fn stream_gfx(factory: GfxFactory, handler: Handler, full: bool) -> anyhow::Result<()> {
+async fn stream_gfx(
+    factory: GfxFactory,
+    handler: Handler,
+    full: bool,
+    annex_b: bool,
+) -> anyhow::Result<()> {
     let mut encoder: Option<(Encoder, u16, u16, bool)> = None;
     let mut surface: Option<(u16, u16, u16)> = None;
     let mut previous_server: Option<GfxServerHandle> = None;
@@ -548,15 +565,15 @@ async fn stream_gfx(factory: GfxFactory, handler: Handler, full: bool) -> anyhow
             let padded = (uw.div_ceil(16) * 16, uh.div_ceil(16) * 16);
             let stride = usize::from(scene.width) * 4;
             let views = avc444_views(&scene.pixels, stride, (uw, uh), padded);
-            let main = annex_b_to_avc(&enc.encode(&views.main)?.to_vec());
-            let auxiliary = annex_b_to_avc(&enc.encode(&views.auxiliary)?.to_vec());
+            let main = framed(enc.encode(&views.main)?.to_vec(), annex_b);
+            let auxiliary = framed(enc.encode(&views.auxiliary)?.to_vec(), annex_b);
             server.send_avc444_frame(id, &main, &regions, Some(&auxiliary), Some(&regions), ts)
         } else {
             let yuv = YUVBuffer::from_rgb8_source(BgraSliceU8::new(
                 &scene.pixels[..usize::from(w) * usize::from(h) * 4],
                 (usize::from(w), usize::from(h)),
             ));
-            let avc = annex_b_to_avc(&enc.encode(&yuv)?.to_vec());
+            let avc = framed(enc.encode(&yuv)?.to_vec(), annex_b);
             server.send_avc420_frame(id, &avc, &regions, ts)
         };
         if sent.is_none() {
@@ -611,11 +628,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let full = std::env::args().any(|a| a == "--gfx444");
+    let annex_b = std::env::args().any(|a| a == "--annex-b");
     let gfx = (full || std::env::args().any(|a| a == "--gfx")).then(GfxFactory::default);
     if let Some(factory) = &gfx {
         let (factory, handler) = (factory.clone(), handler.clone());
         tokio::spawn(async move {
-            if let Err(e) = stream_gfx(factory, handler, full).await {
+            if let Err(e) = stream_gfx(factory, handler, full, annex_b).await {
                 eprintln!("gfx streaming stopped: {e:#}");
             }
         });

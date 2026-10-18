@@ -131,9 +131,30 @@ fn error_text(error: &[c_char]) -> String {
         .into_owned()
 }
 
-/// Strict conversion shared with the software decoder. Truncation must cause
-/// recovery rather than feeding a partially valid reference frame to a decoder.
+/// Puts an RDP H.264 payload in the Annex B form both decoders take. IronRDP frames NAL units
+/// with 4-byte big-endian lengths, but Windows sends Annex B (start codes), so both are accepted.
+///
+/// Length-prefixed payloads are checked strictly: truncation must cause recovery rather than
+/// feeding a partially valid reference frame to a decoder. A payload counts as Annex B only when
+/// it isn't valid length-prefixed data and starts with a start code; checking the start code
+/// first would misread a first NAL of 256–511 bytes, whose length reads `00 00 01 xx`.
 pub fn annex_b(data: &[u8], output: &mut Vec<u8>) -> anyhow::Result<()> {
+    let prefixed = length_prefixed(data, output);
+    if prefixed.is_err()
+        && let Some(nal) = data
+            .strip_prefix(&[0, 0, 0, 1])
+            .or_else(|| data.strip_prefix(&[0, 0, 1]))
+    {
+        ensure!(!nal.is_empty(), "empty H.264 NAL");
+        output.clear();
+        output.extend_from_slice(data);
+        return Ok(());
+    }
+    prefixed
+        .map_err(|e| anyhow::anyhow!("{e} (payload starts {:02x?})", &data[..data.len().min(8)]))
+}
+
+fn length_prefixed(data: &[u8], output: &mut Vec<u8>) -> anyhow::Result<()> {
     output.clear();
     let mut rest = data;
     while !rest.is_empty() {
@@ -162,10 +183,34 @@ mod tests {
             &[0, 0, 0],
             &[0, 0, 0, 0],
             &[0, 0, 0, 2, 0x67],
-            &[0, 0, 0, 1, 0x67, 0],
+            &[0, 0, 0, 3, 0x67, 0],
+            &[0, 0, 0, 1],
+            &[0, 0, 1],
         ] {
             assert!(annex_b(data, &mut output).is_err());
         }
+    }
+    #[test]
+    fn accepts_annex_b_as_windows_sends_it() {
+        let mut output = Vec::new();
+        for data in [
+            &[0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0xce][..],
+            &[0, 0, 1, 0x65, 0x88, 0x84],
+        ] {
+            annex_b(data, &mut output).unwrap();
+            assert_eq!(output, data);
+        }
+    }
+    #[test]
+    fn length_prefix_wins_when_it_tiles_the_payload() {
+        // A 256-byte NAL's length starts like a 3-byte start code.
+        let mut data = vec![0, 0, 1, 0];
+        data.extend(std::iter::repeat_n(0x41, 256));
+        let mut output = Vec::new();
+        annex_b(&data, &mut output).unwrap();
+        assert_eq!(output[..4], [0, 0, 0, 1]);
+        assert_eq!(output.len(), 260);
+        assert!(output[4..].iter().all(|&b| b == 0x41));
     }
     #[test]
     fn unavailable_device_is_a_recoverable_error() {
