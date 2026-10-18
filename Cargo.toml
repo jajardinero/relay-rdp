@@ -119,3 +119,6 @@ ironrdp-session = { path = "vendor/ironrdp-session" }
 
 # CredSSP: don't send clientNonce to servers older than CredSSP 5 (see RELAY-PATCH.md).
 sspi = { path = "vendor/sspi" }
+
+# Audio playback that never blocks the audio thread, with a jitter buffer (see RELAY-PATCH.md).
+ironrdp-rdpsnd-native = { path = "vendor/ironrdp-rdpsnd-native" }

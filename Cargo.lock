@@ -2771,8 +2771,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-rdpsnd-native"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d2d36d9bb45863f9bc5225bf3bccda125fafb1b225c1f99dbeaeebb258e7dc"
 dependencies = [
  "cpal",
  "ironrdp-error",
