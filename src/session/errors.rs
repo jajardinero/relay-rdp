@@ -61,7 +61,20 @@ impl Failure {
     }
 
     /// `legacy`: the host already allows legacy TLS.
-    pub fn tls(e: &io::Error, legacy: bool) -> Self {
+    pub fn tls(e: &io::Error, legacy: bool, port: u16) -> Self {
+        // The network failed mid-handshake: retryable, not a TLS mismatch. (Resets stay here:
+        // servers with no common cipher reset the connection too.)
+        use io::ErrorKind as K;
+        if matches!(
+            e.kind(),
+            K::TimedOut
+                | K::HostUnreachable
+                | K::NetworkUnreachable
+                | K::NetworkDown
+                | K::NotConnected
+        ) {
+            return Self::from_io(e, port);
+        }
         let hint = if legacy {
             "The computer must support TLS 1.0 or newer and a compatible encryption suite."
         } else {
@@ -94,6 +107,17 @@ impl Failure {
                 "Check that it is turned on and that a firewall isn't blocking port {port}."
             )),
             "connection timed out",
+        )
+    }
+
+    /// Our address went away (a VPN profile or Wi-Fi network was switched), taking the
+    /// connection with it.
+    pub fn network_changed(ip: std::net::IpAddr) -> Self {
+        Self::new(
+            FailureKind::Network,
+            "Your network changed",
+            Some("Relay reconnects as soon as the new connection is up."),
+            format!("local address {ip} is no longer assigned"),
         )
     }
 

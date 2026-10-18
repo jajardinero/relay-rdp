@@ -1,5 +1,6 @@
 //! The session lifecycle: connect, run the active stage, and reconnect when the network drops.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,7 +29,9 @@ use crate::store::profiles::GraphicsMode;
 
 /// Keep trying to reconnect for this long after the connection drops.
 const RECONNECT_WINDOW: Duration = Duration::from_secs(300);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_BACKOFF: Duration = Duration::from_secs(10);
+/// While reconnecting, how often to look for a new network (a VPN tunnel or Wi-Fi coming up).
+const NETWORK_POLL: Duration = Duration::from_millis(500);
 /// How long to wait for the server to acknowledge a disconnect before dropping the socket.
 const CLOSE_GRACE: Duration = Duration::from_secs(3);
 /// Window resizes are coalesced; only the size the user settles on is sent.
@@ -61,12 +64,14 @@ pub(super) async fn run_session(
     let mut desktop = params.desktop;
     let mut reconnecting_since: Option<Instant> = None;
     let mut attempt = 0u32;
+    // Shown again when the user restarts a reconnect attempt.
+    let mut lost_reason = String::new();
     let mut graphics = params.experience.graphics;
     let mut graphics_failures = 0u32;
     let mut hardware = params.hardware_video_decoding;
     let mut hardware_reason = None;
 
-    loop {
+    'session: loop {
         let show_progress = reconnecting_since.is_none();
         let gfx = (graphics != GraphicsMode::Compatible).then(|| {
             GfxShared::new(
@@ -84,12 +89,27 @@ pub(super) async fn run_session(
         };
         let connecting = connect::connect(&params, desktop, &events, show_progress, channels);
         tokio::pin!(connecting);
+        let network =
+            network_changed(reconnecting_since.and_then(|_| netinfo::routable_addresses()));
+        tokio::pin!(network);
 
         let outcome = loop {
             tokio::select! {
                 result = &mut connecting => break Some(result),
+                // An attempt that started before the new network was up may be stuck on the old
+                // route; start over on the new one.
+                () = &mut network => {
+                    tracing::debug!("network changed; retrying now");
+                    restart_attempt(&events, &mut attempt, &lost_reason);
+                    continue 'session;
+                }
                 cmd = cmd_rx.recv() => match cmd {
                     None | Some(SessionCmd::Disconnect) => break None,
+                    // A reconnect attempt can hang on a half-working network; start over.
+                    Some(SessionCmd::RetryNow) if reconnecting_since.is_some() => {
+                        restart_attempt(&events, &mut attempt, &lost_reason);
+                        continue 'session;
+                    }
                     Some(SessionCmd::Resize(request)) => desktop = request,
                     Some(_) => {}
                 },
@@ -184,12 +204,19 @@ pub(super) async fn run_session(
             retry_in: delay,
             reason: failure.title.clone(),
         });
+        lost_reason = failure.title;
 
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
+        let network = network_changed(netinfo::routable_addresses());
+        tokio::pin!(network);
         loop {
             tokio::select! {
                 () = &mut sleep => break,
+                () = &mut network => {
+                    tracing::debug!("network changed; retrying now");
+                    break;
+                }
                 cmd = cmd_rx.recv() => match cmd {
                     None | Some(SessionCmd::Disconnect) => return events.send(SessionEvent::Ended(Ended::Closed)),
                     Some(SessionCmd::RetryNow) => break,
@@ -201,7 +228,33 @@ pub(super) async fn run_session(
     }
 }
 
-/// 0.5 s, 1 s, 2 s, 4 s … capped at 30 s. The first retry is quick: most drops are blips.
+/// Starts a reconnect attempt over, keeping the reason the connection was lost on the card.
+fn restart_attempt(events: &EventSink, attempt: &mut u32, reason: &str) {
+    *attempt += 1;
+    events.send(SessionEvent::Reconnecting {
+        attempt: *attempt,
+        retry_in: Duration::ZERO,
+        reason: reason.to_owned(),
+    });
+}
+
+/// Resolves once the machine's routable addresses differ from `before`: a network or VPN tunnel
+/// came up or went away. Never resolves when the addresses can't be read.
+async fn network_changed(before: Option<Vec<IpAddr>>) {
+    let Some(before) = before else {
+        return std::future::pending().await;
+    };
+    let mut poll = tokio::time::interval(NETWORK_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        poll.tick().await;
+        if netinfo::routable_addresses().is_some_and(|now| now != before) {
+            return;
+        }
+    }
+}
+
+/// 0.5 s, 1 s, 2 s, 4 s … capped at 10 s. The first retry is quick: most drops are blips.
 fn backoff(attempt: u32) -> Duration {
     let millis = 500u64.saturating_mul(1 << attempt.saturating_sub(1).min(16));
     Duration::from_millis(millis).min(MAX_BACKOFF)
@@ -264,6 +317,7 @@ impl<'a> ActiveSession<'a> {
             result,
             framed,
             socket_fd,
+            local_addr,
             os,
         } = self.connection.take().expect("connection present");
         if let Some(os) = os {
@@ -397,6 +451,13 @@ impl<'a> ActiveSession<'a> {
                 }
                 () = sleep_until(closing) => return Exit::Closed,
                 _ = stats_tick.tick() => {
+                    // The kernel keeps a socket whose address is gone until it times out; don't
+                    // leave the picture frozen that long.
+                    let ip = local_addr.ip();
+                    if netinfo::address_assigned(ip) == Some(false) {
+                        tracing::info!(%ip, "local address went away; reconnecting");
+                        return Exit::Lost(Failure::network_changed(ip));
+                    }
                     tick_count += 1;
                     // Text is cheap to check; local copies show up within two seconds.
                     if self.focused && tick_count % 2 == 0 && let Some(clipboard) = self.clipboard {

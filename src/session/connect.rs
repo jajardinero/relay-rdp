@@ -31,6 +31,9 @@ use crate::store::profiles::{AudioMode, DetectedOs, ExperienceSettings, Quality}
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_TIMEOUT: Duration = Duration::from_secs(8);
+/// An established connection that hears nothing back for this long is dead, which starts a
+/// reconnect. A shorter blip recovers on its own.
+const DEAD_LINK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Applies separately to the negotiation + TLS phase and to the sign-in phase. Generous because
 /// the server may be slow to create a session, but bounded so a wedged server can't hang the
 /// tab forever.
@@ -46,6 +49,8 @@ pub struct Connection {
     pub framed: UpgradedFramed,
     /// The TCP socket under TLS, for RTT sampling. Valid while `framed` is alive.
     pub socket_fd: RawFd,
+    /// Our end of the TCP connection. If this address disappears, so has the connection.
+    pub local_addr: SocketAddr,
     /// The server's operating system, if it revealed it while signing in.
     pub os: Option<DetectedOs>,
 }
@@ -116,6 +121,7 @@ pub async fn connect(
         mut framed,
         certificate,
         socket_fd,
+        local_addr,
         recorded,
     } = with_timeout(begin_secure(params, desktop, channels, stream), params.port).await?;
 
@@ -158,6 +164,7 @@ pub async fn connect(
         result,
         framed,
         socket_fd,
+        local_addr,
         os,
     })
 }
@@ -168,6 +175,7 @@ struct SecureConnection {
     framed: UpgradedFramed,
     certificate: x509_cert::Certificate,
     socket_fd: RawFd,
+    local_addr: SocketAddr,
     /// What the server sends until sign-in completes.
     recorded: hostinfo::Recorded,
 }
@@ -209,13 +217,20 @@ async fn begin_secure(
                     framed: ironrdp_tokio::TokioFramed::new_with_leftover(stream, leftover),
                     certificate,
                     socket_fd,
+                    local_addr: client_addr,
                     recorded,
                 });
             }
             Err(error) if backend == Backend::Rustls && tls::can_retry(&error) => {
                 tracing::info!(%error, "retrying RDP negotiation with TLS compatibility backend");
             }
-            Err(error) => return Err(Failure::tls(&error, params.advanced.allow_legacy_tls)),
+            Err(error) => {
+                return Err(Failure::tls(
+                    &error,
+                    params.advanced.allow_legacy_tls,
+                    params.port,
+                ));
+            }
         }
     }
     unreachable!("the compatibility backend always returns a connection or an error")
@@ -264,18 +279,26 @@ async fn open_tcp(host: &str, port: u16) -> Result<TcpStream, Failure> {
     Err(last_failure)
 }
 
-/// Low latency for input, and keepalives so a dead link is noticed in ~30 s instead of the
-/// kernel default of over two hours.
+/// Low latency for input, and a dead link noticed in ~30 s instead of minutes or hours.
+///
+/// Keepalives cover an idle link, but Linux sends no probes while sent data is unacknowledged:
+/// a mouse move during an outage would leave only the retransmission timeout (~15 min) to end
+/// the socket, with the session frozen until then. The user timeout bounds that case too, and
+/// also caps keepalive failure (tcp(7)).
 fn tune_socket(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::warn!(error = %e, "failed to set TCP_NODELAY");
     }
+    let socket = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(15))
-        .with_interval(Duration::from_secs(5))
+        .with_time(DEAD_LINK_TIMEOUT / 2)
+        .with_interval(DEAD_LINK_TIMEOUT / 6)
         .with_retries(3);
-    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
         tracing::warn!(error = %e, "failed to enable TCP keepalive");
+    }
+    if let Err(e) = socket.set_tcp_user_timeout(Some(DEAD_LINK_TIMEOUT)) {
+        tracing::warn!(error = %e, "failed to set TCP_USER_TIMEOUT");
     }
 }
 
