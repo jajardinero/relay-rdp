@@ -14,10 +14,12 @@ In Auto graphics mode, the accelerated path is:
 
 ```text
 H.264 → FFmpeg / VA-API → DMA-BUF planes → Vulkan import
-      → GPU YUV conversion → GPU surfaces / caches → egui desktop texture
+      → GPU YUV conversion → GPU surfaces / caches
+      → read back to system memory → GPUI image (uploaded again by the interface)
 ```
 
-Decoded video stays on the GPU. Solid fills, overlapping surface copies, bitmap
+Video is decoded and converted on the GPU. The interface draws on its own GPU device,
+so each new picture is then read back in full and handed to GPUI as an image. Solid fills, overlapping surface copies, bitmap
 caches, and composition also run on the GPU. Other RDP codecs can upload decoded
 bitmap regions into the same GPU surfaces. Everything an RDP frame draws is
 recorded and submitted to the GPU once, at the end of the frame, with bounded

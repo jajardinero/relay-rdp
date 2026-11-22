@@ -1,21 +1,23 @@
 # Relay
 
 **A fast, low-latency RDP client for Linux, built for Wayland.**
-Written in Rust, with an [egui](https://github.com/emilk/egui) interface drawn on the GPU.
+Written in Rust, with an interface built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui),
+the UI framework of the Zed editor.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org)
-[![egui](https://img.shields.io/badge/UI-egui-6a5acd)](https://github.com/emilk/egui)
+[![GPUI](https://img.shields.io/badge/UI-GPUI-6a5acd)](https://gpui-kit.com)
 [![Wayland](https://img.shields.io/badge/Wayland-native-yellow?logo=wayland)](https://wayland.freedesktop.org)
 [![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-lightgrey?logo=linux)](#downloads)
 
-Relay connects to Windows desktops and servers over the Remote Desktop Protocol. Decoded video
-never leaves the GPU, network writes aren't held back, and the whole screen is composed in one
-GPU submission per frame. The goal is a remote desktop that feels local, using a fraction of the
+Relay connects to Windows desktops and servers over the Remote Desktop Protocol. Video is
+decoded on the GPU, network writes aren't held back, and everything an RDP frame draws goes to
+the GPU in one submission. The goal is a remote desktop that feels local, using a fraction of the
 CPU other clients need.
 
-In the same full-screen test, Relay used **4.4× less CPU than xfreerdp** and **5.8× less than
-sdl-freerdp** ([details](#head-to-head-with-freerdp)).
+In a full-screen test, the 0.1.2 release used **4.4× less CPU than xfreerdp** and **5.8× less
+than sdl-freerdp** ([details](#head-to-head-with-freerdp)). That release had the earlier egui
+interface; the current GPUI interface hasn't been measured yet.
 
 ![A Windows Server session in Relay. The session bar shows the round-trip time, a latency graph and a GPU badge; its tooltip explains how the picture is rendered.](docs/images/session.png)
 
@@ -37,17 +39,21 @@ sdl-freerdp** ([details](#head-to-head-with-freerdp)).
 
 | | How Relay does it |
 | --- | --- |
-| **Zero-copy video** | H.264 is decoded by your GPU through VA-API, shared with Vulkan as DMA-BUF, converted from YUV in shaders and drawn as an egui texture. Frames are never copied back to system memory. |
+| **Hardware video** | H.264 is decoded by your GPU through VA-API, shared with Vulkan as DMA-BUF and converted from YUV in shaders. The finished picture is then copied through system memory to the interface (see [Current limitations](#current-limitations)). |
 | **One GPU submission per frame** | Fills, copies, cached bitmaps and decoded tiles are recorded together and submitted once at the end of each RDP frame, with a bound on outstanding GPU work. |
 | **GPU RemoteFX** | RemoteFX tiles are entropy-decoded in parallel on every CPU core; the wavelet transform and color conversion run in GPU compute shaders. |
 | **No network buffering delay** | `TCP_NODELAY` is set on the connection and input uses RDP fast-path, so keystrokes and mouse moves go out the moment they happen. |
 | **Native Wayland** | A native Wayland window (no XWayland), with dynamic resize: the remote desktop follows your window size. |
 | **Written in Rust** | No garbage collector and no runtime pauses, with memory safety throughout. The protocol stack is [IronRDP](https://github.com/Devolutions/IronRDP), also in Rust. |
-| **egui interface** | An immediate-mode UI rendered with wgpu in the same GPU pipeline as the remote desktop. |
+| **GPU-drawn interface** | Built with [GPUI Kit](https://gpui-kit.com) on GPUI, which draws the whole window on the GPU. |
 
 ## Benchmarks
 
 All numbers below were measured on one laptop on 2026-10-16, at commit `f5cacb5`, with release builds.
+That was before the interface moved from egui to GPUI (`c369806`). The decoding and drawing
+benchmarks measure session code that the move didn't change. The head-to-head with FreeRDP measured
+the whole client and hasn't been repeated: the GPUI interface copies every displayed frame
+through system memory (see [Current limitations](#current-limitations)), so expect it to use more CPU.
 
 | Test machine | |
 | --- | --- |
@@ -107,7 +113,7 @@ paced at one frame every 16 ms. CPU and memory of the whole client process were 
 
 | Client | CPU (100% = one core) | Peak memory | Threads |
 | --- | ---: | ---: | ---: |
-| **Relay 0.1.2** | **17.4%** | 187 MB | 22 |
+| **Relay 0.1.2** (egui interface) | **17.4%** | 187 MB | 22 |
 | xfreerdp3 3.31.1 (X11, under XWayland) | 76.2% | 131 MB | 25 |
 | sdl-freerdp3 3.31.1 (SDL3, Wayland) | 100.4% | 221 MB | 35 |
 
@@ -255,6 +261,14 @@ Relay is young (0.1.x). Known gaps:
 
 - **Wayland only.** X11 sessions and XWayland aren't supported.
 - **x86_64 only.** No ARM builds yet.
+- **Every displayed frame is copied through system memory.** The interface draws on its own GPU
+  device, so in a session drawn on the GPU (including H.264 through VA-API) each new picture is
+  read back in full, converted on the CPU and uploaded again. Sessions drawn on the CPU upload the
+  whole picture on every update. This costs CPU time and memory bandwidth, more so at high
+  resolutions.
+- **Keys are mapped by the character they type, not by their position.** Each key is sent as
+  the key that types that character on a US keyboard. With other layouts some keys reach the
+  remote computer as different keys, and characters a US keyboard lacks (such as é) aren't sent.
 - **Not yet supported:** RD Gateway, RemoteApp, multiple monitors, smart cards, microphone,
   printer and USB redirection.
 - **Hardware decoding is VA-API only.** AMD and Intel work out of the box; NVIDIA needs
@@ -265,13 +279,16 @@ Relay is young (0.1.x). Known gaps:
   remote files needs `fuse3`, and works only while the session that copied them is connected.
 - **Ubuntu 24.04** ships `libopenh264.so.7`, which Relay can't load. Software H.264 needs
   `libopenh264.so.8` (or use the AppImage, which bundles it). Hardware decoding is unaffected.
-- **Benchmarks come from one machine**, and end-to-end input latency hasn't been measured yet.
+- **Benchmarks come from one machine** and predate the GPUI interface. End-to-end input latency
+  hasn't been measured yet.
 - No Flatpak, and not yet in any distribution's repositories.
 
 ## Building from source
 
 You need Rust (see `rust-toolchain.toml`), a C compiler, `pkg-config`, and development headers for
-FFmpeg (`libavcodec`, `libavutil`), VA-API (`libva`, `libva-drm`), Wayland, xkbcommon, ALSA and OpenSSL.
+FFmpeg (`libavcodec`, `libavutil`), VA-API (`libva`, `libva-drm`), Wayland, xkbcommon (including
+`xkbcommon-x11`), `libxcb`, ALSA and OpenSSL. GPUI links `libxcb` and `xkbcommon-x11` even
+though Relay runs on Wayland.
 
 ```sh
 git clone https://github.com/jajardinero/relay-rdp.git
@@ -286,7 +303,8 @@ dependency lists, and the test suite are described in [docs/BUILDING.md](docs/BU
 ## Built with
 
 - [IronRDP](https://github.com/Devolutions/IronRDP): the RDP protocol stack, in Rust
-- [egui](https://github.com/emilk/egui), [wgpu](https://wgpu.rs) and [winit](https://github.com/rust-windowing/winit): interface, GPU rendering and windowing
+- [GPUI Kit](https://gpui-kit.com), on the Zed editor's [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui): interface and windowing
+- [wgpu](https://wgpu.rs) and Vulkan: GPU drawing of the remote desktop
 - [FFmpeg](https://ffmpeg.org) with VA-API, and [OpenH264](https://www.openh264.org): H.264 decoding
 - [Tokio](https://tokio.rs), [rustls](https://github.com/rustls/rustls) and OpenSSL: networking and TLS
 
