@@ -8,10 +8,9 @@ use ironrdp_input::{Database, Operation, Scancode};
 use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
-use winit::event_loop::EventLoopProxy;
 use zeroize::Zeroizing;
 
-use crate::app::UserEvent;
+use crate::app::UiWaker;
 use crate::app::input::WheelAccumulator;
 use crate::app::keymap::codes;
 use crate::session::errors::FailureKind;
@@ -30,6 +29,10 @@ impl TabId {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn raw(self) -> usize {
+        self.0 as usize
     }
 }
 
@@ -94,7 +97,7 @@ pub struct BarState {
 pub struct SessionContext<'a> {
     pub hardware_video_decoding: bool,
     pub gpu: Option<Arc<crate::gpu::GpuContext>>,
-    pub proxy: &'a EventLoopProxy<UserEvent>,
+    pub waker: &'a UiWaker,
     pub known_hosts: &'a Arc<Mutex<KnownHosts>>,
 }
 
@@ -243,10 +246,10 @@ impl SessionTab {
         }
     }
 
-    /// The desktop size to request for a session area of `physical` pixels.
+    /// The desktop size to request for a session area of `physical` pixels `(width, height)`.
     pub fn desired_desktop(
         profile: &HostProfile,
-        physical: egui::Vec2,
+        physical: (f32, f32),
         pixels_per_point: f32,
     ) -> DesktopRequest {
         let scale_factor = profile
@@ -254,7 +257,7 @@ impl SessionTab {
             .scale_percent
             .unwrap_or_else(|| (pixels_per_point * 100.0).round() as u32);
         let (width, height) = match profile.display.resolution {
-            ResolutionMode::MatchWindow => (physical.x.round() as u16, physical.y.round() as u16),
+            ResolutionMode::MatchWindow => (physical.0.round() as u16, physical.1.round() as u16),
             ResolutionMode::Fixed => (profile.display.fixed_width, profile.display.fixed_height),
         };
         DesktopRequest {
@@ -389,5 +392,5 @@ fn spawn(
         advanced: profile.advanced.clone(),
         known_hosts: Arc::clone(cx.known_hosts),
     };
-    SessionHandle::spawn(params, cx.proxy.clone())
+    SessionHandle::spawn(params, cx.waker.clone())
 }

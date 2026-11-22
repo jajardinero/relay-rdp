@@ -21,11 +21,8 @@ ironrdp-dvc = "0.8"
 ironrdp-displaycontrol = "0.8"
 
 # UI
-egui = "0.36"
-egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links", "wayland"] }
-egui-wgpu = { version = "0.36", features = ["winit", "wayland"] }
-winit = { version = "0.30.13", default-features = false, features = ["wayland", "wayland-dlopen", "rwh_06"] }
-egui-phosphor = "0.14"
+gpui-kit = "0.10.0"
+wgpu = "30"
 pollster = "1"
 
 ash = "0.38"

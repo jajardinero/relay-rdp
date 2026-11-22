@@ -27,10 +27,9 @@ use ironrdp_pdu::input::fast_path::FastPathInputEvent;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 use tokio::sync::{mpsc, oneshot};
-use winit::event_loop::EventLoopProxy;
 use zeroize::Zeroizing;
 
-use crate::app::UserEvent;
+use crate::app::UiWaker;
 use crate::store::known_hosts::KnownHosts;
 use crate::store::profiles::{AdvancedSettings, DeviceSettings, ExperienceSettings};
 
@@ -142,7 +141,7 @@ pub struct CertificatePrompt {
 pub enum PointerUpdate {
     Default,
     Hidden,
-    Bitmap(Arc<DecodedPointer>),
+    Bitmap(#[allow(dead_code)] Arc<DecodedPointer>),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -290,18 +289,18 @@ pub enum SessionCmd {
 #[derive(Clone)]
 struct EventSink {
     tx: std::sync::mpsc::Sender<SessionEvent>,
-    proxy: EventLoopProxy<UserEvent>,
+    waker: UiWaker,
 }
 
 impl EventSink {
     fn send(&self, event: SessionEvent) {
         if self.tx.send(event).is_ok() {
-            let _ = self.proxy.send_event(UserEvent::Wake);
+            self.waker.wake();
         }
     }
 
     fn wake(&self) {
-        let _ = self.proxy.send_event(UserEvent::Wake);
+        self.waker.wake();
     }
 }
 
@@ -314,14 +313,14 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
-    pub fn spawn(params: ConnectParams, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Self> {
+    pub fn spawn(params: ConnectParams, waker: UiWaker) -> anyhow::Result<Self> {
         let id = SessionId::next();
         let frame = Arc::new(SharedFrame::new());
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = std::sync::mpsc::channel();
         let sink = EventSink {
             tx: event_tx,
-            proxy,
+            waker,
         };
 
         let thread_frame = Arc::clone(&frame);

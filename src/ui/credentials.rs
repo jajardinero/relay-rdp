@@ -1,17 +1,18 @@
 //! Credential profile management and account selectors for the host editor and sign-in.
 
-use egui::{RichText, Ui};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::{
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement,
+    Styled, Window, div, prelude::FluentBuilder as _, px,
+};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::{
-    theme::{self, Palette, size},
-    widgets,
-};
-use crate::store::{
-    credentials::{CredentialProfile, CredentialStore},
-    profiles::HostProfile,
-};
+use super::theme::{Palette, size};
+use super::widgets;
+use crate::store::credentials::{CredentialProfile, CredentialStore};
+use crate::store::profiles::HostProfile;
 
 pub enum Action {
     Save {
@@ -23,24 +24,67 @@ pub enum Action {
 
 pub struct Draft {
     pub profile: CredentialProfile,
-    pub password: Zeroizing<String>,
-    pub is_new: bool,
+    pub name_input: Entity<InputState>,
+    pub user_input: Entity<InputState>,
+    pub domain_input: Entity<InputState>,
+    pub password_input: Entity<InputState>,
 }
 
 impl Draft {
-    fn new(profile: CredentialProfile, is_new: bool) -> Self {
+    pub fn new(profile: CredentialProfile, is_new: bool, window: &mut Window, cx: &mut App) -> Self {
+        let name_val = profile.name.clone();
+        let user_val = profile.username.clone();
+        let domain_val = profile.domain.clone();
+        let pw_placeholder = if is_new {
+            "Optional — asked when you connect"
+        } else {
+            "Leave blank to keep saved password"
+        };
+
+        let name_input = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("Office account");
+            s.set_value(name_val, window, cx);
+            s
+        });
+        let user_input = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("jdoe or CORP\\jdoe");
+            s.set_value(user_val, window, cx);
+            s
+        });
+        let domain_input = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("Optional");
+            s.set_value(domain_val, window, cx);
+            s
+        });
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(pw_placeholder)
+                .masked(true)
+        });
+
         Self {
             profile,
-            password: Zeroizing::new(String::new()),
-            is_new,
+            name_input,
+            user_input,
+            domain_input,
+            password_input,
         }
+    }
+
+    pub fn collect(&mut self, cx: &App) -> (CredentialProfile, Option<Zeroizing<String>>) {
+        self.profile.name = self.name_input.read(cx).value().to_string();
+        self.profile.username = self.user_input.read(cx).value().to_string();
+        self.profile.domain = self.domain_input.read(cx).value().to_string();
+        let pw = self.password_input.read(cx).value().to_string();
+        let password = (!pw.is_empty()).then(|| Zeroizing::new(pw));
+        (self.profile.clone(), password)
     }
 }
 
 #[derive(Default)]
 pub struct Manager {
     pub draft: Option<Draft>,
-    deleting: Option<Uuid>,
+    pub deleting: Option<Uuid>,
     pub busy: bool,
     pub error: Option<String>,
 }
@@ -57,306 +101,335 @@ impl Manager {
             Err(error) => self.error = Some(format!("Couldn't save credential changes: {error}")),
         }
     }
-
-    pub fn show(
-        &mut self,
-        ui: &mut Ui,
-        store: &CredentialStore,
-        hosts: &[HostProfile],
-    ) -> Option<Action> {
-        let p = Palette::of(ui);
-        widgets::section_label(ui, "Credential profiles");
-        ui.label(
-            RichText::new(
-                "Reuse a sign-in across your hosts. Passwords stay in the system keyring.",
-            )
-            .size(size::SMALL)
-            .color(p.muted),
-        );
-        let mut action = None;
-        let mut cancel = false;
-        ui.add_enabled_ui(!self.busy, |ui| {
-            if let Some(draft) = &mut self.draft {
-                ui.add_space(6.0);
-                widgets::field(ui, "Profile name", &mut draft.profile.name, "Office account");
-                widgets::field(ui, "User name", &mut draft.profile.username, "jdoe or CORP\\jdoe");
-                widgets::field(ui, "Domain", &mut draft.profile.domain, "Optional");
-                ui.label(RichText::new("Password").size(size::SMALL).color(p.muted));
-                widgets::text_input(ui, &mut draft.password, if draft.is_new { "Optional — asked when you connect" } else { "Leave blank to keep saved password" }, true);
-                ui.horizontal(|ui| {
-                    if widgets::primary_button(ui, "Save").clicked() {
-                        match draft.profile.validate() {
-                            Ok(()) => action = Some(Action::Save {
-                                profile: draft.profile.clone(),
-                                password: (!draft.password.is_empty()).then(|| draft.password.clone()),
-                            }),
-                            Err(error) => self.error = Some(error.to_string()),
-                        }
-                    }
-                    if widgets::secondary_button(ui, "Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            } else if let Some(id) = self.deleting {
-                let name = store.get(id).map_or("this profile", |p| p.name.as_str());
-                let count = hosts.iter().filter(|h| h.credential_profile_id == Some(id)).count();
-                ui.label(RichText::new(format!("Delete {name}?")).font(theme::font_medium(size::BODY)));
-                ui.label(format!("{count} assigned host(s) will be unassigned and ask for credentials next time. Open sessions stay connected."));
-                ui.horizontal(|ui| {
-                    if widgets::danger_button(ui, "Delete profile").clicked() {
-                        action = Some(Action::Delete(id));
-                    }
-                    if widgets::secondary_button(ui, "Cancel").clicked() {
-                        self.deleting = None;
-                        self.error = None;
-                    }
-                });
-            } else {
-                if store.profiles().is_empty() {
-                    ui.label(RichText::new("No credential profiles yet.").color(p.muted));
-                }
-                for profile in store.profiles() {
-                    ui.push_id(profile.id, |ui| {
-                        let count = hosts.iter().filter(|h| h.credential_profile_id == Some(profile.id)).count();
-                        ui.label(RichText::new(&profile.name).font(theme::font_medium(size::BODY)));
-                        ui.label(RichText::new(format!("{} · {count} host(s)", profile.account_label())).size(size::SMALL).color(p.muted));
-                        ui.horizontal(|ui| {
-                            if widgets::secondary_button(ui, "Edit").clicked() {
-                                self.draft = Some(Draft::new(profile.clone(), false));
-                                self.error = None;
-                            }
-                            if widgets::secondary_button(ui, "Delete").clicked() {
-                                self.deleting = Some(profile.id);
-                                self.error = None;
-                            }
-                        });
-                        ui.add_space(6.0);
-                    });
-                }
-                if widgets::secondary_button(ui, "Add profile").clicked() {
-                    self.draft = Some(Draft::new(CredentialProfile::default(), true));
-                    self.error = None;
-                }
-            }
-        });
-        if cancel {
-            self.draft = None;
-            self.error = None;
-        }
-        if self.busy {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Saving credential changes…");
-            });
-        }
-        if let Some(error) = &self.error {
-            ui.label(RichText::new(error).color(p.poor));
-        }
-        action
-    }
 }
 
-/// Returns true when the assignment changes. A missing link stays visible until replaced.
-pub fn selector(ui: &mut Ui, selected: &mut Option<Uuid>, store: &CredentialStore) -> bool {
-    let before = *selected;
-    let label = match *selected {
-        None => "Manual",
+/// Renders the credential profile management UI inside the Passwords drawer.
+#[allow(clippy::too_many_arguments)]
+pub fn render_manager<V: 'static>(
+    manager: &Manager,
+    store: &CredentialStore,
+    hosts: &[HostProfile],
+    p: &Palette,
+    on_edit: impl Fn(CredentialProfile, bool, &mut Window, &mut App) + Clone + 'static,
+    on_save: impl Fn(&mut Window, &mut App) + Clone + 'static,
+    on_cancel: impl Fn(&mut Window, &mut App) + Clone + 'static,
+    on_confirm_delete: impl Fn(Uuid, &mut Window, &mut App) + Clone + 'static,
+    on_execute_delete: impl Fn(Uuid, &mut Window, &mut App) + Clone + 'static,
+    _cx: &mut Context<V>,
+) -> AnyElement {
+    let busy = manager.busy;
+    let mut root = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .w_full()
+        .child(widgets::section_label("Credential profiles", p))
+        .child(
+            div()
+                .text_size(size::SMALL)
+                .text_color(p.muted)
+                .child("Reuse a sign-in across your hosts. Passwords stay in the system keyring."),
+        );
+
+    if let Some(draft) = &manager.draft {
+        let on_save = on_save.clone();
+        let on_cancel = on_cancel.clone();
+        root = root
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .mt(px(6.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::field_label("Profile name", p))
+                            .child(Input::new(&draft.name_input).disabled(busy)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::field_label("User name", p))
+                            .child(Input::new(&draft.user_input).disabled(busy)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::field_label("Domain", p))
+                            .child(Input::new(&draft.domain_input).disabled(busy)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::field_label("Password", p))
+                            .child(Input::new(&draft.password_input).disabled(busy)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .mt(px(4.0))
+                            .child(widgets::primary_button(
+                                "cred-save",
+                                "Save",
+                                p,
+                                busy,
+                                move |_, window, cx| on_save(window, cx),
+                            ))
+                            .child(widgets::secondary_button(
+                                "cred-cancel",
+                                "Cancel",
+                                p,
+                                move |_, window, cx| {
+                                    if !busy {
+                                        on_cancel(window, cx);
+                                    }
+                                },
+                            )),
+                    ),
+            );
+    } else if let Some(id) = manager.deleting {
+        let name = store.get(id).map_or("this profile", |p| p.name.as_str());
+        let count = hosts
+            .iter()
+            .filter(|h| h.credential_profile_id == Some(id))
+            .count();
+        let on_execute = on_execute_delete.clone();
+        let on_cancel = on_cancel.clone();
+        root = root.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .mt(px(6.0))
+                .child(
+                    div()
+                        .text_size(size::BODY)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.text)
+                        .child(format!("Delete {name}?")),
+                )
+                .child(
+                    div()
+                        .text_size(size::BODY)
+                        .text_color(p.muted)
+                        .child(format!(
+                            "{count} assigned host(s) will be unassigned and ask for credentials next time. Open sessions stay connected."
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .mt(px(4.0))
+                        .child(widgets::danger_button(
+                            "cred-delete-confirm",
+                            "Delete profile",
+                            p,
+                            move |_, window, cx| {
+                                if !busy {
+                                    on_execute(id, window, cx);
+                                }
+                            },
+                        ))
+                        .child(widgets::secondary_button(
+                            "cred-delete-cancel",
+                            "Cancel",
+                            p,
+                            move |_, window, cx| {
+                                if !busy {
+                                    on_cancel(window, cx);
+                                }
+                            },
+                        )),
+                ),
+        );
+    } else {
+        if store.profiles().is_empty() {
+            root = root.child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(size::BODY)
+                    .text_color(p.muted)
+                    .child("No credential profiles yet."),
+            );
+        }
+        for profile in store.profiles() {
+            let count = hosts
+                .iter()
+                .filter(|h| h.credential_profile_id == Some(profile.id))
+                .count();
+            let prof_clone = profile.clone();
+            let id = profile.id;
+            let on_edit = on_edit.clone();
+            let on_confirm_delete = on_confirm_delete.clone();
+            root = root.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .py(px(8.0))
+                    .border_b_1()
+                    .border_color(p.hairline.opacity(0.6))
+                    .child(
+                        div()
+                            .text_size(size::BODY)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.text)
+                            .child(profile.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(size::SMALL)
+                            .text_color(p.muted)
+                            .child(format!("{} · {count} host(s)", profile.account_label())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .mt(px(4.0))
+                            .child(widgets::secondary_button(
+                                ("cred-edit", id.as_u128() as usize),
+                                "Edit",
+                                p,
+                                move |_, window, cx| {
+                                    if !busy {
+                                        on_edit(prof_clone.clone(), false, window, cx);
+                                    }
+                                },
+                            ))
+                            .child(widgets::secondary_button(
+                                ("cred-del", id.as_u128() as usize),
+                                "Delete",
+                                p,
+                                move |_, window, cx| {
+                                    if !busy {
+                                        on_confirm_delete(id, window, cx);
+                                    }
+                                },
+                            )),
+                    ),
+            );
+        }
+        let on_add = on_edit.clone();
+        root = root.child(div().mt(px(6.0)).child(widgets::secondary_button(
+            "cred-add",
+            "Add profile",
+            p,
+            move |_, window, cx| {
+                if !busy {
+                    on_add(CredentialProfile::default(), true, window, cx);
+                }
+            },
+        )));
+    }
+
+    root.when(busy, |el| {
+        el.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .mt(px(6.0))
+                .child(Spinner::new())
+                .child(
+                    div()
+                        .text_size(size::BODY)
+                        .text_color(p.muted)
+                        .child("Saving credential changes…"),
+                ),
+        )
+    })
+    .when_some(manager.error.as_ref(), |el, error| {
+        el.child(
+            div()
+                .mt(px(4.0))
+                .text_size(size::BODY)
+                .text_color(p.poor)
+                .child(error.clone()),
+        )
+    })
+    .into_any_element()
+}
+
+/// Credential profile dropdown selector shared by the Host Editor and Sign-in Dialog.
+pub fn selector(
+    id: impl Into<gpui_kit::ElementId>,
+    selected: Option<Uuid>,
+    store: &CredentialStore,
+    p: &Palette,
+    on_select: impl Fn(Option<Uuid>, &mut Window, &mut App) + Clone + 'static,
+) -> AnyElement {
+    let label = match selected {
+        None => "Manual".to_owned(),
         Some(id) => store
             .get(id)
-            .map_or("Missing credential profile", |p| p.name.as_str()),
+            .map_or("Missing credential profile", |prof| prof.name.as_str())
+            .to_owned(),
     };
-    ui.label(
-        RichText::new("Credentials")
-            .size(size::SMALL)
-            .color(Palette::of(ui).muted),
-    );
-    egui::ComboBox::from_id_salt("credential-profile")
-        .width(ui.available_width())
-        .selected_text(label)
-        .show_ui(ui, |ui| {
-            ui.selectable_value(selected, None, "Manual");
-            for profile in store.profiles() {
-                ui.selectable_value(selected, Some(profile.id), &profile.name);
-            }
-        });
-    before != *selected
-}
+    let profiles: Vec<(Uuid, String)> = store
+        .profiles()
+        .iter()
+        .map(|prof| (prof.id, prof.name.clone()))
+        .collect();
+    let palette = *p;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use egui::{Context, Event, Modifiers, PointerButton, Pos2, Rect, vec2};
-
-    struct Harness {
-        ctx: Context,
-        manager: Manager,
-        store: CredentialStore,
-        hosts: Vec<HostProfile>,
-        selected: Option<Uuid>,
-        selector: bool,
-        shapes: Vec<egui::epaint::ClippedShape>,
-    }
-
-    impl Harness {
-        fn new() -> Self {
-            let ctx = Context::default();
-            theme::install_fonts(&ctx);
-            Self {
-                ctx,
-                manager: Manager::default(),
-                store: CredentialStore::default(),
-                hosts: vec![],
-                selected: None,
-                selector: false,
-                shapes: vec![],
-            }
-        }
-
-        fn frame(&mut self, events: Vec<Event>) -> Option<Action> {
-            let mut action = None;
-            let mut output = self.ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(488.0, 800.0))),
-                    events,
-                    ..Default::default()
-                },
-                |root| {
-                    theme::apply(root.ctx(), &theme::DARK, true);
-                    egui::CentralPanel::default().show(root, |ui| {
-                        if self.selector {
-                            selector(ui, &mut self.selected, &self.store);
-                        } else {
-                            action = self.manager.show(ui, &self.store, &self.hosts);
-                        }
-                    });
-                },
-            );
-            output.textures_delta.clear();
-            self.shapes = output.shapes;
-            action
-        }
-
-        fn text(&self, label: &str) -> Pos2 {
-            self.shapes
-                .iter()
-                .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.text() == label => {
-                        Some(text.pos + text.galley.size() / 2.0)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("missing label: {label}"))
-        }
-
-        fn click(&mut self, label: &str) -> Option<Action> {
-            self.frame(vec![]);
-            let pos = self.text(label);
-            self.frame(vec![Event::PointerMoved(pos)]);
-            self.frame(vec![Event::PointerButton {
-                pos,
-                button: PointerButton::Primary,
-                pressed: true,
-                modifiers: Modifiers::NONE,
-            }]);
-            self.frame(vec![Event::PointerButton {
-                pos,
-                button: PointerButton::Primary,
-                pressed: false,
-                modifiers: Modifiers::NONE,
-            }])
-        }
-    }
-
-    #[test]
-    fn manager_adds_edits_confirms_deletion_and_keeps_failed_drafts() {
-        let mut h = Harness::new();
-        h.click("Add profile");
-        assert!(h.manager.draft.is_some());
-        assert!(h.click("Save").is_none());
-        assert!(h.manager.error.is_some());
-        let draft = h.manager.draft.as_mut().unwrap();
-        draft.profile.name = "Office".into();
-        draft.profile.username = "alice".into();
-        *draft.password = "private-secret".into();
-        let id = draft.profile.id;
-        assert!(matches!(
-            h.click("Save"),
-            Some(Action::Save {
-                password: Some(_),
-                ..
-            })
-        ));
-        assert!(
-            h.store.profiles().is_empty(),
-            "UI submission must wait for acknowledgement"
-        );
-        h.manager.busy = true;
-        h.manager.finish(Err(anyhow::anyhow!("keyring locked")));
-        assert_eq!(
-            &**h.manager.draft.as_ref().unwrap().password,
-            "private-secret"
-        );
-        assert!(
-            h.manager
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("keyring locked")
-        );
-        let Some(Action::Save { profile, .. }) = h.click("Save") else {
-            panic!("retry should submit")
-        };
-        h.store.upsert(profile).unwrap();
-        h.manager.finish(Ok(()));
-        assert!(h.manager.draft.is_none());
-        let mut host = HostProfile::new("a", 3389);
-        host.credential_profile_id = Some(id);
-        h.hosts = vec![host.clone(), host];
-        h.frame(vec![]);
-        h.text("alice · 2 host(s)");
-        h.click("Edit");
-        assert!(!h.manager.draft.as_ref().unwrap().is_new);
-        assert!(h.manager.draft.as_ref().unwrap().password.is_empty());
-        assert!(matches!(
-            h.click("Save"),
-            Some(Action::Save { password: None, .. })
-        ));
-        h.manager.finish(Ok(()));
-        h.click("Delete");
-        assert_eq!(h.manager.deleting, Some(id));
-        h.frame(vec![]);
-        assert!(h.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().starts_with("2 assigned host(s)"))));
-        h.click("Cancel");
-        assert!(h.store.get(id).is_some());
-        h.click("Delete");
-        assert!(
-            matches!(h.click("Delete profile"), Some(Action::Delete(deleted)) if deleted == id)
-        );
-    }
-
-    #[test]
-    fn selector_assigns_profiles_and_returns_to_manual() {
-        let mut h = Harness::new();
-        let profile = CredentialProfile {
-            name: "Office".into(),
-            username: "alice".into(),
-            ..Default::default()
-        };
-        let id = profile.id;
-        h.store.upsert(profile).unwrap();
-        h.selector = true;
-        h.click("Manual");
-        h.click("Office");
-        assert_eq!(h.selected, Some(id));
-        h.click("Office");
-        h.click("Manual");
-        assert_eq!(h.selected, None);
-        h.selected = Some(Uuid::new_v4());
-        h.frame(vec![]);
-        h.text("Missing credential profile");
-        assert!(
-            h.selected.is_some(),
-            "a missing reference must not silently become Manual"
-        );
-    }
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(widgets::field_label("Credentials", p))
+        .child(widgets::dropdown_select(
+            id,
+            label,
+            p,
+            move |state, _window, cx| {
+                let state_entity = cx.entity().clone();
+                let mut list = div().flex().flex_col().gap(px(2.0)).w_full();
+                let on_manual = on_select.clone();
+                let se = state_entity.clone();
+                list = list.child(widgets::menu_item(
+                    "cred-opt-manual",
+                    "Manual",
+                    None,
+                    selected.is_none(),
+                    false,
+                    &palette,
+                    move |_, window, cx| {
+                        on_manual(None, window, cx);
+                        se.update(cx, |s, cx| s.dismiss(window, cx));
+                    },
+                ));
+                for (pid, pname) in &profiles {
+                    let pid = *pid;
+                    let on_pick = on_select.clone();
+                    let se = state_entity.clone();
+                    list = list.child(widgets::menu_item(
+                        ("cred-opt", pid.as_u128() as usize),
+                        pname.clone(),
+                        None,
+                        selected == Some(pid),
+                        false,
+                        &palette,
+                        move |_, window, cx| {
+                            on_pick(Some(pid), window, cx);
+                            se.update(cx, |s, cx| s.dismiss(window, cx));
+                        },
+                    ));
+                }
+                let _ = state;
+                list
+            },
+        ))
+        .into_any_element()
 }

@@ -1,12 +1,20 @@
 //! The host editor: a drawer on the right of the host library.
 
-use egui::{Align, Color32, CornerRadius, Layout, RichText, Stroke, Ui, vec2};
-use egui_phosphor::regular as icon;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::{
+    Anchor, AnyElement, App, AppContext as _, Context, Entity, Focusable as _, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, div, prelude::FluentBuilder as _, px, transparent_black,
+};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::RelayApp;
+use super::assets::{icon_svg, icons};
 use super::credentials as credential_ui;
-use super::theme::{self, Palette, radius, size};
+use super::theme::{FONT_MONO, Palette, radius, size};
 use super::widgets;
 use crate::store::credentials::CredentialStore;
 use crate::store::profiles::{
@@ -20,19 +28,8 @@ pub enum PasswordChange {
     Forget,
 }
 
-pub enum Action {
-    Cancel,
-    /// Open a folder chooser; the result arrives through `EditorState::add_shared_folder`.
-    PickFolder,
-    Save {
-        profile: HostProfile,
-        password: PasswordChange,
-        connect: bool,
-    },
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Section {
+pub enum Section {
     Connection,
     Display,
     Experience,
@@ -60,43 +57,181 @@ impl Section {
     }
 }
 
+pub struct SharedFolderInputs {
+    pub name: Entity<InputState>,
+    pub path: Entity<InputState>,
+}
+
 pub struct EditorState {
-    draft: HostProfile,
-    is_new: bool,
-    port_text: String,
-    password: Zeroizing<String>,
+    pub draft: HostProfile,
+    pub is_new: bool,
     /// The user asked to forget the stored password.
-    forget_password: bool,
-    section: Section,
-    error: Option<String>,
-    pick_folder: bool,
-    focus_first: bool,
+    pub forget_password: bool,
+    pub section: Section,
+    pub error: Option<String>,
+
+    pub address_input: Entity<InputState>,
+    pub name_input: Entity<InputState>,
+    pub port_input: Entity<InputState>,
+    pub username_input: Entity<InputState>,
+    pub domain_input: Entity<InputState>,
+    pub password_input: Entity<InputState>,
+    pub group_input: Entity<InputState>,
+    pub fixed_width_input: Entity<InputState>,
+    pub fixed_height_input: Entity<InputState>,
+    pub load_balance_input: Entity<InputState>,
+    pub folder_inputs: Vec<SharedFolderInputs>,
+    _subs: Vec<Subscription>,
 }
 
 impl EditorState {
-    pub fn new(profile: HostProfile) -> Self {
-        Self::build(profile, true)
+    pub fn new(profile: HostProfile, window: &mut Window, cx: &mut Context<RelayApp>) -> Self {
+        Self::build(profile, true, window, cx)
     }
 
-    pub fn edit(profile: HostProfile) -> Self {
-        Self::build(profile, false)
+    pub fn edit(profile: HostProfile, window: &mut Window, cx: &mut Context<RelayApp>) -> Self {
+        Self::build(profile, false, window, cx)
     }
 
-    fn build(profile: HostProfile, is_new: bool) -> Self {
+    fn build(
+        profile: HostProfile,
+        is_new: bool,
+        window: &mut Window,
+        cx: &mut Context<RelayApp>,
+    ) -> Self {
+        let make_input = |val: String, placeholder: &'static str, masked: bool, window: &mut Window, cx: &mut Context<RelayApp>| {
+            cx.new(|cx| {
+                let mut s = InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .masked(masked);
+                if !val.is_empty() {
+                    s.set_value(val, window, cx);
+                }
+                s
+            })
+        };
+
+        let address_input = make_input(
+            profile.address.clone(),
+            "dc01.corp.example.com or 10.0.0.5",
+            false,
+            window,
+            cx,
+        );
+        let name_input = make_input(
+            profile.name.clone(),
+            "Shown in your host list",
+            false,
+            window,
+            cx,
+        );
+        let port_input = make_input(profile.port.to_string(), "3389", false, window, cx);
+        let username_input = make_input(profile.username.clone(), "jdoe", false, window, cx);
+        let domain_input = make_input(profile.domain.clone(), "Optional", false, window, cx);
+        let had_saved = profile.save_password && !is_new;
+        let pw_hint = if had_saved {
+            "Saved in your keyring — type to replace"
+        } else {
+            "Asked when you connect"
+        };
+        let password_input = make_input(String::new(), pw_hint, true, window, cx);
+        let group_input = make_input(
+            profile.group.clone(),
+            "e.g. Office, Plant, Lab",
+            false,
+            window,
+            cx,
+        );
+        let fixed_width_input = make_input(
+            profile.display.fixed_width.to_string(),
+            "1920",
+            false,
+            window,
+            cx,
+        );
+        let fixed_height_input = make_input(
+            profile.display.fixed_height.to_string(),
+            "1080",
+            false,
+            window,
+            cx,
+        );
+        let load_balance_input = make_input(
+            profile.advanced.load_balance_info.clone(),
+            "From the .rdp file of an RDS farm (loadbalanceinfo)",
+            false,
+            window,
+            cx,
+        );
+
+        let folder_inputs = profile
+            .devices
+            .shared_folders
+            .iter()
+            .map(|f| SharedFolderInputs {
+                name: make_input(f.name.clone(), "Drive name", false, window, cx),
+                path: make_input(
+                    f.path.to_string_lossy().into_owned(),
+                    "/home/you/Shared",
+                    false,
+                    window,
+                    cx,
+                ),
+            })
+            .collect();
+
+        address_input.update(cx, |s, cx| s.focus(window, cx));
+
+        let mut subs = Vec::new();
+        for inp in [
+            &address_input,
+            &name_input,
+            &port_input,
+            &username_input,
+            &domain_input,
+            &password_input,
+            &group_input,
+            &fixed_width_input,
+            &fixed_height_input,
+            &load_balance_input,
+        ] {
+            subs.push(cx.subscribe_in(inp, window, |this, _, event, _, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(editor) = &mut this.editor
+                {
+                    editor.error = None;
+                    cx.notify();
+                }
+            }));
+        }
+
         Self {
-            port_text: profile.port.to_string(),
             draft: profile,
             is_new,
-            password: Zeroizing::new(String::new()),
             forget_password: false,
             section: Section::Connection,
             error: None,
-            pick_folder: false,
-            focus_first: true,
+            address_input,
+            name_input,
+            port_input,
+            username_input,
+            domain_input,
+            password_input,
+            group_input,
+            fixed_width_input,
+            fixed_height_input,
+            load_balance_input,
+            folder_inputs,
+            _subs: subs,
         }
     }
 
-    pub fn add_shared_folder(&mut self, path: std::path::PathBuf) {
+    pub fn add_shared_folder(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<RelayApp>,
+    ) {
         let name = path
             .file_name()
             .map_or_else(|| "Shared".to_owned(), |n| n.to_string_lossy().into_owned());
@@ -107,29 +242,81 @@ impl EditorState {
             .iter()
             .any(|f| f.path == path)
         {
+            let name_input = cx.new(|cx| {
+                let mut s = InputState::new(window, cx).placeholder("Drive name");
+                s.set_value(name.clone(), window, cx);
+                s
+            });
+            let path_str = path.to_string_lossy().into_owned();
+            let path_input = cx.new(|cx| {
+                let mut s = InputState::new(window, cx).placeholder("/home/you/Shared");
+                s.set_value(path_str, window, cx);
+                s
+            });
             self.draft
                 .devices
                 .shared_folders
                 .push(SharedFolder { name, path });
+            self.folder_inputs.push(SharedFolderInputs {
+                name: name_input,
+                path: path_input,
+            });
         }
         self.section = Section::Devices;
+    }
+
+    pub fn remove_shared_folder(&mut self, index: usize) {
+        if index < self.draft.devices.shared_folders.len() {
+            self.draft.devices.shared_folders.remove(index);
+            self.folder_inputs.remove(index);
+        }
     }
 
     pub fn profile_id(&self) -> Uuid {
         self.draft.id
     }
 
-    fn validate(&mut self) -> Option<HostProfile> {
+    pub fn set_group(&mut self, group: String, window: &mut Window, cx: &mut App) {
+        self.draft.group = group.clone();
+        self.group_input.update(cx, |s, cx| {
+            s.set_value(group, window, cx);
+        });
+    }
+
+    pub fn set_fixed_size(&mut self, w: u16, h: u16, window: &mut Window, cx: &mut App) {
+        self.draft.display.fixed_width = w;
+        self.draft.display.fixed_height = h;
+        self.fixed_width_input
+            .update(cx, |s, cx| s.set_value(w.to_string(), window, cx));
+        self.fixed_height_input
+            .update(cx, |s, cx| s.set_value(h.to_string(), window, cx));
+    }
+
+    pub fn validate(&mut self, cx: &App) -> Option<(HostProfile, PasswordChange)> {
         let mut profile = self.draft.clone();
-        profile.address = profile.address.trim().to_owned();
-        profile.name = profile.name.trim().to_owned();
-        profile.group = profile.group.trim().to_owned();
+        profile.address = self.address_input.read(cx).value().trim().to_owned();
+        profile.name = self.name_input.read(cx).value().trim().to_owned();
+        profile.group = self.group_input.read(cx).value().trim().to_owned();
+        profile.username = self.username_input.read(cx).value().to_string();
+        profile.domain = self.domain_input.read(cx).value().to_string();
+        profile.advanced.load_balance_info = self.load_balance_input.read(cx).value().to_string();
+
+        profile.devices.shared_folders = self
+            .folder_inputs
+            .iter()
+            .map(|fi| SharedFolder {
+                name: fi.name.read(cx).value().to_string(),
+                path: fi.path.read(cx).value().to_string().into(),
+            })
+            .collect();
+
         if profile.address.is_empty() {
             self.error = Some("Enter the computer's address.".to_owned());
             self.section = Section::Connection;
             return None;
         }
-        match self.port_text.trim().parse::<u16>() {
+        let port_str = self.port_input.read(cx).value();
+        match port_str.trim().parse::<u16>() {
             Ok(port) if port > 0 => profile.port = port,
             _ => {
                 self.error = Some("The port must be a number from 1 to 65535.".to_owned());
@@ -140,376 +327,554 @@ impl EditorState {
         if profile.name.is_empty() {
             profile.name = profile.address.clone();
         }
-        if profile.display.resolution == ResolutionMode::Fixed
-            && (profile.display.fixed_width < 200 || profile.display.fixed_height < 200)
-        {
-            self.error = Some("A fixed resolution must be at least 200 × 200.".to_owned());
-            self.section = Section::Display;
-            return None;
+        if profile.display.resolution == ResolutionMode::Fixed {
+            let w = self
+                .fixed_width_input
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u16>()
+                .unwrap_or(0);
+            let h = self
+                .fixed_height_input
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u16>()
+                .unwrap_or(0);
+            if !(200..=8192).contains(&w) || !(200..=8192).contains(&h) {
+                self.error = Some("A fixed resolution must be between 200 × 200 and 8192 × 8192.".to_owned());
+                self.section = Section::Display;
+                return None;
+            }
+            profile.display.fixed_width = w;
+            profile.display.fixed_height = h;
         }
-        Some(profile)
-    }
 
-    fn password_change(&self) -> PasswordChange {
-        if self.draft.credential_profile_id.is_some() {
-            return PasswordChange::Keep;
-        }
-        if self.draft.save_password && !self.password.is_empty() {
-            PasswordChange::Set(self.password.clone())
+        let pw_text = self.password_input.read(cx).value().to_string();
+        let pw_change = if profile.credential_profile_id.is_some() {
+            PasswordChange::Keep
+        } else if profile.save_password && !pw_text.is_empty() {
+            PasswordChange::Set(Zeroizing::new(pw_text))
         } else if self.forget_password {
             PasswordChange::Forget
         } else {
             PasswordChange::Keep
-        }
+        };
+
+        Some((profile, pw_change))
     }
 
-    pub fn unassign_credentials(&mut self, id: Uuid) {
+    pub fn unassign_credentials(&mut self, id: Uuid, window: &mut Window, cx: &mut App) {
         if self.draft.credential_profile_id == Some(id) {
             self.draft.credential_profile_id = None;
             self.draft.save_password = false;
-            self.password.clear();
+            self.password_input
+                .update(cx, |s, cx| s.set_value("", window, cx));
         }
+    }
+
+    pub fn any_input_focused(&self, window: &Window, cx: &App) -> bool {
+        [
+            &self.address_input,
+            &self.name_input,
+            &self.port_input,
+            &self.username_input,
+            &self.domain_input,
+            &self.password_input,
+            &self.group_input,
+            &self.fixed_width_input,
+            &self.fixed_height_input,
+            &self.load_balance_input,
+        ]
+        .into_iter()
+        .any(|i| i.read(cx).focus_handle(cx).is_focused(window))
+            || self.folder_inputs.iter().any(|fi| {
+                fi.name.read(cx).focus_handle(cx).is_focused(window)
+                    || fi.path.read(cx).focus_handle(cx).is_focused(window)
+            })
     }
 }
 
-/// Outer width, including the frame's margins.
+/// Outer width of the editor drawer.
 pub const DRAWER_WIDTH: f32 = 468.0;
 
-pub fn show(
-    ui: &mut Ui,
-    state: &mut EditorState,
+pub fn render_editor(
+    state: &EditorState,
     profiles: &ProfileStore,
     credentials: &CredentialStore,
-) -> Vec<Action> {
-    let mut actions = Vec::new();
-    let p = Palette::of(ui);
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let title = if state.is_new {
+        "New host"
+    } else {
+        "Edit host"
+    };
 
-    egui::Panel::right("host-editor")
-        .exact_size(DRAWER_WIDTH)
-        .resizable(false)
-        .show_separator_line(false)
-        .frame(
-            egui::Frame::new()
-                .fill(p.surface)
-                .stroke(Stroke::new(1.0, p.hairline))
-                .inner_margin(egui::Margin::symmetric(24, 20)),
-        )
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let title = if state.is_new {
-                    "New host"
-                } else {
-                    "Edit host"
-                };
-                ui.label(RichText::new(title).font(theme::font_semibold(size::SUBHEAD)));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::icon_button(ui, icon::X, "Close").clicked() {
-                        actions.push(Action::Cancel);
-                    }
-                });
-            });
-            ui.add_space(12.0);
-            section_tabs(ui, &mut state.section);
-            ui.add_space(14.0);
-
-            let footer_height = 64.0;
-            let body_height = (ui.available_height() - footer_height).max(100.0);
-            egui::ScrollArea::vertical()
-                .max_height(body_height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| match state.section {
-                    Section::Connection => connection(ui, state, profiles, credentials),
-                    Section::Display => display(ui, state),
-                    Section::Experience => experience(ui, state),
-                    Section::Devices => devices(ui, state),
-                    Section::Advanced => advanced(ui, state),
-                });
-
-            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if widgets::primary_button(ui, "Save and connect").clicked()
-                            && let Some(profile) = state.validate()
-                        {
-                            let password = state.password_change();
-                            actions.push(Action::Save {
-                                profile,
-                                password,
-                                connect: true,
-                            });
-                        }
-                        if widgets::secondary_button(ui, "Save").clicked()
-                            && let Some(profile) = state.validate()
-                        {
-                            let password = state.password_change();
-                            actions.push(Action::Save {
-                                profile,
-                                password,
-                                connect: false,
-                            });
-                        }
-                    });
-                });
-                if let Some(error) = &state.error {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(error).color(p.poor));
-                }
-            });
-        });
-
-    if std::mem::take(&mut state.pick_folder) {
-        actions.push(Action::PickFolder);
-    }
-    if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ui.ctx().egui_wants_keyboard_input() {
-        actions.push(Action::Cancel);
-    }
-    actions
-}
-
-fn section_tabs(ui: &mut Ui, current: &mut Section) {
-    let p = Palette::of(ui);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        ui.spacing_mut().button_padding = vec2(9.0, 5.0);
-        for section in Section::ALL {
-            let selected = *current == section;
-            let text = RichText::new(section.label())
-                .font(theme::font_medium(size::SMALL + 1.0))
-                .color(if selected { p.text } else { p.muted });
-            let button = egui::Button::new(text)
-                .fill(if selected {
+    let tabs = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(2.0))
+        .children(Section::ALL.into_iter().map(|section| {
+            let selected = state.section == section;
+            let hover = p.hover;
+            div()
+                .id(SharedString::from(format!("editor-tab-{}", section.label())))
+                .flex()
+                .items_center()
+                .h(px(28.0))
+                .px(px(9.0))
+                .rounded(radius::CONTROL)
+                .bg(if selected {
                     p.raised
                 } else {
-                    Color32::TRANSPARENT
+                    transparent_black()
                 })
-                .stroke(Stroke::NONE)
-                .corner_radius(CornerRadius::same(radius::CONTROL))
-                .min_size(vec2(0.0, 28.0));
-            if ui.add(button).clicked() {
-                *current = section;
-            }
-        }
-    });
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if selected { p.text } else { p.muted })
+                .cursor_pointer()
+                .when(!selected, |el| el.hover(move |s| s.bg(hover)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(ed) = &mut this.editor {
+                        ed.section = section;
+                        cx.notify();
+                    }
+                }))
+                .child(section.label())
+        }));
+
+    let body = match state.section {
+        Section::Connection => render_connection(state, profiles, credentials, p, cx),
+        Section::Display => render_display(state, p, cx),
+        Section::Experience => render_experience(state, p, cx),
+        Section::Devices => render_devices(state, p, cx),
+        Section::Advanced => render_advanced(state, p, cx),
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .w(px(DRAWER_WIDTH))
+        .h_full()
+        .flex_shrink_0()
+        .px(px(24.0))
+        .py(px(20.0))
+        .bg(p.surface)
+        .border_l_1()
+        .border_color(p.hairline)
+        // Header
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .mb(px(12.0))
+                .child(
+                    div()
+                        .text_size(size::SUBHEAD)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.text)
+                        .child(title),
+                )
+                .child(widgets::icon_button(
+                    "editor-close",
+                    icons::X,
+                    "Close",
+                    p,
+                    cx.listener(|this, _, _, cx| {
+                        this.editor = None;
+                        cx.notify();
+                    }),
+                )),
+        )
+        // Section tabs
+        .child(div().mb(px(14.0)).child(tabs))
+        // Scrollable body
+        .child(
+            div()
+                .id("editor-body-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .child(div().pr(px(8.0)).pb(px(16.0)).child(body)),
+        )
+        // Footer
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .pt(px(12.0))
+                .border_t_1()
+                .border_color(p.hairline.opacity(0.6))
+                .when_some(state.error.as_ref(), |el, err| {
+                    el.child(
+                        div()
+                            .text_size(size::BODY)
+                            .text_color(p.poor)
+                            .child(err.clone()),
+                    )
+                })
+                .child(
+                    widgets::button_row()
+                        .child(widgets::secondary_button(
+                            "editor-save",
+                            "Save",
+                            p,
+                            cx.listener(|this, _, window, cx| {
+                                this.save_editor(false, window, cx);
+                            }),
+                        ))
+                        .child(widgets::primary_button(
+                            "editor-save-connect",
+                            "Save and connect",
+                            p,
+                            false,
+                            cx.listener(|this, _, window, cx| {
+                                this.save_editor(true, window, cx);
+                            }),
+                        )),
+                ),
+        )
+        .into_any_element()
 }
 
-fn connection(
-    ui: &mut Ui,
-    state: &mut EditorState,
+fn render_connection(
+    state: &EditorState,
     profiles: &ProfileStore,
     credentials: &CredentialStore,
-) {
-    let p = Palette::of(ui);
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let entity = cx.entity().clone();
+    let palette = *p;
 
-    let address = widgets::field(
-        ui,
-        "Address",
-        &mut state.draft.address,
-        "dc01.corp.example.com or 10.0.0.5",
-    );
-    if state.focus_first {
-        state.focus_first = false;
-        address.request_focus();
-    }
-    ui.add_space(6.0);
-
-    pair(
-        ui,
-        0.72,
-        |ui| {
-            widgets::field(ui, "Name", &mut state.draft.name, "Shown in your host list");
-        },
-        |ui| {
-            widgets::field(ui, "Port", &mut state.port_text, "3389");
-        },
-    );
-    ui.add_space(14.0);
-    widgets::section_label(ui, "Sign-in");
-    ui.add_space(2.0);
-    if credential_ui::selector(ui, &mut state.draft.credential_profile_id, credentials) {
-        state.password.clear();
-    }
-    ui.add_space(6.0);
-    if let Some(id) = state.draft.credential_profile_id {
-        if let Some(profile) = credentials.get(id) {
-            ui.label(profile.account_label());
-            ui.label(
-                RichText::new("Manage this account in Passwords in the sidebar.")
-                    .size(size::SMALL)
-                    .color(p.muted),
-            );
-        } else {
-            ui.colored_label(
-                p.poor,
-                "This profile is missing. Choose another profile or Manual.",
-            );
-        }
-    } else {
-        pair(
-            ui,
-            0.5,
-            |ui| {
-                widgets::field(ui, "User name", &mut state.draft.username, "jdoe");
-            },
-            |ui| {
-                widgets::field(ui, "Domain", &mut state.draft.domain, "Optional");
-            },
-        );
-        ui.add_space(6.0);
-
-        let had_saved = state.draft.save_password && !state.is_new && !state.forget_password;
-        ui.label(RichText::new("Password").size(size::SMALL).color(p.muted));
-        let hint = if had_saved {
-            "Saved in your keyring — type to replace"
-        } else {
-            "Asked when you connect"
-        };
-        widgets::text_input(ui, &mut state.password, hint, true);
-        ui.add_space(4.0);
-        widgets::setting_row(
-            ui,
-            "Remember password",
-            Some("Stored in the system keyring, never in a file."),
-            |ui| {
-                let before = state.draft.save_password;
-                widgets::toggle(ui, &mut state.draft.save_password);
-                if before && !state.draft.save_password {
-                    state.forget_password = true;
-                }
-                if !before && state.draft.save_password {
-                    state.forget_password = false;
-                }
-            },
-        );
-    }
-
-    ui.add_space(14.0);
-    widgets::section_label(ui, "Organize");
-    ui.add_space(2.0);
-    ui.label(RichText::new("Group").size(size::SMALL).color(p.muted));
-    ui.horizontal(|ui| {
-        let groups = profiles.groups();
-        let width = if groups.is_empty() {
-            ui.available_width()
-        } else {
-            ui.available_width() - 38.0
-        };
-        ui.add_sized(
-            vec2(width, 34.0),
-            egui::TextEdit::singleline(&mut state.draft.group)
-                .hint_text(RichText::new("e.g. Office, Plant, Lab").color(p.muted))
-                .margin(egui::Margin::symmetric(10, 8)),
-        );
-        if !groups.is_empty() {
-            let pick = widgets::icon_button(ui, icon::CARET_DOWN, "Existing groups");
-            egui::Popup::menu(&pick).show(|ui| {
-                for group in groups {
-                    if ui.button(&group).clicked() {
-                        state.draft.group = group;
-                    }
+    let e_cred = entity.clone();
+    let cred_selector = credential_ui::selector(
+        "editor-cred-select",
+        state.draft.credential_profile_id,
+        credentials,
+        p,
+        move |selected, window, cx| {
+            e_cred.update(cx, |app, cx| {
+                if let Some(ed) = &mut app.editor {
+                    ed.draft.credential_profile_id = selected;
+                    ed.password_input
+                        .update(cx, |s, cx| s.set_value("", window, cx));
+                    cx.notify();
                 }
             });
-        }
-    });
-    ui.add_space(8.0);
-    widgets::setting_row(ui, "Favorite", None, |ui| {
-        widgets::toggle(ui, &mut state.draft.favorite);
-    });
-
-    ui.add_space(10.0);
-    ui.label(
-        RichText::new("Operating system")
-            .size(size::SMALL)
-            .color(p.muted),
+        },
     );
-    // Automatic shows what Relay detected when it last connected.
+
+    let sign_in_fields: AnyElement = if let Some(id) = state.draft.credential_profile_id {
+        if let Some(prof) = credentials.get(id) {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(size::BODY)
+                        .text_color(p.text)
+                        .child(prof.account_label()),
+                )
+                .child(
+                    div()
+                        .text_size(size::SMALL)
+                        .text_color(p.muted)
+                        .child("Manage this account in Passwords in the sidebar."),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .text_size(size::BODY)
+                .text_color(p.poor)
+                .child("This profile is missing. Choose another profile or Manual.")
+                .into_any_element()
+        }
+    } else {
+        let e_rem = entity.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(widgets::field_label("User name", p))
+                            .child(Input::new(&state.username_input)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(widgets::field_label("Domain", p))
+                            .child(Input::new(&state.domain_input)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(widgets::field_label("Password", p))
+                    .child(Input::new(&state.password_input)),
+            )
+            .child(widgets::setting_row(
+                "Remember password",
+                Some("Stored in the system keyring, never in a file."),
+                p,
+                widgets::toggle(
+                    "editor-remember-pw",
+                    state.draft.save_password,
+                    p,
+                    move |on, _, cx| {
+                        let on = *on;
+                        e_rem.update(cx, |app, cx| {
+                            if let Some(ed) = &mut app.editor {
+                                let before = ed.draft.save_password;
+                                ed.draft.save_password = on;
+                                if before && !on {
+                                    ed.forget_password = true;
+                                }
+                                if !before && on {
+                                    ed.forget_password = false;
+                                }
+                                cx.notify();
+                            }
+                        });
+                    },
+                ),
+            ))
+            .into_any_element()
+    };
+
+    let groups = profiles.groups();
+    let e_grp = entity.clone();
+    let group_row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .child(div().flex_1().min_w_0().child(Input::new(&state.group_input)))
+        .when(!groups.is_empty(), |el| {
+            let groups = groups.clone();
+            let raised = p.raised;
+            let surface = p.surface;
+            let hairline = p.hairline;
+            let muted = p.muted;
+            let shadow = p.popup_shadow();
+            el.child(
+                Popover::new("editor-groups-pop")
+                    .anchor(Anchor::TopRight)
+                    .appearance(false)
+                    .trigger(widgets::PopoverTrigger::new(
+                        "editor-groups-trigger",
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(34.0))
+                            .rounded(radius::CONTROL)
+                            .bg(raised)
+                            .border_1()
+                            .border_color(hairline)
+                            .cursor_pointer()
+                            .child(icon_svg(icons::CARET_DOWN, px(14.0), muted)),
+                    ))
+                    .content(move |_state, _window, cx| {
+                        let se = cx.entity().clone();
+                        let mut list = div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .min_w(px(160.0))
+                            .p(px(6.0))
+                            .rounded(radius::ROW)
+                            .bg(surface)
+                            .border_1()
+                            .border_color(hairline)
+                            .shadow(shadow.clone());
+                        for grp in &groups {
+                            let g = grp.clone();
+                            let e = e_grp.clone();
+                            let se = se.clone();
+                            list = list.child(widgets::menu_item(
+                                SharedString::from(format!("grp-pick-{g}")),
+                                g.clone(),
+                                None,
+                                false,
+                                false,
+                                &palette,
+                                move |_, window, cx| {
+                                    e.update(cx, |app, cx| {
+                                        if let Some(ed) = &mut app.editor {
+                                            ed.set_group(g.clone(), window, cx);
+                                            cx.notify();
+                                        }
+                                    });
+                                    se.update(cx, |s, cx| s.dismiss(window, cx));
+                                },
+                            ));
+                        }
+                        list
+                    }),
+            )
+        });
+
     let automatic = match state.draft.detected_os {
         Some(os) => format!("Automatic ({})", os.label()),
         None => "Automatic (not detected yet)".to_owned(),
     };
-    let label = |choice: OsChoice| match choice {
-        OsChoice::Automatic => automatic.clone(),
-        OsChoice::Windows => "Windows".to_owned(),
-        OsChoice::Linux => "Linux".to_owned(),
-        OsChoice::MacOs => "macOS".to_owned(),
+    let os_label = {
+        let automatic = automatic.clone();
+        move |choice: OsChoice| match choice {
+            OsChoice::Automatic => automatic.clone(),
+            OsChoice::Windows => "Windows".to_owned(),
+            OsChoice::Linux => "Linux".to_owned(),
+            OsChoice::MacOs => "macOS".to_owned(),
+        }
     };
-    egui::ComboBox::from_id_salt("os")
-        .width(ui.available_width())
-        .selected_text(label(state.draft.os))
-        .show_ui(ui, |ui| {
+    let cur_os = state.draft.os;
+    let e_os = entity.clone();
+    let os_dropdown = widgets::dropdown_select(
+        "editor-os-select",
+        os_label(cur_os),
+        p,
+        move |_state, _window, cx| {
+            let se = cx.entity().clone();
+            let mut list = div().flex().flex_col().gap(px(2.0)).w_full();
             for choice in [
                 OsChoice::Automatic,
                 OsChoice::Windows,
                 OsChoice::Linux,
                 OsChoice::MacOs,
             ] {
-                ui.selectable_value(&mut state.draft.os, choice, label(choice));
+                let lbl = os_label(choice);
+                let e = e_os.clone();
+                let se = se.clone();
+                list = list.child(widgets::menu_item(
+                    SharedString::from(format!("os-opt-{lbl}")),
+                    lbl,
+                    None,
+                    cur_os == choice,
+                    false,
+                    &palette,
+                    move |_, window, cx| {
+                        e.update(cx, |app, cx| {
+                            if let Some(ed) = &mut app.editor {
+                                ed.draft.os = choice;
+                                cx.notify();
+                            }
+                        });
+                        se.update(cx, |s, cx| s.dismiss(window, cx));
+                    },
+                ));
             }
-        });
+            list
+        },
+    );
+
+    let e_fav = entity.clone();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(widgets::field_label("Address", p))
+                .child(Input::new(&state.address_input)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(widgets::field_label("Name", p))
+                        .child(Input::new(&state.name_input)),
+                )
+                .child(
+                    div()
+                        .w(px(100.0))
+                        .child(widgets::field_label("Port", p))
+                        .child(Input::new(&state.port_input)),
+                ),
+        )
+        .child(div().mt(px(8.0)).child(widgets::section_label("Sign-in", p)))
+        .child(cred_selector)
+        .child(sign_in_fields)
+        .child(div().mt(px(8.0)).child(widgets::section_label("Organize", p)))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(widgets::field_label("Group", p))
+                .child(group_row),
+        )
+        .child(widgets::setting_row(
+            "Favorite",
+            None,
+            p,
+            widgets::toggle("editor-fav", state.draft.favorite, p, move |on, _, cx| {
+                let on = *on;
+                e_fav.update(cx, |app, cx| {
+                    if let Some(ed) = &mut app.editor {
+                        ed.draft.favorite = on;
+                        cx.notify();
+                    }
+                });
+            }),
+        ))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(widgets::field_label("Operating system", p))
+                .child(os_dropdown),
+        )
+        .into_any_element()
 }
 
-fn display(ui: &mut Ui, state: &mut EditorState) {
-    let p = Palette::of(ui);
-    let display = &mut state.draft.display;
+fn render_display(
+    state: &EditorState,
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let display = &state.draft.display;
+    let entity = cx.entity().clone();
+    let palette = *p;
 
-    widgets::section_label(ui, "Resolution");
-    ui.add_space(2.0);
-    choice_card(
-        ui,
-        display.resolution == ResolutionMode::MatchWindow,
-        "Match the window",
-        "The remote desktop resizes with this window, pixel for pixel.",
-    )
-    .then(|| display.resolution = ResolutionMode::MatchWindow);
-    choice_card(
-        ui,
-        display.resolution == ResolutionMode::Fixed,
-        "Fixed size",
-        "Always use one resolution, scaled down to fit when needed.",
-    )
-    .then(|| display.resolution = ResolutionMode::Fixed);
-
-    if display.resolution == ResolutionMode::Fixed {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::DragValue::new(&mut display.fixed_width)
-                    .range(200..=8192)
-                    .suffix(" px"),
-            );
-            ui.label(RichText::new("×").color(p.muted));
-            ui.add(
-                egui::DragValue::new(&mut display.fixed_height)
-                    .range(200..=8192)
-                    .suffix(" px"),
-            );
-            for (w, h) in [(1920, 1080), (2560, 1440), (1280, 800)] {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new(format!("{w}×{h}")).size(size::SMALL))
-                            .frame(false),
-                    )
-                    .clicked()
-                {
-                    display.fixed_width = w;
-                    display.fixed_height = h;
-                }
-            }
-        });
-    }
-
-    ui.add_space(14.0);
-    widgets::section_label(ui, "Scaling");
-    ui.add_space(2.0);
-    let current = display.scale_percent;
-    let label = |s: Option<u32>| match s {
+    let scale_label = |s: Option<u32>| match s {
         None => "Same as this display".to_owned(),
         Some(v) => format!("{v}%"),
     };
-    egui::ComboBox::from_id_salt("scale")
-        .width(ui.available_width())
-        .selected_text(label(current))
-        .show_ui(ui, |ui| {
-            for option in [
+    let cur_scale = display.scale_percent;
+    let e_scale = entity.clone();
+    let scale_dropdown = widgets::dropdown_select(
+        "editor-scale-select",
+        scale_label(cur_scale),
+        p,
+        move |_state, _window, cx| {
+            let se = cx.entity().clone();
+            let mut list = div().flex().flex_col().gap(px(2.0)).w_full();
+            for opt in [
                 None,
                 Some(100),
                 Some(125),
@@ -519,261 +884,548 @@ fn display(ui: &mut Ui, state: &mut EditorState) {
                 Some(250),
                 Some(300),
             ] {
-                ui.selectable_value(&mut display.scale_percent, option, label(option));
+                let lbl = scale_label(opt);
+                let e = e_scale.clone();
+                let se = se.clone();
+                list = list.child(widgets::menu_item(
+                    SharedString::from(format!("scale-opt-{lbl}")),
+                    lbl,
+                    None,
+                    cur_scale == opt,
+                    false,
+                    &palette,
+                    move |_, window, cx| {
+                        e.update(cx, |app, cx| {
+                            if let Some(ed) = &mut app.editor {
+                                ed.draft.display.scale_percent = opt;
+                                cx.notify();
+                            }
+                        });
+                        se.update(cx, |s, cx| s.dismiss(window, cx));
+                    },
+                ));
             }
-        });
-
-    ui.add_space(14.0);
-    widgets::setting_row(
-        ui,
-        "Start in fullscreen",
-        Some("Leave fullscreen with Ctrl+Alt+Enter."),
-        |ui| {
-            widgets::toggle(ui, &mut display.start_fullscreen);
+            list
         },
     );
-}
 
-fn experience(ui: &mut Ui, state: &mut EditorState) {
-    let p = Palette::of(ui);
-    let experience = &mut state.draft.experience;
-    widgets::section_label(ui, "Quality");
-    ui.add_space(2.0);
-    for quality in Quality::ALL {
-        if choice_card(
-            ui,
-            experience.quality == quality,
-            quality.label(),
-            quality.description(),
-        ) {
-            experience.quality = quality;
-            quality.apply_visuals(experience);
-        }
-    }
-    ui.label(
-        RichText::new("Also sets the options below. You can still change them.")
-            .size(size::SMALL)
-            .color(p.muted),
-    );
-    ui.add_space(14.0);
-    widgets::section_label(ui, "Graphics");
-    ui.add_space(2.0);
-    for mode in GraphicsMode::ALL {
-        if choice_card(
-            ui,
-            experience.graphics == mode,
-            mode.label(),
-            mode.description(),
-        ) {
-            experience.graphics = mode;
-        }
-    }
-    ui.add_space(14.0);
-    widgets::section_label(ui, "Remote desktop");
-    ui.add_space(2.0);
-    widgets::setting_row(
-        ui,
-        "Desktop wallpaper",
-        Some("Off saves bandwidth."),
-        |ui| {
-            widgets::toggle(ui, &mut experience.wallpaper);
-        },
-    );
-    ui.add_space(4.0);
-    widgets::setting_row(ui, "Window animations", None, |ui| {
-        widgets::toggle(ui, &mut experience.animations);
-    });
-    ui.add_space(4.0);
-    widgets::setting_row(
-        ui,
-        "Font smoothing",
-        Some("ClearType text on the remote computer."),
-        |ui| {
-            widgets::toggle(ui, &mut experience.font_smoothing);
-        },
-    );
-}
+    let e_fs = entity.clone();
 
-fn devices(ui: &mut Ui, state: &mut EditorState) {
-    let p = Palette::of(ui);
-    let devices = &mut state.draft.devices;
-
-    widgets::setting_row(
-        ui,
-        "Clipboard",
-        Some("Copy and paste text, images and files both ways."),
-        |ui| {
-            widgets::toggle(ui, &mut devices.clipboard);
-        },
-    );
-    ui.add_space(14.0);
-    widgets::section_label(ui, "Sound");
-    ui.add_space(2.0);
-    egui::ComboBox::from_id_salt("audio")
-        .width(ui.available_width())
-        .selected_text(devices.audio.label())
-        .show_ui(ui, |ui| {
-            for mode in AudioMode::ALL {
-                ui.selectable_value(&mut devices.audio, mode, mode.label());
-            }
-        });
-
-    ui.add_space(14.0);
-    widgets::section_label(ui, "Shared folders");
-    ui.label(
-        RichText::new("These appear as drives under This PC on the remote computer.")
-            .size(size::SMALL)
-            .color(p.muted),
-    );
-    ui.add_space(4.0);
-    let mut remove = None;
-    for (i, folder) in devices.shared_folders.iter_mut().enumerate() {
-        egui::Frame::new()
-            .fill(p.canvas)
-            .corner_radius(CornerRadius::same(radius::ROW))
-            .inner_margin(egui::Margin::same(10))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(ui.available_width() - 40.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut folder.name)
-                                .hint_text("Drive name")
-                                .desired_width(f32::INFINITY),
-                        );
-                        let mut path = folder.path.to_string_lossy().into_owned();
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut path)
-                                    .hint_text("/home/you/Shared")
-                                    .font(theme::mono(12.0))
-                                    .desired_width(f32::INFINITY),
-                            )
-                            .changed()
-                        {
-                            folder.path = path.into();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(widgets::section_label("Resolution", p))
+        .child(choice_card(
+            "res-match",
+            display.resolution == ResolutionMode::MatchWindow,
+            "Match the window",
+            "The remote desktop resizes with this window, pixel for pixel.",
+            p,
+            cx.listener(|this, _, _, cx| {
+                if let Some(ed) = &mut this.editor {
+                    ed.draft.display.resolution = ResolutionMode::MatchWindow;
+                    cx.notify();
+                }
+            }),
+        ))
+        .child(choice_card(
+            "res-fixed",
+            display.resolution == ResolutionMode::Fixed,
+            "Fixed size",
+            "Always use one resolution, scaled down to fit when needed.",
+            p,
+            cx.listener(|this, _, _, cx| {
+                if let Some(ed) = &mut this.editor {
+                    ed.draft.display.resolution = ResolutionMode::Fixed;
+                    cx.notify();
+                }
+            }),
+        ))
+        .when(display.resolution == ResolutionMode::Fixed, |el| {
+            el.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .mt(px(4.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(div().w(px(100.0)).child(Input::new(&state.fixed_width_input)))
+                            .child(div().text_color(p.muted).child("×"))
+                            .child(div().w(px(100.0)).child(Input::new(&state.fixed_height_input)))
+                            .child(div().text_size(size::SMALL).text_color(p.muted).child("px")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .children([(1920, 1080), (2560, 1440), (1280, 800)].into_iter().map(
+                                |(w, h)| {
+                                    let hover = p.hover;
+                                    div()
+                                        .id(("preset", w as usize * 10000 + h as usize))
+                                        .px(px(8.0))
+                                        .py(px(4.0))
+                                        .rounded(radius::CONTROL)
+                                        .bg(p.raised)
+                                        .text_size(size::SMALL)
+                                        .text_color(p.text)
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(hover))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            if let Some(ed) = &mut this.editor {
+                                                ed.set_fixed_size(w, h, window, cx);
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child(format!("{w}×{h}"))
+                                },
+                            )),
+                    ),
+            )
+        })
+        .child(div().mt(px(10.0)).child(widgets::section_label("Scaling", p)))
+        .child(scale_dropdown)
+        .child(div().mt(px(10.0)).child(widgets::setting_row(
+            "Start in fullscreen",
+            Some("Leave fullscreen with Ctrl+Alt+Enter."),
+            p,
+            widgets::toggle(
+                "editor-start-fs",
+                display.start_fullscreen,
+                p,
+                move |on, _, cx| {
+                    let on = *on;
+                    e_fs.update(cx, |app, cx| {
+                        if let Some(ed) = &mut app.editor {
+                            ed.draft.display.start_fullscreen = on;
+                            cx.notify();
                         }
                     });
-                    if widgets::icon_button(ui, icon::TRASH, "Remove").clicked() {
-                        remove = Some(i);
+                },
+            ),
+        )))
+        .into_any_element()
+}
+
+fn render_experience(
+    state: &EditorState,
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let exp = &state.draft.experience;
+    let entity = cx.entity().clone();
+    let e_wp = entity.clone();
+    let e_anim = entity.clone();
+    let e_font = entity.clone();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(widgets::section_label("Quality", p))
+        .children(Quality::ALL.into_iter().map(|quality| {
+            choice_card(
+                SharedString::from(format!("quality-{}", quality.label())),
+                exp.quality == quality,
+                quality.label(),
+                quality.description(),
+                p,
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(ed) = &mut this.editor {
+                        ed.draft.experience.quality = quality;
+                        quality.apply_visuals(&mut ed.draft.experience);
+                        cx.notify();
+                    }
+                }),
+            )
+        }))
+        .child(
+            div()
+                .text_size(size::SMALL)
+                .text_color(p.muted)
+                .child("Also sets the options below. You can still change them."),
+        )
+        .child(div().mt(px(10.0)).child(widgets::section_label("Graphics", p)))
+        .children(GraphicsMode::ALL.into_iter().map(|mode| {
+            choice_card(
+                SharedString::from(format!("gfx-{}", mode.label())),
+                exp.graphics == mode,
+                mode.label(),
+                mode.description(),
+                p,
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(ed) = &mut this.editor {
+                        ed.draft.experience.graphics = mode;
+                        cx.notify();
+                    }
+                }),
+            )
+        }))
+        .child(
+            div()
+                .mt(px(10.0))
+                .child(widgets::section_label("Remote desktop", p)),
+        )
+        .child(widgets::setting_row(
+            "Desktop wallpaper",
+            Some("Off saves bandwidth."),
+            p,
+            widgets::toggle("exp-wallpaper", exp.wallpaper, p, move |on, _, cx| {
+                let on = *on;
+                e_wp.update(cx, |app, cx| {
+                    if let Some(ed) = &mut app.editor {
+                        ed.draft.experience.wallpaper = on;
+                        cx.notify();
                     }
                 });
-            });
-        ui.add_space(4.0);
-    }
-    if let Some(i) = remove {
-        devices.shared_folders.remove(i);
-    }
-    if widgets::secondary_button(ui, format!("{}  Add folder…", icon::FOLDER_PLUS)).clicked() {
-        state.pick_folder = true;
-    }
+            }),
+        ))
+        .child(widgets::setting_row(
+            "Window animations",
+            None,
+            p,
+            widgets::toggle("exp-anim", exp.animations, p, move |on, _, cx| {
+                let on = *on;
+                e_anim.update(cx, |app, cx| {
+                    if let Some(ed) = &mut app.editor {
+                        ed.draft.experience.animations = on;
+                        cx.notify();
+                    }
+                });
+            }),
+        ))
+        .child(widgets::setting_row(
+            "Font smoothing",
+            Some("ClearType text on the remote computer."),
+            p,
+            widgets::toggle("exp-font", exp.font_smoothing, p, move |on, _, cx| {
+                let on = *on;
+                e_font.update(cx, |app, cx| {
+                    if let Some(ed) = &mut app.editor {
+                        ed.draft.experience.font_smoothing = on;
+                        cx.notify();
+                    }
+                });
+            }),
+        ))
+        .into_any_element()
 }
 
-fn advanced(ui: &mut Ui, state: &mut EditorState) {
-    let p = Palette::of(ui);
-    let advanced = &mut state.draft.advanced;
+fn render_devices(
+    state: &EditorState,
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let devices = &state.draft.devices;
+    let entity = cx.entity().clone();
+    let palette = *p;
+    let e_cb = entity.clone();
+    let e_audio = entity.clone();
+    let cur_audio = devices.audio;
 
-    ui.label(
-        RichText::new("Keyboard layout on the remote computer")
-            .size(size::SMALL)
-            .color(p.muted),
+    let audio_dropdown = widgets::dropdown_select(
+        "editor-audio-select",
+        cur_audio.label(),
+        p,
+        move |_state, _window, cx| {
+            let se = cx.entity().clone();
+            let mut list = div().flex().flex_col().gap(px(2.0)).w_full();
+            for mode in AudioMode::ALL {
+                let e = e_audio.clone();
+                let se = se.clone();
+                list = list.child(widgets::menu_item(
+                    SharedString::from(format!("audio-opt-{}", mode.label())),
+                    mode.label(),
+                    None,
+                    cur_audio == mode,
+                    false,
+                    &palette,
+                    move |_, window, cx| {
+                        e.update(cx, |app, cx| {
+                            if let Some(ed) = &mut app.editor {
+                                ed.draft.devices.audio = mode;
+                                cx.notify();
+                            }
+                        });
+                        se.update(cx, |s, cx| s.dismiss(window, cx));
+                    },
+                ));
+            }
+            list
+        },
     );
-    let current = KEYBOARD_LAYOUTS
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .child(widgets::setting_row(
+            "Clipboard",
+            Some("Copy and paste text, images and files both ways."),
+            p,
+            widgets::toggle("dev-clip", devices.clipboard, p, move |on, _, cx| {
+                let on = *on;
+                e_cb.update(cx, |app, cx| {
+                    if let Some(ed) = &mut app.editor {
+                        ed.draft.devices.clipboard = on;
+                        cx.notify();
+                    }
+                });
+            }),
+        ))
+        .child(div().mt(px(8.0)).child(widgets::section_label("Sound", p)))
+        .child(audio_dropdown)
+        .child(
+            div()
+                .mt(px(8.0))
+                .child(widgets::section_label("Shared folders", p)),
+        )
+        .child(
+            div()
+                .text_size(size::SMALL)
+                .text_color(p.muted)
+                .child("These appear as drives under This PC on the remote computer."),
+        )
+        .children(state.folder_inputs.iter().enumerate().map(|(i, fi)| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .p(px(10.0))
+                .rounded(radius::ROW)
+                .bg(p.canvas)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(6.0))
+                        .child(Input::new(&fi.name))
+                        .child(div().font_family(FONT_MONO).child(Input::new(&fi.path))),
+                )
+                .child(widgets::icon_button(
+                    ("folder-rm", i),
+                    icons::TRASH,
+                    "Remove",
+                    p,
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(ed) = &mut this.editor {
+                            ed.remove_shared_folder(i);
+                            cx.notify();
+                        }
+                    }),
+                ))
+        }))
+        .child(
+            div()
+                .id("editor-add-folder")
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(8.0))
+                .h(px(34.0))
+                .px(px(14.0))
+                .rounded(radius::CONTROL)
+                .bg(p.raised)
+                .text_size(size::BODY)
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.text)
+                .cursor_pointer()
+                .hover({
+                    let hover = p.control_hover;
+                    move |s| s.bg(hover)
+                })
+                .on_click(cx.listener(|this, _, _, _cx| {
+                    this.picker.shared_folder();
+                }))
+                .child(icon_svg(icons::FOLDER_PLUS, px(16.0), p.text))
+                .child("Add folder…"),
+        )
+        .into_any_element()
+}
+
+fn render_advanced(
+    state: &EditorState,
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let adv = &state.draft.advanced;
+    let entity = cx.entity().clone();
+    let palette = *p;
+    let cur_klid = adv.keyboard_layout;
+    let current_kb = KEYBOARD_LAYOUTS
         .iter()
-        .find(|(id, _)| *id == advanced.keyboard_layout)
+        .find(|(id, _)| *id == cur_klid)
         .map_or_else(
-            || format!("Custom ({:#06x})", advanced.keyboard_layout),
+            || format!("Custom ({:#06x})", cur_klid),
             |(_, name)| (*name).to_owned(),
         );
-    egui::ComboBox::from_id_salt("keyboard")
-        .width(ui.available_width())
-        .selected_text(current)
-        .show_ui(ui, |ui| {
-            for (id, name) in KEYBOARD_LAYOUTS {
-                ui.selectable_value(&mut advanced.keyboard_layout, *id, *name);
+
+    let e_kb = entity.clone();
+    let kb_dropdown = widgets::dropdown_select(
+        "editor-kb-select",
+        current_kb,
+        p,
+        move |_state, _window, cx| {
+            let se = cx.entity().clone();
+            let mut list = div()
+                .id("kb-layout-scroll")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .w_full()
+                .max_h(px(260.0))
+                .overflow_y_scrollbar();
+            for &(klid, name) in KEYBOARD_LAYOUTS {
+                let e = e_kb.clone();
+                let se = se.clone();
+                list = list.child(widgets::menu_item(
+                    ("klid", klid as usize),
+                    name,
+                    None,
+                    cur_klid == klid,
+                    false,
+                    &palette,
+                    move |_, window, cx| {
+                        e.update(cx, |app, cx| {
+                            if let Some(ed) = &mut app.editor {
+                                ed.draft.advanced.keyboard_layout = klid;
+                                cx.notify();
+                            }
+                        });
+                        se.update(cx, |s, cx| s.dismiss(window, cx));
+                    },
+                ));
             }
-        });
-
-    ui.add_space(10.0);
-    widgets::field(
-        ui,
-        "Load balancing info",
-        &mut advanced.load_balance_info,
-        "From the .rdp file of an RDS farm (loadbalanceinfo)",
-    );
-
-    ui.add_space(14.0);
-    widgets::setting_row(
-        ui,
-        "Reconnect automatically",
-        Some("If the network drops, keep trying for up to five minutes."),
-        |ui| {
-            widgets::toggle(ui, &mut advanced.auto_reconnect);
+            div().w_full().child(list)
         },
     );
-    widgets::setting_row(
-        ui,
-        "Allow legacy TLS",
-        Some(
-            "Insecure. For old Windows computers that only offer TLS 1.0. The connection may lack forward secrecy; use only on networks you trust.",
-        ),
-        |ui| {
-            widgets::toggle(ui, &mut advanced.allow_legacy_tls);
-        },
-    );
+
+    let e_rec = entity.clone();
+    let e_tls = entity.clone();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(widgets::field_label(
+                    "Keyboard layout on the remote computer",
+                    p,
+                ))
+                .child(kb_dropdown),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(widgets::field_label("Load balancing info", p))
+                .child(Input::new(&state.load_balance_input)),
+        )
+        .child(widgets::setting_row(
+            "Reconnect automatically",
+            Some("If the network drops, keep trying for up to five minutes."),
+            p,
+            widgets::toggle("adv-reconn", adv.auto_reconnect, p, move |on, _, cx| {
+                let on = *on;
+                e_rec.update(cx, |app, cx| {
+                    if let Some(ed) = &mut app.editor {
+                        ed.draft.advanced.auto_reconnect = on;
+                        cx.notify();
+                    }
+                });
+            }),
+        ))
+        .child(widgets::setting_row(
+            "Allow legacy TLS",
+            Some("Insecure. For old Windows computers that only offer TLS 1.0. The connection may lack forward secrecy; use only on networks you trust."),
+            p,
+            widgets::toggle("adv-tls", adv.allow_legacy_tls, p, move |on, _, cx| {
+                let on = *on;
+                e_tls.update(cx, |app, cx| {
+                    if let Some(ed) = &mut app.editor {
+                        ed.draft.advanced.allow_legacy_tls = on;
+                        cx.notify();
+                    }
+                });
+            }),
+        ))
+        .into_any_element()
 }
 
-/// Two fields side by side; the first takes `split` of the width.
-fn pair(ui: &mut Ui, split: f32, left: impl FnOnce(&mut Ui), right: impl FnOnce(&mut Ui)) {
-    let gap = 10.0;
-    let width = ui.available_width();
-    let left_w = ((width - gap) * split).floor();
-    let right_w = width - gap - left_w;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        ui.allocate_ui_with_layout(vec2(left_w, 0.0), Layout::top_down(Align::Min), left);
-        ui.allocate_ui_with_layout(vec2(right_w, 0.0), Layout::top_down(Align::Min), right);
-    });
-}
-
-/// A selectable card with a title and one line of explanation. Returns true when clicked.
-fn choice_card(ui: &mut Ui, selected: bool, title: &str, description: &str) -> bool {
-    let p = Palette::of(ui);
-    let response = egui::Frame::new()
-        .fill(if selected {
+fn choice_card(
+    id: impl Into<gpui_kit::ElementId>,
+    selected: bool,
+    title: &str,
+    description: &str,
+    p: &Palette,
+    on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let hover = p.hover;
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(10.0))
+        .w_full()
+        .px(px(12.0))
+        .py(px(10.0))
+        .rounded(radius::ROW)
+        .bg(if selected {
             p.accent_soft()
         } else {
-            Color32::TRANSPARENT
+            transparent_black()
         })
-        .stroke(Stroke::new(
-            1.0,
-            if selected { p.accent } else { p.hairline },
-        ))
-        .corner_radius(CornerRadius::same(radius::ROW))
-        .inner_margin(egui::Margin::symmetric(12, 10))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let glyph = if selected {
-                    icon::RADIO_BUTTON
-                } else {
-                    icon::CIRCLE
-                };
-                ui.label(RichText::new(glyph).size(16.0).color(if selected {
-                    p.accent
-                } else {
-                    p.muted
-                }));
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(title).font(theme::font_medium(size::BODY)));
-                    ui.label(RichText::new(description).size(size::SMALL).color(p.muted));
-                });
-            });
-        })
-        .response
-        .interact(egui::Sense::click());
-    ui.add_space(4.0);
-    response.clicked()
+        .border_1()
+        .border_color(if selected { p.accent } else { p.hairline })
+        .cursor_pointer()
+        .when(!selected, |el| el.hover(move |s| s.bg(hover)))
+        .on_click(on_click)
+        .child(div().mt(px(2.0)).child(icon_svg(
+            if selected {
+                icons::RADIO_ON
+            } else {
+                icons::RADIO_OFF
+            },
+            px(16.0),
+            if selected { p.accent } else { p.muted },
+        )))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(size::BODY)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.text)
+                        .child(title.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(size::SMALL)
+                        .text_color(p.muted)
+                        .child(description.to_owned()),
+                ),
+        )
+        .into_any_element()
 }
 
 /// Common Windows keyboard layout identifiers (KLID).
@@ -806,64 +1458,3 @@ const KEYBOARD_LAYOUTS: &[(u32, &str)] = &[
     (0x0804, "Chinese (Simplified)"),
     (0x0404, "Chinese (Traditional)"),
 ];
-
-#[cfg(test)]
-mod credential_tests {
-    use super::*;
-    use crate::store::credentials::CredentialProfile;
-
-    #[test]
-    fn linked_host_editor_displays_shared_account_without_manual_password_controls() {
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        let mut credentials = CredentialStore::default();
-        let credential = CredentialProfile {
-            name: "Office".into(),
-            username: "alice".into(),
-            domain: "CORP".into(),
-            ..Default::default()
-        };
-        let id = credential.id;
-        credentials.upsert(credential).unwrap();
-        let mut host = HostProfile::new("host", 3389);
-        host.credential_profile_id = Some(id);
-        host.save_password = true;
-        let mut state = EditorState::edit(host.clone());
-        let mut output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    vec2(468.0, 900.0),
-                )),
-                ..Default::default()
-            },
-            |root| {
-                egui::CentralPanel::default().show(root, |ui| {
-                    connection(ui, &mut state, &ProfileStore::default(), &credentials)
-                });
-            },
-        );
-        let labels: Vec<_> = output
-            .shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) => Some(text.galley.text()),
-                _ => None,
-            })
-            .collect();
-        assert!(labels.contains(&"Office"));
-        assert!(labels.contains(&"CORP\\alice"));
-        assert!(!labels.contains(&"User name"));
-        assert!(!labels.contains(&"Remember password"));
-        output.textures_delta.clear();
-
-        *state.password = "dormant-password".into();
-        assert!(matches!(state.password_change(), PasswordChange::Keep));
-        let duplicate = EditorState::new(host);
-        assert_eq!(duplicate.draft.credential_profile_id, Some(id));
-        state.unassign_credentials(id);
-        assert_eq!(state.draft.credential_profile_id, None);
-        assert!(!state.draft.save_password);
-        assert!(state.password.is_empty());
-    }
-}

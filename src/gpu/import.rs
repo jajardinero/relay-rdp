@@ -5,7 +5,6 @@ use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
 
 use anyhow::{Context, ensure};
 use ash::vk;
-use egui_wgpu::wgpu;
 
 use super::GpuContext;
 use crate::session::gfx::vaapi::{HardwareFrame, Layer};

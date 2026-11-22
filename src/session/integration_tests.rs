@@ -59,29 +59,14 @@ impl Drop for Server {
     }
 }
 
-/// Logging, TLS, and a proxy to the process's one event loop (winit allows only one per
-/// process, so the tests share it; it is never run).
-fn setup() -> winit::event_loop::EventLoopProxy<UserEvent> {
-    use std::sync::OnceLock;
-    use winit::platform::wayland::EventLoopBuilderExtWayland as _;
-    static PROXY: OnceLock<std::sync::Mutex<winit::event_loop::EventLoopProxy<UserEvent>>> =
-        OnceLock::new();
+/// Logging, TLS, and a no-op waker for headless session integration tests.
+fn setup() -> UiWaker {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("relay=debug")
         .with_test_writer()
         .try_init();
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let proxy = PROXY.get_or_init(|| {
-        let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
-            .with_wayland()
-            .with_any_thread(true)
-            .build()
-            .unwrap();
-        let proxy = event_loop.create_proxy();
-        std::mem::forget(event_loop);
-        std::sync::Mutex::new(proxy)
-    });
-    proxy.lock().unwrap().clone()
+    UiWaker::noop()
 }
 
 #[test]

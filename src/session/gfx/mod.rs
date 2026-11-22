@@ -2492,7 +2492,7 @@ mod tests {
                     context.flush().unwrap();
                     context
                         .device
-                        .poll(egui_wgpu::wgpu::PollType::wait_indefinitely())
+                        .poll(wgpu::PollType::wait_indefinitely())
                         .unwrap();
                 };
                 for _ in 0..3 {

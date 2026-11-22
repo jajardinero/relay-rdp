@@ -7,9 +7,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use winit::event_loop::EventLoopProxy;
 
-use crate::app::UserEvent;
+use crate::app::UiWaker;
 use crate::ui::widgets::Signal;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -24,7 +23,7 @@ pub struct Prober {
 }
 
 impl Prober {
-    pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub fn new(waker: UiWaker) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let results = Arc::new(Mutex::new(HashMap::new()));
         let thread_results = Arc::clone(&results);
@@ -35,7 +34,7 @@ impl Prober {
                     .enable_all()
                     .build()
                 {
-                    Ok(rt) => rt.block_on(run(rx, thread_results, proxy)),
+                    Ok(rt) => rt.block_on(run(rx, thread_results, waker)),
                     Err(e) => tracing::warn!(error = %e, "host probing disabled"),
                 }
             });
@@ -62,7 +61,7 @@ impl Prober {
 async fn run(
     mut rx: mpsc::UnboundedReceiver<Vec<Endpoint>>,
     results: Arc<Mutex<HashMap<Endpoint, Signal>>>,
-    proxy: EventLoopProxy<UserEvent>,
+    waker: UiWaker,
 ) {
     let mut endpoints: Vec<Endpoint> = Vec::new();
     let mut tick = tokio::time::interval(PROBE_INTERVAL);
@@ -93,7 +92,7 @@ async fn run(
         while let Some(Ok((endpoint, signal))) = set.join_next().await {
             results.lock().insert(endpoint, signal);
         }
-        let _ = proxy.send_event(UserEvent::Wake);
+        waker.wake();
     }
 }
 

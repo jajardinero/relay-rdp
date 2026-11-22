@@ -1,10 +1,10 @@
 //! Sending system shortcuts (Super, Alt+Tab, …) to the remote computer on Wayland.
 //!
 //! Compositors keep their own shortcuts unless a client asks them not to, through the
-//! `keyboard-shortcuts-inhibit` protocol. winit doesn't expose it, so we bind it ourselves on
-//! winit's Wayland connection, against the window's surface.
+//! `keyboard-shortcuts-inhibit` protocol. GPUI doesn't expose it, so we bind it ourselves on
+//! GPUI's Wayland connection, against the window's surface.
 
-use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _, RawDisplayHandle, RawWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use wayland_client::backend::{Backend, ObjectId};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_registry, wl_seat::WlSeat, wl_surface::WlSurface};
@@ -13,7 +13,6 @@ use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{
     self, ZwpKeyboardShortcutsInhibitorV1 as Inhibitor,
 };
-use winit::window::Window;
 
 struct State;
 
@@ -28,7 +27,7 @@ pub struct ShortcutInhibitor {
 
 impl ShortcutInhibitor {
     /// `None` on X11 or when the compositor lacks the protocol.
-    pub fn new(window: &Window) -> Option<Self> {
+    pub fn new(window: &(impl HasDisplayHandle + HasWindowHandle)) -> Option<Self> {
         let RawDisplayHandle::Wayland(display) = window.display_handle().ok()?.as_raw() else {
             return None;
         };
@@ -36,8 +35,8 @@ impl ShortcutInhibitor {
             return None;
         };
 
-        // SAFETY: winit owns the display and keeps it alive for as long as the window exists,
-        // and this object never outlives the window (it is dropped first, see `App`).
+        // SAFETY: GPUI owns the display and keeps it alive for as long as the window exists,
+        // and this object never outlives the window.
         let backend = unsafe { Backend::from_foreign_display(display.display.as_ptr().cast()) };
         let connection = Connection::from_backend(backend);
         let (globals, queue) = registry_queue_init::<State>(&connection).ok()?;
@@ -51,7 +50,7 @@ impl ShortcutInhibitor {
             .ok()?;
         let seat: WlSeat = globals.bind(&qh, 1..=1, ()).ok()?;
 
-        // SAFETY: the pointer is winit's live `wl_surface` for this window.
+        // SAFETY: the pointer is GPUI's live `wl_surface` for this window.
         let surface_id =
             unsafe { ObjectId::from_ptr(WlSurface::interface(), handle.surface.as_ptr().cast()) }
                 .ok()?;

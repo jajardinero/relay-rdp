@@ -1,420 +1,1374 @@
 //! A session tab: the remote desktop, the floating session bar, and the connect / reconnect /
 //! disconnected states drawn over it.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Color32, CornerRadius, Pos2, Rect, RichText, Stroke, Ui, pos2, vec2};
-use egui_phosphor::regular as icon;
-use egui_wgpu::wgpu::FilterMode;
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::{
+    Anchor, AnyElement, App, Bounds, Context, Corners, CursorStyle, Element, ElementId,
+    FontWeight, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, PathBuilder, Pixels, ScrollEvent, SharedString,
+    StatefulInteractiveElement, Style, Styled, Window, canvas, div, fill, point,
+    prelude::FluentBuilder as _, px, relative, rgba, size as gpui_size, white,
+};
 use ironrdp_input::Scancode;
 
+use super::RelayApp;
+use super::assets::{icon_svg, icons};
 use super::tab::{Phase, SessionTab, StageState, TabId};
-use super::theme::{self, Palette, radius, size};
+use super::theme::{FONT_MONO, Palette, radius, size};
 use super::widgets::{self, Signal};
-use crate::app::gpu::{RemoteTextures, TextureInfo};
+use crate::app::gpu::FrameImage;
 use crate::app::input::RemoteViewport;
 use crate::app::keymap::codes;
 use crate::session::errors::{Failure, FailureKind};
-use crate::session::{CertificateInfo, Ended, Engine, Rendering, Stage};
+use crate::session::{CertificateInfo, Ended, Engine, Stage};
 
 /// Height of the strip at the top of the desktop that reveals the session bar.
 pub const EDGE_ZONE: f32 = 4.0;
-const EDGE_DWELL: Duration = Duration::from_millis(300);
-const BAR_LINGER: Duration = Duration::from_millis(1500);
+pub const EDGE_DWELL: Duration = Duration::from_millis(300);
+pub const BAR_LINGER: Duration = Duration::from_millis(1500);
 
-pub enum Action {
-    ToggleFullscreen,
-    Disconnect,
-    CloseTab,
-    Reconnect,
-    RetryNow,
-    ChangeCredentials,
-    EditHost,
-    TrustCertificate(bool),
-    SendCtrlAltDel,
-    SendKeys(Vec<Scancode>),
-    SwitchTo(TabId),
-    GoHome,
-    /// Leave the session running in its tab and go back to the host library.
-    Minimize,
+type ViewportRecord = Option<(Bounds<Pixels>, Option<RemoteViewport>)>;
+
+/// Shared slot populated by `RemoteDesktopElement::prepaint` with the latest laid-out bounds.
+#[derive(Clone, Default)]
+pub struct ViewportSlot(pub Rc<RefCell<ViewportRecord>>);
+
+/// Custom GPUI Element that paints the remote desktop `RenderImage` (pixel-exact 1:1 when it
+/// fits, aspect-fitted otherwise), dims under overlays, and draws any remote bitmap cursor.
+struct RemoteDesktopElement {
+    frame: Option<FrameImage>,
+    live: bool,
+    dimmed: bool,
+    pointer_over_remote: bool,
+    viewport_slot: ViewportSlot,
 }
 
-pub struct ViewContext<'a> {
-    pub pixels_per_point: f32,
-    pub fullscreen: bool,
-    pub pointer: Option<Pos2>,
-    pub tabs: &'a [(TabId, String)],
+impl IntoElement for RemoteDesktopElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
 }
 
-#[derive(Default)]
-pub struct Output {
-    pub viewport: Option<RemoteViewport>,
-    pub filter: Option<FilterMode>,
-    pub actions: Vec<Action>,
-}
+impl Element for RemoteDesktopElement {
+    type RequestLayoutState = ();
+    type PrepaintState = (Hitbox, Option<Bounds<Pixels>>);
 
-pub fn show(
-    ui: &mut Ui,
-    tab: &mut SessionTab,
-    textures: &RemoteTextures,
-    cx: ViewContext<'_>,
-) -> Output {
-    let area = ui.max_rect();
-    let mut out = Output::default();
+    fn id(&self) -> Option<ElementId> {
+        Some(ElementId::Name("remote-desktop-canvas".into()))
+    }
 
-    // The picture: live, or dimmed under an overlay once we've had one.
-    let show_picture = tab.was_live && !matches!(tab.phase, Phase::Connecting);
-    if show_picture && let Some(info) = textures.get(tab.handle.id) {
-        let (rect, filter) = place_image(area, &info, cx.pixels_per_point);
-        let tint = if tab.is_live() {
-            Color32::WHITE
-        } else {
-            Color32::from_gray(70)
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let style = Style {
+            size: gpui_size(relative(1.0).into(), relative(1.0).into()),
+            ..Default::default()
         };
-        ui.painter().image(
-            info.id,
-            rect,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            tint,
-        );
-        out.filter = Some(filter);
-        if tab.is_live() {
-            out.viewport = Some(RemoteViewport {
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let scale = window.scale_factor();
+        let img_bounds = self
+            .frame
+            .as_ref()
+            .map(|f| place_image(bounds, f.width, f.height, scale));
+        let vp = if self.live {
+            self.frame.as_ref().zip(img_bounds).map(|(f, rect)| RemoteViewport {
                 rect,
-                remote_width: info.width as u16,
-                remote_height: info.height as u16,
-            });
+                remote_width: f.width as u16,
+                remote_height: f.height as u16,
+            })
+        } else {
+            None
+        };
+        *self.viewport_slot.0.borrow_mut() = Some((bounds, vp));
+        (hitbox, img_bounds)
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        let (hitbox, img_bounds) = prepaint;
+
+        if self.live && self.pointer_over_remote {
+            window.set_cursor_style(CursorStyle::Arrow, hitbox);
         }
-    }
 
-    if tab.cert_prompt.is_some() {
-        certificate_card(ui, area, tab, &mut out.actions);
-        return out;
-    }
-
-    match &tab.phase {
-        Phase::Connecting => connect_card(ui, area, tab, None, &mut out.actions),
-        Phase::Live => session_bar(ui, area, tab, &cx, &mut out.actions),
-        Phase::Reconnecting {
-            attempt,
-            retry_at,
-            reason,
-        } => reconnect_card(ui, area, *attempt, *retry_at, reason, &mut out.actions),
-        Phase::Ended(ended) => {
-            let ended = ended.clone();
-            if tab.was_live {
-                ended_card(ui, area, tab, &ended, &mut out.actions);
-            } else {
-                let failure = match &ended {
-                    Ended::Failed(f) => Some(f.clone()),
-                    Ended::ServerEnded(reason) => Some(Failure {
-                        kind: FailureKind::Server,
-                        title: "The computer ended the connection".to_owned(),
-                        hint: Some(reason.clone()),
-                        detail: String::new(),
-                    }),
-                    Ended::Closed => None,
-                };
-                connect_card(ui, area, tab, failure.as_ref(), &mut out.actions);
+        if let (Some(frame), Some(rect)) = (&self.frame, *img_bounds) {
+            let _ = window.paint_image(
+                rect,
+                rect,
+                Corners::all(px(0.0)),
+                frame.image.clone(),
+                0,
+                false,
+            );
+            if self.dimmed {
+                window.paint_quad(fill(bounds, rgba(0x000000B8)));
             }
         }
     }
-    out
 }
 
-/// 1:1 (pixel-exact, nearest filtering) when the desktop fits, otherwise scaled down to fit.
+/// 1:1 (pixel-exact) when the desktop fits, otherwise scaled down to fit.
 /// The origin is snapped to the physical pixel grid so 1:1 stays crisp.
-fn place_image(area: Rect, info: &TextureInfo, ppp: f32) -> (Rect, FilterMode) {
-    let native = vec2(info.width as f32, info.height as f32) / ppp;
-    let fits = native.x <= area.width() + 0.5 && native.y <= area.height() + 0.5;
-    let size = if fits {
-        native
+pub fn place_image(area: Bounds<Pixels>, width: u32, height: u32, scale: f32) -> Bounds<Pixels> {
+    let area_w = f32::from(area.size.width);
+    let area_h = f32::from(area.size.height);
+    let native_w = width as f32 / scale;
+    let native_h = height as f32 / scale;
+    let fits = native_w <= area_w + 0.5 && native_h <= area_h + 0.5;
+    let (w, h) = if fits {
+        (native_w, native_h)
     } else {
-        native * (area.width() / native.x).min(area.height() / native.y)
+        let factor = (area_w / native_w).min(area_h / native_h);
+        (native_w * factor, native_h * factor)
     };
-    let min = area.center() - size / 2.0;
-    let min = pos2((min.x * ppp).round() / ppp, (min.y * ppp).round() / ppp);
-    let filter = if fits {
-        FilterMode::Nearest
-    } else {
-        FilterMode::Linear
-    };
-    (Rect::from_min_size(min, size), filter)
+    let ox = f32::from(area.origin.x) + (area_w - w) / 2.0;
+    let oy = f32::from(area.origin.y) + (area_h - h) / 2.0;
+    let snapped_x = (ox * scale).round() / scale;
+    let snapped_y = (oy * scale).round() / scale;
+    Bounds::new(point(px(snapped_x), px(snapped_y)), gpui_size(px(w), px(h)))
 }
 
-/// A centered card on the canvas.
-fn card<R>(ui: &mut Ui, area: Rect, width: f32, id: &str, content: impl FnOnce(&mut Ui) -> R) -> R {
-    let p = Palette::of(ui);
-    egui::Area::new(egui::Id::new(id))
-        .order(egui::Order::Middle)
-        .fixed_pos(area.center())
-        .pivot(Align2::CENTER_CENTER)
-        .constrain_to(area)
-        .show(ui.ctx(), |ui| {
-            egui::Frame::new()
-                .fill(p.surface)
-                .stroke(Stroke::new(1.0, p.hairline))
-                .corner_radius(CornerRadius::same(radius::PANEL))
-                .inner_margin(egui::Margin::same(28))
-                .shadow(ui.visuals().window_shadow)
-                .show(ui, |ui| {
-                    ui.set_width(width);
-                    content(ui)
-                })
-                .inner
-        })
-        .inner
-}
+pub fn render_session(
+    this: &mut RelayApp,
+    tab_id: TabId,
+    p: &Palette,
+    window: &mut Window,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let fullscreen = window.is_fullscreen();
+    let others: Vec<(TabId, String)> = this
+        .tabs
+        .iter()
+        .map(|t| (t.id, t.title().to_owned()))
+        .collect();
 
-fn host_heading(ui: &mut Ui, tab: &SessionTab) {
-    let p = Palette::of(ui);
-    ui.label(RichText::new(tab.title()).font(theme::font_semibold(size::HEADING)));
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(tab.profile.endpoint())
-                .font(theme::mono(13.0))
-                .color(p.muted),
-        );
-        let account = tab.profile.account_label();
-        if !account.is_empty() {
-            ui.label(
-                RichText::new(format!("as {account}"))
-                    .size(size::SMALL)
-                    .color(p.muted),
+    let Some(tab_idx) = this.tabs.iter().position(|t| t.id == tab_id) else {
+        return div().flex_1().bg(p.canvas).into_any_element();
+    };
+
+    let session_id = this.tabs[tab_idx].handle.id;
+    let is_live = this.tabs[tab_idx].is_live();
+    let was_live = this.tabs[tab_idx].was_live;
+    let show_picture = was_live && !matches!(this.tabs[tab_idx].phase, Phase::Connecting);
+    let frame = if show_picture {
+        this.textures.get(session_id)
+    } else {
+        None
+    };
+
+    let pointer_over_remote = this.pointer_over_remote;
+    let viewport_slot = this.viewport_slot.clone();
+
+    let mut container = div()
+        .id(("session-surface", tab_id.raw()))
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .h_full()
+        .bg(p.canvas)
+        .overflow_hidden()
+        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+            this.on_session_mouse_move(tab_id, event.position, cx);
+        }))
+        .on_scroll(cx.listener(move |this, event: &ScrollEvent, _window, _cx| {
+            this.on_session_scroll(tab_id, event);
+        }));
+
+    for btn in MouseButton::all() {
+        container = container
+            .on_mouse_down(
+                btn,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.on_session_mouse_button(tab_id, event.button, event.position, true, window, cx);
+                }),
+            )
+            .on_mouse_up(
+                btn,
+                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                    this.on_session_mouse_button(tab_id, event.button, event.position, false, window, cx);
+                }),
             );
+    }
+
+    // Remote desktop picture layer
+    container = container.child(
+        div()
+            .absolute()
+            .inset_0()
+            .child(RemoteDesktopElement {
+                frame,
+                live: is_live,
+                dimmed: !is_live || this.tabs[tab_idx].cert_prompt.is_some(),
+                pointer_over_remote,
+                viewport_slot,
+            }),
+    );
+
+    // Overlay cards or floating session bar
+    let tab = &this.tabs[tab_idx];
+    if tab.cert_prompt.is_some() {
+        container = container.child(render_certificate_card(tab_id, tab, p, cx));
+    } else {
+        match &tab.phase {
+            Phase::Connecting => {
+                container = container.child(render_connect_card(
+                    tab_id,
+                    tab,
+                    None,
+                    this.failure_details_open,
+                    p,
+                    cx,
+                ));
+            }
+            Phase::Live => {
+                if let Some(bar) = render_session_bar(tab_id, tab, fullscreen, &others, p, cx) {
+                    container = container.child(bar);
+                }
+            }
+            Phase::Reconnecting {
+                attempt,
+                retry_at,
+                reason,
+            } => {
+                container = container.child(render_reconnect_card(
+                    tab_id, *attempt, *retry_at, reason, p, cx,
+                ));
+            }
+            Phase::Ended(ended) => {
+                if tab.was_live {
+                    container = container.child(render_ended_card(
+                        tab_id,
+                        tab,
+                        ended,
+                        this.failure_details_open,
+                        p,
+                        cx,
+                    ));
+                } else {
+                    let failure = match ended {
+                        Ended::Failed(f) => Some(f.clone()),
+                        Ended::ServerEnded(reason) => Some(Failure {
+                            kind: FailureKind::Server,
+                            title: "The computer ended the connection".to_owned(),
+                            hint: Some(reason.clone()),
+                            detail: String::new(),
+                        }),
+                        Ended::Closed => None,
+                    };
+                    container = container.child(render_connect_card(
+                        tab_id,
+                        tab,
+                        failure.as_ref(),
+                        this.failure_details_open,
+                        p,
+                        cx,
+                    ));
+                }
+            }
         }
-    });
+    }
+
+    container.into_any_element()
 }
 
-fn connect_card(
-    ui: &mut Ui,
-    area: Rect,
+fn centered_card(width: f32, p: &Palette, child: impl IntoElement) -> AnyElement {
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .w(px(width))
+                .p(px(28.0))
+                .rounded(radius::PANEL)
+                .bg(p.surface)
+                .border_1()
+                .border_color(p.hairline)
+                .shadow(p.window_shadow())
+                .child(child),
+        )
+        .into_any_element()
+}
+
+fn host_heading(tab: &SessionTab, p: &Palette) -> AnyElement {
+    let account = tab.profile.account_label();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .text_size(size::HEADING)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(p.text)
+                .child(tab.title().to_owned()),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .font_family(FONT_MONO)
+                        .text_size(px(13.0))
+                        .text_color(p.muted)
+                        .child(tab.profile.endpoint()),
+                )
+                .when(!account.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(size::SMALL)
+                            .text_color(p.muted)
+                            .child(format!("as {account}")),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
+fn render_connect_card(
+    tab_id: TabId,
     tab: &SessionTab,
     failure: Option<&Failure>,
-    actions: &mut Vec<Action>,
-) {
-    let p = Palette::of(ui);
-    card(ui, area, 520.0, "connect-card", |ui| {
-        host_heading(ui, tab);
-        ui.add_space(28.0);
-        stage_track(ui, &tab.stages);
-        ui.add_space(24.0);
+    details_open: bool,
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .gap(px(20.0))
+        .child(host_heading(tab, p))
+        .child(render_stage_track(&tab.stages, p));
 
-        match failure {
-            None => {
-                widgets::button_row(ui, |ui| {
-                    if widgets::secondary_button(ui, "Cancel").clicked() {
-                        actions.push(Action::Disconnect);
-                    }
-                });
-            }
-            Some(failure) => {
-                failure_text(ui, failure, &p);
-                ui.add_space(18.0);
-                widgets::button_row(ui, |ui| {
-                    if failure.kind == FailureKind::Credentials {
-                        if widgets::primary_button(ui, "Change sign-in").clicked() {
-                            actions.push(Action::ChangeCredentials);
-                        }
-                    } else if widgets::primary_button(ui, "Try again").clicked() {
-                        actions.push(Action::Reconnect);
-                    }
-                    if tab.saved && widgets::secondary_button(ui, "Edit host").clicked() {
-                        actions.push(Action::EditHost);
-                    }
-                    if widgets::secondary_button(ui, "Close").clicked() {
-                        actions.push(Action::CloseTab);
-                    }
-                });
-            }
+    match failure {
+        None => {
+            body = body.child(widgets::button_row().child(widgets::secondary_button(
+                "connect-cancel",
+                "Cancel",
+                p,
+                cx.listener(move |this, _, _, cx| {
+                    this.disconnect_tab(tab_id);
+                    cx.notify();
+                }),
+            )));
         }
-    });
+        Some(failure) => {
+            body = body
+                .child(render_failure_text(failure, details_open, p, cx))
+                .child(
+                    widgets::button_row()
+                        .child(widgets::secondary_button(
+                            "connect-close",
+                            "Close",
+                            p,
+                            cx.listener(move |this, _, window, cx| {
+                                this.close_tab(tab_id, window);
+                                cx.notify();
+                            }),
+                        ))
+                        .when(tab.saved, |el| {
+                            el.child(widgets::secondary_button(
+                                "connect-edit",
+                                "Edit host",
+                                p,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.edit_tab_host(tab_id, window, cx);
+                                }),
+                            ))
+                        })
+                        .child(if failure.kind == FailureKind::Credentials {
+                            widgets::primary_button(
+                                "connect-change-creds",
+                                "Change sign-in",
+                                p,
+                                false,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.change_tab_credentials(tab_id, window, cx);
+                                }),
+                            )
+                        } else {
+                            widgets::primary_button(
+                                "connect-retry",
+                                "Try again",
+                                p,
+                                false,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.reconnect_tab(tab_id, window, cx);
+                                }),
+                            )
+                        }),
+                );
+        }
+    }
+
+    centered_card(576.0, p, body)
 }
 
-fn failure_text(ui: &mut Ui, failure: &Failure, p: &Palette) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(icon::WARNING_CIRCLE).size(20.0).color(p.poor));
-        ui.label(RichText::new(&failure.title).font(theme::font_semibold(size::SUBHEAD)));
-    });
-    if let Some(hint) = &failure.hint {
-        ui.add_space(2.0);
-        ui.label(RichText::new(hint).color(p.muted));
-    }
-    if !failure.detail.is_empty() {
-        ui.add_space(6.0);
-        egui::CollapsingHeader::new(
-            RichText::new("Technical details")
-                .size(size::SMALL)
-                .color(p.muted),
-        )
-        .id_salt("failure-details")
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(&failure.detail)
-                        .font(theme::mono(11.5))
-                        .color(p.muted),
-                )
-                .selectable(true)
-                .wrap(),
-            );
-        });
-    }
-}
-
-/// The four connection steps as a horizontal track. It is a real sequence, so the steps are
-/// numbered; each shows how long it took.
-fn stage_track(ui: &mut Ui, stages: &[StageState; 4]) {
-    let p = Palette::of(ui);
-    let height = 72.0;
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(ui.available_width(), height), egui::Sense::hover());
-    let painter = ui.painter_at(rect.expand(4.0));
-    let n = Stage::ALL.len();
-    let step = rect.width() / n as f32;
-    let radius = 14.0;
-    let cy = rect.top() + radius + 2.0;
-    let time = ui.input(|i| i.time) as f32;
-    let mut animating = false;
-
-    for (i, stage) in Stage::ALL.iter().enumerate() {
-        let cx = rect.left() + step * (i as f32 + 0.5);
-        let center = pos2(cx, cy);
-
-        if i + 1 < n {
-            let next = pos2(rect.left() + step * (i as f32 + 1.5), cy);
-            let done = matches!(stages[i], StageState::Done(_));
-            painter.line_segment(
-                [
-                    center + vec2(radius + 6.0, 0.0),
-                    next - vec2(radius + 6.0, 0.0),
-                ],
-                Stroke::new(
-                    2.0,
-                    if done {
-                        p.good.gamma_multiply(0.7)
-                    } else {
-                        p.hairline
-                    },
+fn render_failure_text(
+    failure: &Failure,
+    details_open: bool,
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(icon_svg(icons::WARNING_CIRCLE, px(20.0), p.poor))
+                .child(
+                    div()
+                        .text_size(size::SUBHEAD)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.text)
+                        .child(failure.title.clone()),
                 ),
-            );
-        }
-
-        match stages[i] {
-            StageState::Pending => {
-                painter.circle_stroke(center, radius, Stroke::new(1.5, p.hairline));
-                painter.text(
-                    center,
-                    Align2::CENTER_CENTER,
-                    (i + 1).to_string(),
-                    theme::font_medium(13.0),
-                    p.muted,
-                );
-            }
-            StageState::Active(_) => {
-                animating = true;
-                painter.circle_stroke(
-                    center,
-                    radius,
-                    Stroke::new(1.5, p.accent.gamma_multiply(0.3)),
-                );
-                // A quarter arc chasing around the ring.
-                let start = time * 4.0;
-                let points: Vec<Pos2> = (0..=16)
-                    .map(|k| {
-                        let a = start + k as f32 / 16.0 * std::f32::consts::FRAC_PI_2 * 1.5;
-                        center + vec2(a.cos(), a.sin()) * radius
-                    })
-                    .collect();
-                painter.add(egui::Shape::line(points, Stroke::new(2.5, p.accent)));
-                painter.text(
-                    center,
-                    Align2::CENTER_CENTER,
-                    (i + 1).to_string(),
-                    theme::font_medium(13.0),
-                    p.accent,
-                );
-            }
-            StageState::Done(_) => {
-                painter.circle_filled(center, radius, p.good);
-                painter.text(
-                    center,
-                    Align2::CENTER_CENTER,
-                    icon::CHECK,
-                    theme::font(14.0),
-                    p.on_accent,
-                );
-            }
-            StageState::Failed => {
-                painter.circle_filled(center, radius, p.poor);
-                painter.text(
-                    center,
-                    Align2::CENTER_CENTER,
-                    icon::X,
-                    theme::font(14.0),
-                    Color32::WHITE,
-                );
-            }
-        }
-
-        let label_color = match stages[i] {
-            StageState::Pending => p.muted,
-            _ => p.text,
-        };
-        painter.text(
-            pos2(cx, cy + radius + 14.0),
-            Align2::CENTER_CENTER,
-            stage.label(),
-            theme::font_medium(size::SMALL + 1.0),
-            label_color,
-        );
-        let timing = match stages[i] {
-            StageState::Done(d) => format_duration(d),
-            StageState::Active(since) => format_duration(since.elapsed()),
-            _ => String::new(),
-        };
-        painter.text(
-            pos2(cx, cy + radius + 32.0),
-            Align2::CENTER_CENTER,
-            timing,
-            theme::mono(11.5),
-            p.muted,
-        );
-    }
-
-    if animating {
-        ui.ctx().request_repaint_after(Duration::from_millis(16));
-    }
+        )
+        .when_some(failure.hint.as_ref(), |el, hint| {
+            el.child(
+                div()
+                    .text_size(size::BODY)
+                    .text_color(p.muted)
+                    .child(hint.clone()),
+            )
+        })
+        .when(!failure.detail.is_empty(), |el| {
+            el.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .mt(px(4.0))
+                    .child(
+                        div()
+                            .id("toggle-failure-details")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .text_size(size::SMALL)
+                            .text_color(p.muted)
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.failure_details_open = !this.failure_details_open;
+                                cx.notify();
+                            }))
+                            .child(icon_svg(icons::CARET_DOWN, px(12.0), p.muted))
+                            .child("Technical details"),
+                    )
+                    .when(details_open, |el| {
+                        el.child(
+                            div()
+                                .p(px(10.0))
+                                .rounded(radius::CONTROL)
+                                .bg(p.canvas)
+                                .font_family(FONT_MONO)
+                                .text_size(px(11.5))
+                                .text_color(p.muted)
+                                .child(failure.detail.clone()),
+                        )
+                    }),
+            )
+        })
+        .into_any_element()
 }
 
-/// "GPU"/"CPU" badge plus the codec, so you can tell at a glance how the picture is rendered.
-fn render_badge(ui: &mut Ui, rendering: &Rendering, p: &Palette) {
-    let response = ui
-        .scope(|ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            let (fill, color) = match rendering.engine {
-                Engine::Gpu => (p.accent_soft(), p.accent),
-                Engine::Cpu => (p.raised, p.muted),
-            };
-            widgets::tag(ui, rendering.badge(), fill, color);
-            ui.label(
-                RichText::new(rendering.codec_label())
-                    .font(theme::font_medium(size::SMALL))
-                    .color(p.text),
-            );
+fn render_stage_track(stages: &[StageState; 4], p: &Palette) -> AnyElement {
+    let stages = *stages;
+    let palette = *p;
+    let elapsed_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f32();
+
+    div()
+        .relative()
+        .w_full()
+        .h(px(74.0))
+        // Connector lines + active spinner arcs painted via canvas
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let n = Stage::ALL.len();
+                    let step = f32::from(bounds.size.width) / n as f32;
+                    let r = 14.0_f32;
+                    let cy = f32::from(bounds.origin.y) + r + 2.0;
+
+                    for (i, state) in stages.iter().enumerate().take(n) {
+                        let cx_pos = f32::from(bounds.origin.x) + step * (i as f32 + 0.5);
+                        if i + 1 < n {
+                            let next_x = f32::from(bounds.origin.x) + step * (i as f32 + 1.5);
+                            let done = matches!(state, StageState::Done(_));
+                            let color = if done {
+                                palette.good.opacity(0.7)
+                            } else {
+                                palette.hairline
+                            };
+                            let mut line = PathBuilder::stroke(px(2.0));
+                            line.move_to(point(px(cx_pos + r + 6.0), px(cy)));
+                            line.line_to(point(px(next_x - r - 6.0), px(cy)));
+                            if let Ok(path) = line.build() {
+                                window.paint_path(path, color);
+                            }
+                        }
+
+                        if matches!(state, StageState::Active(_)) {
+                            let start = elapsed_secs * 4.0;
+                            let mut arc = PathBuilder::stroke(px(2.5));
+                            for k in 0..=16 {
+                                let a = start + k as f32 / 16.0 * std::f32::consts::FRAC_PI_2 * 1.5;
+                                let pt = point(px(cx_pos + a.cos() * r), px(cy + a.sin() * r));
+                                if k == 0 {
+                                    arc.move_to(pt);
+                                } else {
+                                    arc.line_to(pt);
+                                }
+                            }
+                            if let Ok(path) = arc.build() {
+                                window.paint_path(path, palette.accent);
+                            }
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        // Step circles, labels and timings
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .w_full()
+                .h_full()
+                .children(Stage::ALL.iter().enumerate().map(|(i, stage)| {
+                    let st = stages[i];
+                    let circle = match st {
+                        StageState::Pending => div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(28.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(p.hairline)
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.muted)
+                            .child((i + 1).to_string()),
+                        StageState::Active(_) => div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(28.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(p.accent.opacity(0.3))
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.accent)
+                            .child((i + 1).to_string()),
+                        StageState::Done(_) => div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(28.0))
+                            .rounded_full()
+                            .bg(p.good)
+                            .child(icon_svg(icons::CHECK, px(14.0), p.on_accent)),
+                        StageState::Failed => div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(28.0))
+                            .rounded_full()
+                            .bg(p.poor)
+                            .child(icon_svg(icons::X, px(14.0), white())),
+                    };
+
+                    let label_color = if matches!(st, StageState::Pending) {
+                        p.muted
+                    } else {
+                        p.text
+                    };
+                    let timing = match st {
+                        StageState::Done(d) => format_duration(d),
+                        StageState::Active(since) => format_duration(since.elapsed()),
+                        _ => String::new(),
+                    };
+
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .items_center()
+                        .pt(px(2.0))
+                        .gap(px(6.0))
+                        .child(circle)
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(label_color)
+                                .child(stage.label()),
+                        )
+                        .child(
+                            div()
+                                .h(px(14.0))
+                                .font_family(FONT_MONO)
+                                .text_size(px(11.5))
+                                .text_color(p.muted)
+                                .child(timing),
+                        )
+                })),
+        )
+        .into_any_element()
+}
+
+fn render_certificate_card(
+    tab_id: TabId,
+    tab: &SessionTab,
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let Some(prompt) = &tab.cert_prompt else {
+        return div().into_any_element();
+    };
+    let info: &CertificateInfo = &prompt.info;
+    let changed = info.previous_fingerprint.is_some();
+
+    let (icon_path, color, title) = if changed {
+        (
+            icons::SHIELD_WARNING,
+            p.poor,
+            "This computer's identity has changed",
+        )
+    } else {
+        (
+            icons::SHIELD_CHECK,
+            p.accent,
+            "Check this computer's identity",
+        )
+    };
+    let explanation = if changed {
+        "The certificate is different from the one you trusted before. This happens when the \
+         computer was reinstalled or its certificate renewed, but it can also mean someone is \
+         intercepting the connection. Continue only if you expected this change."
+    } else {
+        "This is the first time you're connecting to this computer. Compare the fingerprint \
+         with the one your administrator gave you, then trust it to continue. You won't be \
+         asked again unless it changes."
+    };
+
+    let cert_row = |label: &'static str, value: String, mono: bool| {
+        div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .w(px(108.0))
+                    .flex_shrink_0()
+                    .text_size(size::SMALL)
+                    .text_color(p.muted)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .when(mono, |el| el.font_family(FONT_MONO).text_size(size::SMALL))
+                    .when(!mono, |el| el.text_size(size::BODY))
+                    .text_color(p.text)
+                    .child(value),
+            )
+    };
+
+    let mut rows = div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(cert_row(
+            "Computer",
+            format!("{}:{}", info.host, info.port),
+            true,
+        ))
+        .child(cert_row("Issued to", info.subject.clone(), false))
+        .child(cert_row("Issued by", info.issuer.clone(), false))
+        .child(cert_row("Expires", info.not_after.clone(), false))
+        .child(cert_row(
+            "Fingerprint",
+            split_fingerprint(&info.fingerprint),
+            true,
+        ));
+
+    if let Some(prev) = &info.previous_fingerprint {
+        rows = rows.child(cert_row("Trusted before", split_fingerprint(prev), true));
+    }
+
+    let trust_btn = if changed {
+        widgets::danger_button(
+            "cert-trust",
+            "Trust the new certificate",
+            p,
+            cx.listener(move |this, _, _, cx| {
+                this.answer_tab_certificate(tab_id, true);
+                cx.notify();
+            }),
+        )
+    } else {
+        widgets::primary_button(
+            "cert-trust",
+            "Trust and connect",
+            p,
+            false,
+            cx.listener(move |this, _, _, cx| {
+                this.answer_tab_certificate(tab_id, true);
+                cx.notify();
+            }),
+        )
+    };
+
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .child(icon_svg(icon_path, px(24.0), color))
+                .child(
+                    div()
+                        .text_size(size::SUBHEAD)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.text)
+                        .child(title),
+                ),
+        )
+        .child(
+            div()
+                .text_size(size::BODY)
+                .text_color(p.muted)
+                .child(explanation),
+        )
+        .child(div().my(px(4.0)).child(rows))
+        .child(
+            div().mt(px(8.0)).child(
+                widgets::button_row()
+                    .child(widgets::secondary_button(
+                        "cert-cancel",
+                        "Cancel",
+                        p,
+                        cx.listener(move |this, _, _, cx| {
+                            this.answer_tab_certificate(tab_id, false);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(trust_btn),
+            ),
+        );
+
+    centered_card(576.0, p, body)
+}
+
+fn render_reconnect_card(
+    tab_id: TabId,
+    attempt: u32,
+    retry_at: Instant,
+    reason: &str,
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let wait = retry_at.saturating_duration_since(Instant::now());
+    let next = if wait.is_zero() {
+        "Trying now".to_owned()
+    } else {
+        format!("Next try in {} s", wait.as_secs() + 1)
+    };
+
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .child(Spinner::new())
+                .child(
+                    div()
+                        .text_size(size::SUBHEAD)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.text)
+                        .child("Reconnecting…"),
+                ),
+        )
+        .child(
+            div()
+                .text_size(size::BODY)
+                .text_color(p.muted)
+                .child(format!(
+                    "{reason}. Your session is kept on the remote computer."
+                )),
+        )
+        .child(
+            div()
+                .text_size(size::SMALL)
+                .text_color(p.muted)
+                .child(format!("Attempt {attempt}. {next}.")),
+        )
+        .child(
+            div().mt(px(12.0)).child(
+                widgets::button_row()
+                    .child(widgets::secondary_button(
+                        "reconn-disconnect",
+                        "Disconnect",
+                        p,
+                        cx.listener(move |this, _, _, cx| {
+                            this.disconnect_tab(tab_id);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(widgets::primary_button(
+                        "reconn-retry",
+                        "Retry now",
+                        p,
+                        false,
+                        cx.listener(move |this, _, _, _cx| {
+                            this.retry_tab_now(tab_id);
+                        }),
+                    )),
+            ),
+        );
+
+    centered_card(476.0, p, body)
+}
+
+fn render_ended_card(
+    tab_id: TabId,
+    tab: &SessionTab,
+    ended: &Ended,
+    details_open: bool,
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> AnyElement {
+    let header: AnyElement = match ended {
+        Ended::ServerEnded(reason) => div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(icon_svg(icons::PLUGS, px(22.0), p.muted))
+                    .child(
+                        div()
+                            .text_size(size::SUBHEAD)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.text)
+                            .child("Session ended"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(size::BODY)
+                    .text_color(p.muted)
+                    .child(reason.clone()),
+            )
+            .into_any_element(),
+        Ended::Failed(failure) => render_failure_text(failure, details_open, p, cx),
+        Ended::Closed => div().into_any_element(),
+    };
+
+    let primary = if tab.failure_kind() == Some(FailureKind::Credentials) {
+        widgets::primary_button(
+            "ended-change-creds",
+            "Change sign-in",
+            p,
+            false,
+            cx.listener(move |this, _, window, cx| {
+                this.change_tab_credentials(tab_id, window, cx);
+            }),
+        )
+    } else {
+        widgets::primary_button(
+            "ended-reconnect",
+            "Reconnect",
+            p,
+            false,
+            cx.listener(move |this, _, window, cx| {
+                this.reconnect_tab(tab_id, window, cx);
+            }),
+        )
+    };
+
+    let body = div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
+        .child(header)
+        .child(
+            widgets::button_row()
+                .child(widgets::secondary_button(
+                    "ended-close",
+                    "Close tab",
+                    p,
+                    cx.listener(move |this, _, window, cx| {
+                        this.close_tab(tab_id, window);
+                        cx.notify();
+                    }),
+                ))
+                .child(primary),
+        );
+
+    centered_card(496.0, p, body)
+}
+
+fn render_session_bar(
+    tab_id: TabId,
+    tab: &SessionTab,
+    fullscreen: bool,
+    all_tabs: &[(TabId, String)],
+    p: &Palette,
+    cx: &mut Context<RelayApp>,
+) -> Option<AnyElement> {
+    let now = Instant::now();
+    let visible = tab.bar.engaged || tab.bar.visible_until.is_some_and(|until| now < until);
+    if !visible {
+        return None;
+    }
+
+    let signal = tab.current_rtt().map_or(Signal::Unknown, Signal::Rtt);
+    let history: Vec<f32> = tab.rtt_history.iter().copied().collect();
+    let stats = tab.stats;
+    let palette = *p;
+    let entity = cx.entity().clone();
+
+    let sparkline_box = div()
+        .id(("bar-sparkline", tab_id.raw()))
+        .flex()
+        .items_center()
+        .tooltip(move |window, cx| {
+            Tooltip::element(move |_window, _cx| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .text_size(size::SMALL)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(palette.text)
+                            .child("Round-trip time, last minute"),
+                    )
+                    .child(
+                        div()
+                            .font_family(FONT_MONO)
+                            .text_size(px(11.5))
+                            .text_color(palette.muted)
+                            .child(format!(
+                                "{:.0} screen updates/s\n{} in, {} out per second",
+                                stats.updates_per_sec,
+                                format_rate(stats.bytes_in_per_sec),
+                                format_rate(stats.bytes_out_per_sec),
+                            )),
+                    )
+            })
+            .build(window, cx)
         })
-        .response;
-    response.on_hover_ui(|ui| {
-        ui.label(RichText::new("Rendering").font(theme::font_medium(size::SMALL)));
-        ui.label(rendering.details());
-        if let Some(reason) = &rendering.fallback {
-            ui.label(
-                RichText::new(format!("Video decoding: {reason}"))
-                    .size(size::SMALL)
-                    .color(p.muted),
-            );
-        }
+        .child(widgets::sparkline(
+            history,
+            px(56.0),
+            px(16.0),
+            signal.color(p),
+        ));
+
+    let rendering_el = tab.rendering.as_ref().map(|rendering| {
+        let (fill_c, text_c) = match rendering.engine {
+            Engine::Gpu => (p.accent_soft(), p.accent),
+            Engine::Cpu => (p.raised, p.muted),
+        };
+        let details = rendering.details();
+        let fallback = rendering.fallback.clone();
+        div()
+            .id(("bar-render-badge", tab_id.raw()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .ml(px(4.0))
+            .tooltip(move |window, cx| {
+                let fallback = fallback.clone();
+                Tooltip::element(move |_window, _cx| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(size::SMALL)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(palette.text)
+                                .child("Rendering"),
+                        )
+                        .child(
+                            div()
+                                .text_size(size::BODY)
+                                .text_color(palette.text)
+                                .child(details),
+                        )
+                        .when_some(fallback.clone(), |el, reason| {
+                            el.child(
+                                div()
+                                    .text_size(size::SMALL)
+                                    .text_color(palette.muted)
+                                    .child(format!("Video decoding: {reason}")),
+                            )
+                        })
+                })
+                .build(window, cx)
+            })
+            .child(widgets::tag(rendering.badge(), fill_c, text_c))
+            .child(
+                div()
+                    .text_size(size::SMALL)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.text)
+                    .child(rendering.codec_label()),
+            )
     });
+
+    let switch_menu = if fullscreen && !all_tabs.is_empty() {
+        let tabs_list = all_tabs.to_vec();
+        let e_sw = entity.clone();
+        let raised = p.raised;
+        let surface = p.surface;
+        let hairline = p.hairline;
+        let muted = p.muted;
+        let shadow = p.popup_shadow();
+
+        Some(
+            Popover::new(("bar-switch", tab_id.raw()))
+                .anchor(Anchor::TopRight)
+                .appearance(false)
+                .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+                    this.set_session_bar_menu_open(tab_id, *open);
+                    cx.notify();
+                }))
+                .trigger(widgets::PopoverTrigger::new(
+                    ("bar-switch-btn", tab_id.raw()),
+                    div()
+                        .id(("bar-switch-tip", tab_id.raw()))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(30.0))
+                        .rounded(radius::CONTROL)
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(raised))
+                        .tooltip(|window, cx| Tooltip::new("Switch session").build(window, cx))
+                        .child(icon_svg(icons::STACK, px(16.0), muted)),
+                ))
+                .content(move |_state, _window, cx| {
+                    let se = cx.entity().clone();
+                    let mut list = div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(200.0))
+                        .p(px(6.0))
+                        .rounded(radius::ROW)
+                        .bg(surface)
+                        .border_1()
+                        .border_color(hairline)
+                        .shadow(shadow.clone());
+
+                    let e_home = e_sw.clone();
+                    let se_h = se.clone();
+                    list = list
+                        .child(widgets::menu_item(
+                            "bar-go-home",
+                            "Hosts",
+                            Some(icons::SQUARES_FOUR),
+                            false,
+                            false,
+                            &palette,
+                            move |_, window, cx| {
+                                e_home.update(cx, |app, cx| {
+                                    app.active = super::ActiveTab::Home;
+                                    cx.notify();
+                                });
+                                se_h.update(cx, |s, cx| s.dismiss(window, cx));
+                            },
+                        ))
+                        .child(widgets::menu_separator(&palette));
+
+                    for (id, title) in &tabs_list {
+                        let id = *id;
+                        let current = id == tab_id;
+                        let e_t = e_sw.clone();
+                        let se_t = se.clone();
+                        list = list.child(widgets::menu_item(
+                            ("bar-tab", id.raw()),
+                            title.clone(),
+                            None,
+                            current,
+                            false,
+                            &palette,
+                            move |_, window, cx| {
+                                if !current {
+                                    e_t.update(cx, |app, cx| {
+                                        app.active = super::ActiveTab::Session(id);
+                                        cx.notify();
+                                    });
+                                }
+                                se_t.update(cx, |s, cx| s.dismiss(window, cx));
+                            },
+                        ));
+                    }
+                    list
+                }),
+        )
+    } else {
+        None
+    };
+
+    let keys_menu = {
+        let e_keys = entity.clone();
+        let raised = p.raised;
+        let surface = p.surface;
+        let hairline = p.hairline;
+        let muted = p.muted;
+        let shadow = p.popup_shadow();
+
+        Popover::new(("bar-keys", tab_id.raw()))
+            .anchor(Anchor::TopRight)
+            .appearance(false)
+            .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+                this.set_session_bar_menu_open(tab_id, *open);
+                cx.notify();
+            }))
+            .trigger(widgets::PopoverTrigger::new(
+                ("bar-keys-btn", tab_id.raw()),
+                div()
+                    .id(("bar-keys-tip", tab_id.raw()))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(30.0))
+                    .rounded(radius::CONTROL)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(raised))
+                    .tooltip(|window, cx| Tooltip::new("Send keys").build(window, cx))
+                    .child(icon_svg(icons::KEYBOARD, px(16.0), muted)),
+            ))
+            .content(move |_state, _window, cx| {
+                let se = cx.entity().clone();
+                let mut list = div()
+                    .flex()
+                    .flex_col()
+                    .min_w(px(190.0))
+                    .p(px(6.0))
+                    .rounded(radius::ROW)
+                    .bg(surface)
+                    .border_1()
+                    .border_color(hairline)
+                    .shadow(shadow.clone());
+
+                let e_cad = e_keys.clone();
+                let se_cad = se.clone();
+                list = list.child(widgets::menu_item(
+                    "keys-cad",
+                    "Ctrl+Alt+Del",
+                    None,
+                    false,
+                    false,
+                    &palette,
+                    move |_, window, cx| {
+                        e_cad.update(cx, |app, _| app.send_tab_ctrl_alt_del(tab_id));
+                        se_cad.update(cx, |s, cx| s.dismiss(window, cx));
+                    },
+                ));
+
+                let combos: [(&str, Vec<Scancode>); 4] = [
+                    ("Windows key", vec![codes::SUPER_LEFT]),
+                    ("Alt+Tab", vec![codes::ALT_LEFT, codes::TAB]),
+                    (
+                        "Ctrl+Shift+Esc",
+                        vec![codes::CONTROL_LEFT, codes::SHIFT_LEFT, codes::ESCAPE],
+                    ),
+                    ("Print Screen", vec![codes::PRINT_SCREEN]),
+                ];
+                for (label, combo) in combos {
+                    let e_c = e_keys.clone();
+                    let se_c = se.clone();
+                    list = list.child(widgets::menu_item(
+                        SharedString::from(format!("keys-combo-{label}")),
+                        label,
+                        None,
+                        false,
+                        false,
+                        &palette,
+                        move |_, window, cx| {
+                            let combo = combo.clone();
+                            e_c.update(cx, |app, _| app.send_tab_keys(tab_id, &combo));
+                            se_c.update(cx, |s, cx| s.dismiss(window, cx));
+                        },
+                    ));
+                }
+                list
+            })
+    };
+
+    let (fs_icon, fs_tip) = if fullscreen {
+        (icons::CORNERS_IN, "Exit fullscreen (Ctrl+Alt+Enter)")
+    } else {
+        (icons::CORNERS_OUT, "Fullscreen (Ctrl+Alt+Enter)")
+    };
+
+    let pill = div()
+        .id(("session-bar-pill", tab_id.raw()))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(14.0))
+        .py(px(6.0))
+        .rounded(px(22.0))
+        .bg(p.surface)
+        .border_1()
+        .border_color(p.hairline)
+        .shadow(p.popup_shadow())
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            this.set_session_bar_hovered(tab_id, *hovered);
+            cx.notify();
+        }))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_move(|_, _, cx| cx.stop_propagation())
+        .child(widgets::signal_bars(("bar-sig", tab_id.raw()), signal, p))
+        .child(
+            div()
+                .text_size(size::BODY)
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.text)
+                .child(tab.title().to_owned()),
+        )
+        .when_some(tab.current_rtt(), |el, rtt| {
+            el.child(
+                div()
+                    .font_family(FONT_MONO)
+                    .text_size(size::SMALL)
+                    .text_color(p.muted)
+                    .child(format!("{} ms", rtt.as_millis().max(1))),
+            )
+        })
+        .child(sparkline_box)
+        .when_some(rendering_el, |el, badge| el.child(badge))
+        // Vertical separator
+        .child(div().w(px(1.0)).h(px(18.0)).mx(px(4.0)).bg(p.hairline))
+        .when_some(switch_menu, |el, menu| el.child(menu))
+        .child(keys_menu)
+        .child(widgets::icon_button(
+            ("bar-min", tab_id.raw()),
+            icons::MINUS,
+            "Minimize to tab",
+            p,
+            cx.listener(move |this, _, _, cx| {
+                this.minimize_tab(tab_id);
+                cx.notify();
+            }),
+        ))
+        .child(widgets::icon_button(
+            ("bar-fs", tab_id.raw()),
+            fs_icon,
+            fs_tip,
+            p,
+            cx.listener(|_this, _, window, _cx| {
+                window.toggle_fullscreen();
+            }),
+        ))
+        .child(widgets::icon_button(
+            ("bar-disconnect", tab_id.raw()),
+            icons::PLUGS,
+            "Disconnect",
+            p,
+            cx.listener(move |this, _, _, cx| {
+                this.disconnect_tab(tab_id);
+                cx.notify();
+            }),
+        ));
+
+    Some(
+        div()
+            .absolute()
+            .top(px(10.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(pill)
+            .into_any_element(),
+    )
 }
 
 fn format_rate(bytes: u64) -> String {
@@ -434,96 +1388,6 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
-fn certificate_card(ui: &mut Ui, area: Rect, tab: &SessionTab, actions: &mut Vec<Action>) {
-    let p = Palette::of(ui);
-    let Some(prompt) = &tab.cert_prompt else {
-        return;
-    };
-    let info: &CertificateInfo = &prompt.info;
-    let changed = info.previous_fingerprint.is_some();
-
-    card(ui, area, 520.0, "certificate-card", |ui| {
-        let (glyph, color, title) = if changed {
-            (
-                icon::SHIELD_WARNING,
-                p.poor,
-                "This computer's identity has changed",
-            )
-        } else {
-            (
-                icon::SHIELD_CHECK,
-                p.accent,
-                "Check this computer's identity",
-            )
-        };
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(glyph).size(26.0).color(color));
-            ui.label(RichText::new(title).font(theme::font_semibold(size::SUBHEAD)));
-        });
-        ui.add_space(6.0);
-        let body = if changed {
-            "The certificate is different from the one you trusted before. This happens when the \
-             computer was reinstalled or its certificate renewed, but it can also mean someone is \
-             intercepting the connection. Continue only if you expected this change."
-        } else {
-            "This is the first time you're connecting to this computer. Compare the fingerprint \
-             with the one your administrator gave you, then trust it to continue. You won't be \
-             asked again unless it changes."
-        };
-        ui.label(RichText::new(body).color(p.muted));
-        ui.add_space(14.0);
-
-        egui::Grid::new("cert-grid")
-            .num_columns(2)
-            .spacing([16.0, 6.0])
-            .show(ui, |ui| {
-                let row = |ui: &mut Ui, label: &str, value: &str, mono: bool| {
-                    ui.label(RichText::new(label).size(size::SMALL).color(p.muted));
-                    let text = if mono {
-                        RichText::new(value).font(theme::mono(12.0))
-                    } else {
-                        RichText::new(value).size(size::BODY)
-                    };
-                    ui.add(egui::Label::new(text).wrap());
-                    ui.end_row();
-                };
-                row(
-                    ui,
-                    "Computer",
-                    &format!("{}:{}", info.host, info.port),
-                    true,
-                );
-                row(ui, "Issued to", &info.subject, false);
-                row(ui, "Issued by", &info.issuer, false);
-                row(ui, "Expires", &info.not_after, false);
-                row(
-                    ui,
-                    "Fingerprint",
-                    &split_fingerprint(&info.fingerprint),
-                    true,
-                );
-                if let Some(previous) = &info.previous_fingerprint {
-                    row(ui, "Trusted before", &split_fingerprint(previous), true);
-                }
-            });
-
-        ui.add_space(20.0);
-        widgets::button_row(ui, |ui| {
-            let trust = if changed {
-                widgets::danger_button(ui, "Trust the new certificate")
-            } else {
-                widgets::primary_button(ui, "Trust and connect")
-            };
-            if trust.clicked() {
-                actions.push(Action::TrustCertificate(true));
-            }
-            if widgets::secondary_button(ui, "Cancel").clicked() {
-                actions.push(Action::TrustCertificate(false));
-            }
-        });
-    });
-}
-
 /// SHA-256 fingerprints are long; break them into two lines of 16 bytes.
 fn split_fingerprint(fp: &str) -> String {
     let parts: Vec<&str> = fp.split(':').collect();
@@ -533,303 +1397,19 @@ fn split_fingerprint(fp: &str) -> String {
     format!("{}\n{}", parts[..16].join(":"), parts[16..].join(":"))
 }
 
-fn reconnect_card(
-    ui: &mut Ui,
-    area: Rect,
-    attempt: u32,
-    retry_at: Instant,
-    reason: &str,
-    actions: &mut Vec<Action>,
-) {
-    let p = Palette::of(ui);
-    card(ui, area, 420.0, "reconnect-card", |ui| {
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().size(18.0).color(p.fair));
-            ui.label(RichText::new("Reconnecting…").font(theme::font_semibold(size::SUBHEAD)));
-        });
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(format!(
-                "{reason}. Your session is kept on the remote computer."
-            ))
-            .color(p.muted),
-        );
-        let wait = retry_at.saturating_duration_since(Instant::now());
-        let next = if wait.is_zero() {
-            "Trying now".to_owned()
-        } else {
-            format!("Next try in {} s", wait.as_secs() + 1)
-        };
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!("Attempt {attempt}. {next}."))
-                .size(size::SMALL)
-                .color(p.muted),
-        );
-        ui.add_space(18.0);
-        widgets::button_row(ui, |ui| {
-            if widgets::primary_button(ui, "Retry now").clicked() {
-                actions.push(Action::RetryNow);
-            }
-            if widgets::secondary_button(ui, "Disconnect").clicked() {
-                actions.push(Action::Disconnect);
-            }
-        });
-        ui.ctx().request_repaint_after(Duration::from_millis(250));
-    });
-}
-
-fn ended_card(ui: &mut Ui, area: Rect, tab: &SessionTab, ended: &Ended, actions: &mut Vec<Action>) {
-    let p = Palette::of(ui);
-    card(ui, area, 440.0, "ended-card", |ui| {
-        match ended {
-            Ended::ServerEnded(reason) => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(icon::PLUGS).size(22.0).color(p.muted));
-                    ui.label(
-                        RichText::new("Session ended").font(theme::font_semibold(size::SUBHEAD)),
-                    );
-                });
-                ui.add_space(4.0);
-                ui.label(RichText::new(reason).color(p.muted));
-            }
-            Ended::Failed(failure) => failure_text(ui, failure, &p),
-            Ended::Closed => {}
-        }
-        ui.add_space(18.0);
-        widgets::button_row(ui, |ui| {
-            if tab.failure_kind() == Some(FailureKind::Credentials) {
-                if widgets::primary_button(ui, "Change sign-in").clicked() {
-                    actions.push(Action::ChangeCredentials);
-                }
-            } else if widgets::primary_button(ui, "Reconnect").clicked() {
-                actions.push(Action::Reconnect);
-            }
-            if widgets::secondary_button(ui, "Close tab").clicked() {
-                actions.push(Action::CloseTab);
-            }
-        });
-    });
-}
-
-/// The floating bar at the top of a live session. Hidden until the pointer rests at the top
-/// edge (or Ctrl+Alt+Home), so the remote desktop keeps every pixel.
-fn session_bar(
-    ui: &mut Ui,
-    area: Rect,
-    tab: &mut SessionTab,
-    cx: &ViewContext<'_>,
-    actions: &mut Vec<Action>,
-) {
-    let ctx = ui.ctx().clone();
-    let now = Instant::now();
-
-    let near_edge = cx.pointer.is_some_and(|pos| {
-        area.x_range().contains(pos.x)
-            && pos.y >= area.top() - 1.0
-            && pos.y <= area.top() + EDGE_ZONE
-    });
-    if near_edge {
-        let since = *tab.bar.edge_since.get_or_insert(now);
-        let waited = now.duration_since(since);
-        if waited >= EDGE_DWELL {
-            tab.bar.visible_until = Some(now + BAR_LINGER);
-        } else {
-            ctx.request_repaint_after(EDGE_DWELL - waited);
-        }
-    } else {
-        tab.bar.edge_since = None;
-    }
-    if tab.bar.engaged {
-        tab.bar.visible_until = Some(now + BAR_LINGER);
-    }
-
-    let visible = tab.bar.visible_until.is_some_and(|until| now < until);
-    match tab.bar.visible_until {
-        Some(until) if now < until => ctx.request_repaint_after(until - now),
-        _ => tab.bar.visible_until = None,
-    }
-
-    let bar_id = egui::Id::new(("session-bar", tab.id));
-    let t = ctx.animate_bool_with_time(bar_id, visible, 0.14);
-    if t <= 0.0 {
-        tab.bar.engaged = false;
-        return;
-    }
-
-    let p = Palette::of(ui);
-    let offset = (1.0 - t) * -14.0;
-    let response = egui::Area::new(bar_id)
-        .order(egui::Order::Foreground)
-        .fixed_pos(pos2(area.center().x, area.top() + 10.0 + offset))
-        .pivot(Align2::CENTER_TOP)
-        .show(&ctx, |ui| {
-            ui.set_opacity(t);
-            egui::Frame::new()
-                .fill(p.surface)
-                .stroke(Stroke::new(1.0, p.hairline))
-                .corner_radius(CornerRadius::same(22))
-                .inner_margin(egui::Margin::symmetric(14, 6))
-                .shadow(ui.visuals().popup_shadow)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        bar_contents(ui, tab, cx, actions);
-                    });
-                });
-        })
-        .response;
-
-    let pointer_over = cx
-        .pointer
-        .is_some_and(|pos| response.rect.expand(8.0).contains(pos));
-    tab.bar.engaged = pointer_over || egui::Popup::is_any_open(&ctx);
-}
-
-fn bar_contents(
-    ui: &mut Ui,
-    tab: &mut SessionTab,
-    cx: &ViewContext<'_>,
-    actions: &mut Vec<Action>,
-) {
-    let p = Palette::of(ui);
-    let signal = tab.current_rtt().map_or(Signal::Unknown, Signal::Rtt);
-
-    widgets::signal_bars(ui, signal);
-    ui.label(RichText::new(tab.title()).font(theme::font_medium(size::BODY)));
-    if let Some(rtt) = tab.current_rtt() {
-        ui.label(
-            RichText::new(format!("{} ms", rtt.as_millis().max(1)))
-                .font(theme::mono(12.0))
-                .color(p.muted),
-        );
-    }
-    let history: Vec<f32> = tab.rtt_history.iter().copied().collect();
-    let stats = tab.stats;
-    widgets::sparkline(ui, &history, vec2(56.0, 16.0), signal.color(&p)).on_hover_ui(|ui| {
-        ui.label(
-            RichText::new("Round-trip time, last minute").font(theme::font_medium(size::SMALL)),
-        );
-        ui.label(
-            RichText::new(format!(
-                "{:.0} screen updates/s\n{} in, {} out per second",
-                stats.updates_per_sec,
-                format_rate(stats.bytes_in_per_sec),
-                format_rate(stats.bytes_out_per_sec),
-            ))
-            .font(theme::mono(11.5))
-            .color(p.muted),
-        );
-    });
-    if let Some(rendering) = &tab.rendering {
-        ui.add_space(4.0);
-        render_badge(ui, rendering, &p);
-    }
-
-    ui.add_space(4.0);
-    ui.separator();
-
-    if cx.fullscreen && !cx.tabs.is_empty() {
-        let switch = widgets::icon_button(ui, icon::STACK, "Switch session");
-        egui::Popup::menu(&switch).show(|ui| {
-            ui.set_min_width(200.0);
-            if ui
-                .button(format!("{}  Hosts", icon::SQUARES_FOUR))
-                .clicked()
-            {
-                actions.push(Action::GoHome);
-            }
-            ui.separator();
-            for (id, title) in cx.tabs {
-                let current = *id == tab.id;
-                let label = if current {
-                    RichText::new(title).strong()
-                } else {
-                    RichText::new(title)
-                };
-                if ui.add_enabled(!current, egui::Button::new(label)).clicked() {
-                    actions.push(Action::SwitchTo(*id));
-                }
-            }
-        });
-    }
-
-    let keys = widgets::icon_button(ui, icon::KEYBOARD, "Send keys");
-    egui::Popup::menu(&keys).show(|ui| {
-        ui.set_min_width(190.0);
-        if ui.button("Ctrl+Alt+Del").clicked() {
-            actions.push(Action::SendCtrlAltDel);
-        }
-        let combos: [(&str, Vec<Scancode>); 4] = [
-            ("Windows key", vec![codes::SUPER_LEFT]),
-            ("Alt+Tab", vec![codes::ALT_LEFT, codes::TAB]),
-            (
-                "Ctrl+Shift+Esc",
-                vec![codes::CONTROL_LEFT, codes::SHIFT_LEFT, codes::ESCAPE],
-            ),
-            ("Print Screen", vec![codes::PRINT_SCREEN]),
-        ];
-        for (label, combo) in combos {
-            if ui.button(label).clicked() {
-                actions.push(Action::SendKeys(combo));
-            }
-        }
-    });
-
-    if widgets::icon_button(ui, icon::MINUS, "Minimize to tab").clicked() {
-        actions.push(Action::Minimize);
-    }
-
-    let (glyph, tip) = if cx.fullscreen {
-        (icon::CORNERS_IN, "Exit fullscreen (Ctrl+Alt+Enter)")
-    } else {
-        (icon::CORNERS_OUT, "Fullscreen (Ctrl+Alt+Enter)")
-    };
-    if widgets::icon_button(ui, glyph, tip).clicked() {
-        actions.push(Action::ToggleFullscreen);
-    }
-
-    let disconnect = widgets::icon_button(ui, icon::PLUGS, "Disconnect");
-    if disconnect.clicked() {
-        actions.push(Action::Disconnect);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn info(w: u32, h: u32) -> TextureInfo {
-        TextureInfo {
-            id: egui::TextureId::Managed(0),
-            width: w,
-            height: h,
-        }
-    }
-
     #[test]
-    fn exact_fit_is_one_to_one() {
-        let area = Rect::from_min_size(pos2(0.0, 44.0), vec2(1280.0, 756.0));
-        let (rect, filter) = place_image(area, &info(2560, 1512), 2.0);
-        assert_eq!(filter, FilterMode::Nearest);
-        assert_eq!(rect, area);
-    }
+    fn place_image_fits_1_to_1_and_scales_down_when_larger() {
+        let area = Bounds::new(point(px(0.0), px(0.0)), gpui_size(px(1920.0), px(1080.0)));
+        let exact = place_image(area, 1280, 720, 1.0);
+        assert_eq!(f32::from(exact.size.width), 1280.0);
+        assert_eq!(f32::from(exact.size.height), 720.0);
 
-    #[test]
-    fn oversized_desktops_scale_down_and_center() {
-        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 1000.0));
-        let (rect, filter) = place_image(area, &info(2000, 1000), 1.0);
-        assert_eq!(filter, FilterMode::Linear);
-        assert_eq!(rect.size(), vec2(1000.0, 500.0));
-        assert_eq!(rect.center(), area.center());
-    }
-
-    #[test]
-    fn fingerprints_wrap_in_two_lines() {
-        let fp = (0..32)
-            .map(|i| format!("{i:02X}"))
-            .collect::<Vec<_>>()
-            .join(":");
-        assert_eq!(split_fingerprint(&fp).lines().count(), 2);
+        let scaled = place_image(area, 3840, 2160, 1.0);
+        assert!((f32::from(scaled.size.width) - 1920.0).abs() < 0.5);
+        assert!((f32::from(scaled.size.height) - 1080.0).abs() < 0.5);
     }
 }

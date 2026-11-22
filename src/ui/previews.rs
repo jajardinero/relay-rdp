@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use egui_wgpu::wgpu;
+use gpui_kit::RenderImage;
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use uuid::Uuid;
 
 use crate::gpu::GpuContext;
@@ -35,7 +36,7 @@ pub struct Previews {
     in_flight: Arc<Mutex<HashSet<Uuid>>>,
     updated: Arc<Mutex<HashSet<Uuid>>>,
     /// Loaded snapshots; `None` when a host has none.
-    textures: HashMap<Uuid, Option<egui::TextureHandle>>,
+    textures: HashMap<Uuid, Option<Arc<RenderImage>>>,
     /// Bumped by deletions, so a snapshot taken before one isn't saved after it.
     epoch: Arc<AtomicU64>,
 }
@@ -133,13 +134,13 @@ impl Previews {
     }
 
     /// The host's snapshot, loaded once and again after a new one is saved.
-    pub fn texture(&mut self, ctx: &egui::Context, id: Uuid) -> Option<egui::TextureHandle> {
+    pub fn image(&mut self, id: Uuid) -> Option<Arc<RenderImage>> {
         let stale = self.updated.lock().remove(&id);
         if stale || !self.textures.contains_key(&id) {
             let loaded = self
                 .dir
                 .as_deref()
-                .and_then(|dir| load(ctx, &Self::path(dir, id)));
+                .and_then(|dir| load(&Self::path(dir, id)));
             self.textures.insert(id, loaded);
         }
         self.textures.get(&id).cloned().flatten()
@@ -272,12 +273,15 @@ fn span(i: u32, n: u32, total: u32) -> (u32, u32) {
     (start, end.min(total))
 }
 
-fn load(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
-    let image = image::open(path).ok()?.to_rgba8();
-    let size = [image.width() as usize, image.height() as usize];
-    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-    let name = format!("preview-{}", path.display());
-    Some(ctx.load_texture(name, pixels, egui::TextureOptions::LINEAR))
+fn load(path: &Path) -> Option<Arc<RenderImage>> {
+    let mut img = image::open(path).ok()?.to_rgba8();
+    // GPUI RenderImage expects BGRA8 pixel order.
+    for px in img.as_flat_samples_mut().samples.as_chunks_mut::<4>().0 {
+        px.swap(0, 2);
+    }
+    let mut frames = SmallVec::new();
+    frames.push(image::Frame::new(img));
+    Some(Arc::new(RenderImage::new(frames)))
 }
 
 #[cfg(test)]

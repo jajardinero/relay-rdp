@@ -1,5 +1,5 @@
-//! Shared GPU compositor. The session thread submits offscreen work; egui samples
-//! the completed desktop on the same queue. Video pixels never enter CPU memory.
+//! Shared GPU compositor. The session thread submits offscreen work; the UI samples
+//! the completed desktop. Video pixels decode via VA-API on the GPU.
 mod import;
 
 use std::collections::VecDeque;
@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use ash::vk;
-use egui_wgpu::{RenderState, WgpuSetup, WgpuSetupExisting, wgpu};
 use parking_lot::{Mutex, RwLock};
 use wgpu::util::DeviceExt;
 
@@ -209,31 +208,6 @@ pub struct Store444 {
 
 /// Enable foreign queue ownership transfers in addition to wgpu's DMA-BUF
 /// features. Fall back to ordinary device creation if the driver lacks interop.
-pub async fn configure(
-    setup: WgpuSetup,
-    window: Arc<winit::window::Window>,
-) -> anyhow::Result<WgpuSetup> {
-    let instance = setup.new_instance().await;
-    let surface = instance.create_surface(window)?;
-    let preference = wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::LowPower);
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: preference,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            ..Default::default()
-        })
-        .await?;
-    let (device, queue) = open_device(&adapter).await?;
-    Ok(WgpuSetupExisting {
-        instance,
-        adapter,
-        device,
-        queue,
-    }
-    .into())
-}
-
 async fn open_device(adapter: &wgpu::Adapter) -> anyhow::Result<(wgpu::Device, wgpu::Queue)> {
     let features = wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
     let mut desc = wgpu::DeviceDescriptor {
@@ -380,12 +354,26 @@ fn source_group(
 }
 
 impl GpuContext {
-    pub fn new(state: &RenderState) -> Option<Arc<Self>> {
+    /// Creates an offscreen Vulkan GPU context for hardware video decoding and
+    /// GPU-accelerated RDP surface composition.
+    pub fn new_headless() -> Option<Arc<Self>> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let preference =
+            wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::LowPower);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: preference,
+            ..Default::default()
+        }))
+        .map_err(|error| tracing::info!(%error, "GPU drawing unavailable: no Vulkan adapter"))
+        .ok()?;
+
         let storage = wgpu::DownlevelFlags::VERTEX_STORAGE
             | wgpu::DownlevelFlags::FRAGMENT_STORAGE
             | wgpu::DownlevelFlags::COMPUTE_SHADERS;
-        if !state
-            .adapter
+        if !adapter
             .get_downlevel_capabilities()
             .flags
             .contains(storage)
@@ -393,7 +381,14 @@ impl GpuContext {
             tracing::info!("GPU drawing unavailable: no compute shaders or storage buffers");
             return None;
         }
-        Some(Self::from_device(state.device.clone(), state.queue.clone()))
+
+        let (device, queue) = pollster::block_on(open_device(&adapter))
+            .map_err(|error| tracing::info!(%error, "GPU drawing unavailable: device open failed"))
+            .ok()?;
+
+        let info = adapter.get_info();
+        tracing::info!(adapter = %info.name, backend = ?info.backend, "GPU compositor ready");
+        Some(Self::from_device(device, queue))
     }
 
     /// Drawing needs only the device; VA-API decoding also needs DMA-BUF interop.
@@ -534,9 +529,8 @@ impl GpuContext {
         }
     }
 
-    /// Runs `f` while no session submits GPU work. Reconfiguring the window's surface waits for
-    /// the queue to drain, and wgpu fails it if another thread submits meanwhile: the window
-    /// keeps its old size while egui draws at the new one, failing every frame.
+    /// Runs `f` while no session submits GPU work.
+    #[allow(dead_code)]
     pub fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
         let _drained = self.submit_lock.write();
         f()

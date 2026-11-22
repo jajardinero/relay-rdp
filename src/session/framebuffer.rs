@@ -255,8 +255,9 @@ impl SharedFrame {
         !self.wake_pending.swap(true, Ordering::AcqRel)
     }
 
-    pub fn clear_wake(&self) {
-        self.wake_pending.store(false, Ordering::Release);
+    /// Returns whether a wake was pending and clears the flag.
+    pub fn take_wake(&self) -> bool {
+        self.wake_pending.swap(false, Ordering::AcqRel)
     }
 }
 

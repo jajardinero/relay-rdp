@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-use winit::event_loop::EventLoopProxy;
-
-use crate::app::UserEvent;
+use crate::app::UiWaker;
 
 pub enum Picked {
     RdpFile(PathBuf),
@@ -17,18 +15,18 @@ pub enum Picked {
 pub struct Picker {
     tx: mpsc::Sender<Picked>,
     rx: mpsc::Receiver<Picked>,
-    proxy: EventLoopProxy<UserEvent>,
+    waker: UiWaker,
     /// One chooser at a time.
     open: Arc<AtomicBool>,
 }
 
 impl Picker {
-    pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub fn new(waker: UiWaker) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             tx,
             rx,
-            proxy,
+            waker,
             open: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -60,13 +58,13 @@ impl Picker {
         if self.open.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (tx, proxy, open) = (self.tx.clone(), self.proxy.clone(), Arc::clone(&self.open));
+        let (tx, waker, open) = (self.tx.clone(), self.waker.clone(), Arc::clone(&self.open));
         let spawned = std::thread::Builder::new()
             .name("file-chooser".into())
             .spawn(move || {
                 if let Some(picked) = pick() {
                     let _ = tx.send(picked);
-                    let _ = proxy.send_event(UserEvent::Wake);
+                    waker.wake();
                 }
                 open.store(false, Ordering::Release);
             });

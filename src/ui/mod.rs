@@ -1,5 +1,6 @@
-//! Application UI: tab strip, host library, sessions, dialogs.
+//! Application UI: GPUI Kit root view, tab strip, host library, sessions, dialogs and input routing.
 
+pub mod assets;
 pub mod credentials;
 pub mod dialogs;
 pub mod editor;
@@ -13,26 +14,31 @@ pub mod widgets;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use egui::{Color32, CornerRadius, Sense, Stroke, vec2};
-use egui_phosphor::regular as icon;
-use egui_wgpu::wgpu::FilterMode;
-use ironrdp_input::Operation;
+use gpui_kit::{
+    App, Context, FocusHandle, Focusable as _, FontWeight, Hsla, InteractiveElement, IntoElement,
+    KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, ParentElement,
+    Pixels, Point, Render, ScrollEvent, StatefulInteractiveElement, Styled, Subscription, Window,
+    div, prelude::FluentBuilder as _, px, transparent_black,
+};
+use ironrdp_input::{Operation, Scancode};
 use parking_lot::Mutex;
 use uuid::Uuid;
-use winit::event::{MouseButton, MouseScrollDelta, TouchPhase};
-use winit::event_loop::EventLoopProxy;
 use zeroize::Zeroizing;
 
+use self::assets::{icon_svg, icons};
 use self::dialogs::{CredentialsDialog, Dialog};
-use self::tab::{Phase, SessionContext, SessionTab, TabId};
-use self::theme::{Palette, size};
+use self::session_view::ViewportSlot;
+use self::tab::{Phase, SessionContext, SessionTab, StageState, TabId};
+use self::theme::{Palette, radius, size};
 use crate::APP_NAME;
-use crate::app::UserEvent;
 use crate::app::gpu::RemoteTextures;
+use crate::app::inhibit::ShortcutInhibitor;
 use crate::app::input::{self, RemoteViewport};
-use crate::session::{Ended, PointerUpdate, SessionEvent, SessionId, SharedFrame, Stage};
+use crate::app::keymap::{self, codes};
+use crate::app::UiWaker;
+use crate::session::{Ended, SessionEvent, Stage};
 use crate::store::credentials::{CredentialProfile, CredentialStore};
 use crate::store::known_hosts::KnownHosts;
 use crate::store::profiles::{HostProfile, ProfileStore, parse_endpoint};
@@ -43,13 +49,6 @@ use crate::util::pick::{Picked, Picker};
 use crate::util::probe::Prober;
 
 pub const TAB_STRIP_HEIGHT: f32 = 44.0;
-
-pub enum WindowRequest {
-    SetFullscreen(bool),
-    SetTitle(String),
-    #[allow(dead_code)]
-    Quit,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Hotkey {
@@ -91,143 +90,213 @@ enum PendingSecret {
     HostWrite,
 }
 
-pub struct Ui {
+pub struct RelayApp {
     pub(crate) gpu: Option<Arc<crate::gpu::GpuContext>>,
-    proxy: EventLoopProxy<UserEvent>,
-    settings: SettingsStore,
-    profiles: ProfileStore,
-    credentials: CredentialStore,
-    credential_manager: credentials::Manager,
-    known_hosts: Arc<Mutex<KnownHosts>>,
-    prober: Prober,
-    picker: Picker,
-    previews: previews::Previews,
+    pub(crate) waker: UiWaker,
+    pub(crate) settings: SettingsStore,
+    pub(crate) profiles: ProfileStore,
+    pub(crate) credentials: CredentialStore,
+    pub(crate) credential_manager: credentials::Manager,
+    pub(crate) known_hosts: Arc<Mutex<KnownHosts>>,
+    pub(crate) prober: Prober,
+    pub(crate) picker: Picker,
+    pub(crate) previews: previews::Previews,
+    pub(crate) textures: RemoteTextures,
 
-    tabs: Vec<SessionTab>,
-    active: ActiveTab,
-    home: home::HomeState,
-    editor: Option<editor::EditorState>,
-    dialog: Option<Dialog>,
-    toasts: toasts::Toasts,
-    requests: Vec<WindowRequest>,
-    pending_launch: Option<LaunchRequest>,
+    pub(crate) tabs: Vec<SessionTab>,
+    pub(crate) active: ActiveTab,
+    pub(crate) home: home::HomeState,
+    pub(crate) editor: Option<editor::EditorState>,
+    pub(crate) dialog: Option<Dialog>,
+    pub(crate) toasts: toasts::Toasts,
+    pub(crate) pending_launch: Option<LaunchRequest>,
+    pub(crate) failure_details_open: bool,
 
-    fullscreen: bool,
-    applied_theme: Option<(bool, bool)>,
-    title: String,
-    pixels_per_point: f32,
-    /// The area available to a session last frame, in points.
-    session_area: Option<egui::Rect>,
-    viewport: Option<(TabId, RemoteViewport)>,
-    filters: HashMap<SessionId, FilterMode>,
-
-    pointer_pos: Option<egui::Pos2>,
-    pointer_over_remote: bool,
+    pub(crate) viewport_slot: ViewportSlot,
+    pub(crate) pointer_pos: Option<Point<Pixels>>,
+    pub(crate) pointer_over_remote: bool,
     pointer_grab: Option<TabId>,
     buttons_down: u8,
     pending_move: Option<(TabId, ironrdp_input::MousePosition)>,
-    surrender_focus: bool,
+    prev_modifiers: Modifiers,
+    prev_capslock: bool,
+    bar_menu_open: Option<TabId>,
+
+    focus_handle: FocusHandle,
+    inhibitor: Option<ShortcutInhibitor>,
+    applied_dark: Option<bool>,
+    title: String,
+    window_focused: bool,
+    focused_session: Option<TabId>,
+    frames_shown: u64,
 
     secret_worker: SecretWorker,
     pending_secrets: HashMap<Uuid, PendingSecret>,
-    /// The egui context, kept for work triggered outside a frame (keyring results).
-    last_ctx: Option<egui::Context>,
-    window_focused: bool,
-    /// The session told it has focus (clipboard sync follows it).
-    focused_session: Option<TabId>,
-    frames_shown: u64,
+    _window_subs: Vec<Subscription>,
 }
 
-impl Ui {
+impl RelayApp {
     pub fn new(
-        ctx: &egui::Context,
-        proxy: EventLoopProxy<UserEvent>,
         launch: Option<LaunchRequest>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Self {
-        theme::install_fonts(ctx);
-        let wake_proxy = proxy.clone();
+        let (waker, notify) = UiWaker::new();
+        let secret_waker = waker.clone();
         let secret_worker = SecretWorker::new(secrets::DesktopKeyring, move || {
-            let _ = wake_proxy.send_event(UserEvent::Wake);
+            secret_waker.wake();
         });
-        let prober = Prober::new(proxy.clone());
-        let picker = Picker::new(proxy.clone());
-        let preview_proxy = proxy.clone();
+        let prober = Prober::new(waker.clone());
+        let picker = Picker::new(waker.clone());
+        let preview_waker = waker.clone();
         let previews = previews::Previews::new(move || {
-            let _ = preview_proxy.send_event(UserEvent::Wake);
+            preview_waker.wake();
         });
-        let ui = Self {
-            gpu: None,
-            settings: SettingsStore::load(),
-            profiles: ProfileStore::load(),
-            credentials: CredentialStore::load(),
+
+        let gpu = crate::gpu::GpuContext::new_headless();
+        let inhibitor = ShortcutInhibitor::new(window);
+        let focus_handle = cx.focus_handle();
+        let home = home::HomeState::new(window, cx);
+
+        let settings = SettingsStore::load();
+        let profiles = ProfileStore::load();
+        let credentials = CredentialStore::load();
+        let known_hosts = Arc::new(Mutex::new(KnownHosts::load()));
+
+        // Spawn background wakeup loop driven by Notify (RDP frames/events, prober, keyring, picker, previews).
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                notify.notified().await;
+                let ok = this.update_in(cx, |app, window, cx| {
+                    app.poll(window, cx);
+                    cx.notify();
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // Periodic tick for smooth touchpad momentum glide, session bar edge dwell/linger,
+        // connect track spinner animation, reconnect countdown, and toast expiry.
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let ok = this.update_in(cx, |app, window, cx| {
+                    if app.tick(window, cx) {
+                        cx.notify();
+                    }
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let mut window_subs = Vec::new();
+        window_subs.push(cx.observe_window_activation(window, |this, window, cx| {
+            let active = window.is_window_active();
+            if !active {
+                this.release_all_input();
+            }
+            this.window_focused = active;
+            this.sync_session_focus();
+            cx.notify();
+        }));
+        window_subs.push(cx.observe_window_appearance(window, |this, window, cx| {
+            this.applied_dark = None;
+            this.apply_theme(window, cx);
+            cx.notify();
+        }));
+
+        let mut app = Self {
+            gpu,
+            waker,
+            settings,
+            profiles,
+            credentials,
             credential_manager: credentials::Manager::default(),
-            known_hosts: Arc::new(Mutex::new(KnownHosts::load())),
+            known_hosts,
             prober,
             picker,
             previews,
-            proxy,
+            textures: RemoteTextures::default(),
             tabs: Vec::new(),
             active: ActiveTab::Home,
-            home: home::HomeState::default(),
+            home,
             editor: None,
             dialog: None,
             toasts: toasts::Toasts::default(),
-            requests: Vec::new(),
             pending_launch: launch,
-            fullscreen: false,
-            applied_theme: None,
-            title: String::new(),
-            pixels_per_point: 1.0,
-            session_area: None,
-            viewport: None,
-            filters: HashMap::new(),
+            failure_details_open: false,
+            viewport_slot: ViewportSlot::default(),
             pointer_pos: None,
             pointer_over_remote: false,
             pointer_grab: None,
             buttons_down: 0,
             pending_move: None,
-            surrender_focus: false,
-            secret_worker,
-            pending_secrets: HashMap::new(),
-            last_ctx: None,
+            prev_modifiers: Modifiers::default(),
+            prev_capslock: false,
+            bar_menu_open: None,
+            focus_handle,
+            inhibitor,
+            applied_dark: None,
+            title: String::new(),
             window_focused: true,
             focused_session: None,
             frames_shown: 0,
+            secret_worker,
+            pending_secrets: HashMap::new(),
+            _window_subs: window_subs,
         };
-        ui.watch_hosts();
-        ui
+        app.watch_hosts();
+        app.apply_theme(window, cx);
+        app
     }
 
-    pub fn settings(&self) -> &AppSettings {
-        &self.settings.settings
-    }
-
-    fn palette(&self) -> Palette {
-        let dark = match self.settings.settings.theme {
+    fn is_dark(&self, window: &Window) -> bool {
+        match self.settings.settings.theme {
             ThemePreference::Dark => true,
             ThemePreference::Light => false,
-            ThemePreference::System => !matches!(dark_light::detect(), Ok(dark_light::Mode::Light)),
-        };
-        if dark { theme::DARK } else { theme::LIGHT }
-    }
-
-    pub fn clear_color(&self) -> [f32; 4] {
-        let c = self.palette().canvas;
-        [
-            f32::from(c.r()) / 255.0,
-            f32::from(c.g()) / 255.0,
-            f32::from(c.b()) / 255.0,
-            1.0,
-        ]
-    }
-
-    fn apply_theme(&mut self, ctx: &egui::Context) {
-        let palette = self.palette();
-        let key = (palette.dark, self.settings.settings.reduce_motion);
-        if self.applied_theme != Some(key) {
-            theme::apply(ctx, &palette, key.1);
-            self.applied_theme = Some(key);
+            ThemePreference::System => match window.appearance() {
+                gpui_kit::WindowAppearance::Light | gpui_kit::WindowAppearance::VibrantLight => {
+                    false
+                }
+                _ => !matches!(dark_light::detect(), Ok(dark_light::Mode::Light)),
+            },
         }
+    }
+
+    fn palette(&self, window: &Window) -> Palette {
+        Palette::for_mode(self.is_dark(window))
+    }
+
+    fn apply_theme(&mut self, window: &Window, cx: &mut App) {
+        let dark = self.is_dark(window);
+        if self.applied_dark != Some(dark) {
+            let p = Palette::for_mode(dark);
+            theme::apply(cx, &p);
+            self.applied_dark = Some(dark);
+        }
+    }
+
+    pub fn update_settings(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut AppSettings),
+    ) {
+        let prev_previews = self.settings.settings.desktop_previews;
+        f(&mut self.settings.settings);
+        if prev_previews && !self.settings.settings.desktop_previews {
+            self.previews.clear();
+        }
+        self.settings.save();
+        self.applied_dark = None;
+        cx.notify();
     }
 
     fn watch_hosts(&self) {
@@ -238,86 +307,6 @@ impl Ui {
             .map(|h| (h.address.trim().to_owned(), h.port))
             .collect();
         self.prober.watch(endpoints);
-    }
-
-    // ── Per-frame plumbing used by the app shell ──────────────────────────────
-
-    /// Drains session events and background results.
-    pub fn poll(&mut self) {
-        for tab in &mut self.tabs {
-            while let Some(event) = tab.handle.try_event() {
-                let went_live = matches!(event, SessionEvent::StageCompleted(Stage::Desktop, _));
-                if let SessionEvent::HostOs(os) = event
-                    && tab.saved
-                {
-                    self.profiles.set_detected_os(tab.profile.id, os);
-                }
-                tab.handle_event(event);
-                if went_live && tab.saved {
-                    self.profiles.mark_connected(tab.profile.id);
-                }
-            }
-        }
-
-        // Snapshots of live sessions for the host library's tiles.
-        if self.settings.settings.desktop_previews {
-            for tab in &self.tabs {
-                if let (true, true, Some(since)) = (tab.saved, tab.is_live(), tab.live_since) {
-                    let gpu = self.gpu.as_ref();
-                    self.previews
-                        .capture_if_due(tab.profile.id, since, &tab.handle.frame, gpu);
-                }
-            }
-        }
-
-        // Tabs the user disconnected on purpose simply close.
-        let closed: Vec<TabId> = self
-            .tabs
-            .iter()
-            .filter(|t| matches!(t.phase, Phase::Ended(Ended::Closed)))
-            .map(|t| t.id)
-            .collect();
-        for id in closed {
-            self.close_tab(id);
-        }
-
-        while let Some(picked) = self.picker.try_recv() {
-            match picked {
-                Picked::RdpFile(path) => self.import_rdp_file(&path),
-                Picked::SharedFolder(path) => {
-                    if let Some(editor) = &mut self.editor {
-                        editor.add_shared_folder(path);
-                    }
-                }
-            }
-        }
-
-        self.poll_secrets();
-    }
-
-    pub fn frames(&self) -> Vec<(SessionId, Arc<SharedFrame>)> {
-        self.tabs
-            .iter()
-            .map(|t| (t.handle.id, Arc::clone(&t.handle.frame)))
-            .collect()
-    }
-
-    pub fn texture_filters(&self) -> &HashMap<SessionId, FilterMode> {
-        &self.filters
-    }
-
-    pub fn set_fullscreen_state(&mut self, fullscreen: bool) {
-        self.fullscreen = fullscreen;
-    }
-
-    pub fn take_window_requests(&mut self) -> Vec<WindowRequest> {
-        std::mem::take(&mut self.requests)
-    }
-
-    pub fn shutdown(&mut self) {
-        for tab in &mut self.tabs {
-            tab.disconnect();
-        }
     }
 
     fn tab(&self, id: TabId) -> Option<&SessionTab> {
@@ -335,98 +324,269 @@ impl Ui {
         }
     }
 
-    // ── Input routing ─────────────────────────────────────────────────────────
+    // ── Periodic tick & background polling ────────────────────────────────────
 
-    /// The session that should receive keyboard input, if any.
-    pub fn keyboard_session(&mut self, ctx: &egui::Context) -> Option<&mut SessionTab> {
-        if self.dialog.is_some() || ctx.egui_wants_keyboard_input() {
-            return None;
-        }
-        let tab = self.active_tab_mut()?;
-        (tab.is_live() && tab.cert_prompt.is_none()).then_some(tab)
-    }
+    /// Returns true if the UI needs a redraw.
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mut dirty = false;
+        let now = Instant::now();
 
-    fn pointer_target(
-        &self,
-        ctx: &egui::Context,
-        pos: egui::Pos2,
-    ) -> Option<(TabId, RemoteViewport)> {
-        let (tab_id, viewport) = self.viewport?;
-        if self.pointer_grab == Some(tab_id) {
-            return Some((tab_id, viewport));
-        }
-        if self.dialog.is_some() || !viewport.contains(pos) {
-            return None;
-        }
-        let tab = self.tab(tab_id)?;
-        if !tab.is_live() || tab.cert_prompt.is_some() {
-            return None;
-        }
-        // Floating UI (session bar, menus, toasts) sits on higher layers and keeps the pointer.
-        if ctx
-            .layer_id_at(pos)
-            .is_some_and(|layer| layer.order != egui::Order::Background)
-        {
-            return None;
-        }
-        Some((tab_id, viewport))
-    }
-
-    /// Returns true when the move went to a remote desktop.
-    pub fn pointer_moved(&mut self, ctx: &egui::Context, pos: egui::Pos2) -> bool {
-        self.pointer_pos = Some(pos);
-        match self.pointer_target(ctx, pos) {
-            Some((tab_id, viewport)) => {
-                self.pointer_over_remote = true;
-                self.pending_move = Some((tab_id, viewport.to_remote(pos)));
-                true
-            }
-            None => {
-                self.pointer_over_remote = false;
-                false
-            }
-        }
-    }
-
-    pub fn pointer_left(&mut self) {
-        self.pointer_pos = None;
-        self.pointer_over_remote = false;
-        self.pending_move = None;
-    }
-
-    pub fn flush_pointer(&mut self) {
+        // Flush coalesced mouse moves.
         if let Some((tab_id, position)) = self.pending_move.take()
             && let Some(tab) = self.tab_mut(tab_id)
         {
             tab.send_ops([Operation::MouseMove(position)]);
         }
+
+        // Touchpad momentum glide steps.
+        let touchpad = self.touchpad_scrolling();
+        for tab in &mut self.tabs {
+            if tab.wheel.next_step().is_some_and(|at| at <= now) {
+                let ops = tab.wheel.glide(now, touchpad);
+                tab.send_ops(ops);
+            }
+        }
+
+        // Session bar edge dwell & linger timers.
+        if let ActiveTab::Session(id) = self.active {
+            let area_top = self
+                .viewport_slot
+                .0
+                .borrow()
+                .map(|(bounds, _)| f32::from(bounds.origin.y));
+            let pointer = self.pointer_pos;
+            let menu_open = self.bar_menu_open == Some(id);
+            if let Some(tab) = self.tab_mut(id) {
+                match &tab.phase {
+                    Phase::Connecting => {
+                        if tab.stages.iter().any(|s| matches!(s, StageState::Active(_))) {
+                            dirty = true;
+                        }
+                    }
+                    Phase::Reconnecting { .. } => {
+                        dirty = true;
+                    }
+                    Phase::Live => {
+                        let was_visible = tab.bar.engaged
+                            || tab.bar.visible_until.is_some_and(|until| now < until);
+                        let near_edge = pointer.zip(area_top).is_some_and(|(pos, top)| {
+                            let y = f32::from(pos.y);
+                            y >= top - 1.0 && y <= top + session_view::EDGE_ZONE
+                        });
+                        if near_edge {
+                            let since = *tab.bar.edge_since.get_or_insert(now);
+                            if now.duration_since(since) >= session_view::EDGE_DWELL {
+                                tab.bar.visible_until = Some(now + session_view::BAR_LINGER);
+                            }
+                        } else {
+                            tab.bar.edge_since = None;
+                        }
+                        if tab.bar.engaged || menu_open {
+                            tab.bar.visible_until = Some(now + session_view::BAR_LINGER);
+                        }
+                        let is_visible = tab.bar.engaged
+                            || menu_open
+                            || tab.bar.visible_until.is_some_and(|until| now < until);
+                        if !is_visible {
+                            tab.bar.visible_until = None;
+                        }
+                        if was_visible != is_visible {
+                            dirty = true;
+                        }
+                    }
+                    Phase::Ended(_) => {}
+                }
+            }
+        }
+
+        // Toast pruning.
+        let toast_before = self.toasts.prune().is_some();
+        let toast_after = self.toasts.prune().is_some();
+        if toast_before != toast_after {
+            dirty = true;
+        }
+
+        // Update Wayland shortcut inhibitor.
+        let capture = self.wants_shortcut_capture(window);
+        if let Some(inhibitor) = &mut self.inhibitor {
+            inhibitor.set(capture);
+        }
+
+        // Sync remote desktop frames if any session signaled a frame update.
+        let frames: Vec<_> = self
+            .tabs
+            .iter()
+            .map(|t| (t.handle.id, Arc::clone(&t.handle.frame)))
+            .collect();
+        if !frames.is_empty() {
+            self.textures.sync(self.gpu.as_ref(), &frames);
+        }
+
+        // Check periodic desktop preview capture.
+        if self.settings.settings.desktop_previews {
+            for tab in &self.tabs {
+                if let (true, true, Some(since)) = (tab.saved, tab.is_live(), tab.live_since) {
+                    let gpu = self.gpu.as_ref();
+                    self.previews
+                        .capture_if_due(tab.profile.id, since, &tab.handle.frame, gpu);
+                }
+            }
+        }
+
+        // Wait a couple of frames so the window has its real size before CLI launch.
+        if self.frames_shown > 2
+            && let Some(launch) = self.pending_launch.take()
+        {
+            self.open_launch(launch, window, cx);
+            dirty = true;
+        }
+
+        dirty
     }
 
-    /// Returns true when the click went to a remote desktop.
-    pub fn pointer_button(
+    /// Drains session events, file picker results, and keyring completions.
+    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for tab in &mut self.tabs {
+            while let Some(event) = tab.handle.try_event() {
+                let went_live = matches!(event, SessionEvent::StageCompleted(Stage::Desktop, _));
+                if let SessionEvent::HostOs(os) = event
+                    && tab.saved
+                {
+                    self.profiles.set_detected_os(tab.profile.id, os);
+                }
+                tab.handle_event(event);
+                if went_live && tab.saved {
+                    self.profiles.mark_connected(tab.profile.id);
+                }
+            }
+        }
+
+        let frames: Vec<_> = self
+            .tabs
+            .iter()
+            .map(|t| (t.handle.id, Arc::clone(&t.handle.frame)))
+            .collect();
+        self.textures.sync(self.gpu.as_ref(), &frames);
+
+        // Tabs the user disconnected on purpose simply close.
+        let closed: Vec<TabId> = self
+            .tabs
+            .iter()
+            .filter(|t| matches!(t.phase, Phase::Ended(Ended::Closed)))
+            .map(|t| t.id)
+            .collect();
+        for id in closed {
+            self.close_tab(id, window);
+        }
+
+        while let Some(picked) = self.picker.try_recv() {
+            match picked {
+                Picked::RdpFile(path) => self.import_rdp_file(&path, window, cx),
+                Picked::SharedFolder(path) => {
+                    if let Some(editor) = &mut self.editor {
+                        editor.add_shared_folder(path, window, cx);
+                    }
+                }
+            }
+        }
+
+        self.poll_secrets(window, cx);
+    }
+
+    // ── Session bar & pointer / keyboard input ────────────────────────────────
+
+    pub fn set_session_bar_hovered(&mut self, id: TabId, hovered: bool) {
+        let menu_open = self.bar_menu_open == Some(id);
+        if let Some(tab) = self.tab_mut(id) {
+            tab.bar.engaged = hovered || menu_open;
+            if hovered {
+                tab.bar.visible_until = Some(Instant::now() + session_view::BAR_LINGER);
+            }
+        }
+    }
+
+    pub fn set_session_bar_menu_open(&mut self, id: TabId, open: bool) {
+        self.bar_menu_open = open.then_some(id);
+        if let Some(tab) = self.tab_mut(id) {
+            tab.bar.engaged = open;
+            if open {
+                tab.bar.visible_until = Some(Instant::now() + session_view::BAR_LINGER);
+            }
+        }
+    }
+
+    fn current_viewport(&self) -> Option<RemoteViewport> {
+        self.viewport_slot.0.borrow().and_then(|(_, vp)| vp)
+    }
+
+    fn pointer_target(&self, tab_id: TabId, pos: Point<Pixels>) -> Option<RemoteViewport> {
+        let viewport = self.current_viewport()?;
+        if self.pointer_grab == Some(tab_id) {
+            return Some(viewport);
+        }
+        if self.dialog.is_some() || !viewport.contains(pos) {
+            return None;
+        }
+        let tab = self.tab(tab_id)?;
+        if !tab.is_live() || tab.cert_prompt.is_some() || tab.bar.engaged {
+            return None;
+        }
+        Some(viewport)
+    }
+
+    pub fn on_session_mouse_move(
         &mut self,
-        ctx: &egui::Context,
-        button: MouseButton,
-        pressed: bool,
-    ) -> bool {
-        let Some(pos) = self.pointer_pos else {
-            return false;
-        };
-        let target = if pressed || self.pointer_grab.is_none() {
-            self.pointer_target(ctx, pos)
+        tab_id: TabId,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pointer_pos = Some(pos);
+        if let Some(viewport) = self.pointer_target(tab_id, pos) {
+            self.pointer_over_remote = true;
+            self.pending_move = Some((tab_id, viewport.to_remote(pos)));
+            // Repaint when software cursor bitmap is active so the cursor tracks smoothly.
+            if let Some(tab) = self.tab(tab_id)
+                && matches!(tab.cursor, crate::session::PointerUpdate::Bitmap(_))
+            {
+                cx.notify();
+            }
         } else {
-            self.viewport
-                .filter(|(id, _)| Some(*id) == self.pointer_grab)
+            self.pointer_over_remote = false;
+        }
+    }
+
+    pub fn on_session_mouse_button(
+        &mut self,
+        tab_id: TabId,
+        button: MouseButton,
+        pos: Point<Pixels>,
+        pressed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pointer_pos = Some(pos);
+        let target = if pressed || self.pointer_grab.is_none() {
+            self.pointer_target(tab_id, pos)
+        } else if self.pointer_grab == Some(tab_id) {
+            self.current_viewport()
+        } else {
+            None
         };
-        let Some((tab_id, viewport)) = target else {
-            return false;
+        let Some(viewport) = target else {
+            return;
         };
 
-        self.flush_pointer();
+        if let Some((tid, mpos)) = self.pending_move.take()
+            && let Some(tab) = self.tab_mut(tid)
+        {
+            tab.send_ops([Operation::MouseMove(mpos)]);
+        }
+
         if pressed {
             self.buttons_down = self.buttons_down.saturating_add(1);
             self.pointer_grab = Some(tab_id);
-            self.surrender_focus = true;
+            // Return keyboard focus to the root view so keys go straight to the remote desktop.
+            window.focus(&self.focus_handle, cx);
         } else {
             self.buttons_down = self.buttons_down.saturating_sub(1);
             if self.buttons_down == 0 {
@@ -435,7 +595,7 @@ impl Ui {
         }
 
         let Some(rdp_button) = input::rdp_button(button) else {
-            return true;
+            return;
         };
         if let Some(tab) = self.tab_mut(tab_id) {
             let op = if pressed {
@@ -446,72 +606,202 @@ impl Ui {
             };
             tab.send_ops([Operation::MouseMove(viewport.to_remote(pos)), op]);
         }
-        true
     }
 
-    pub fn pointer_wheel(
-        &mut self,
-        ctx: &egui::Context,
-        delta: MouseScrollDelta,
-        phase: TouchPhase,
-    ) -> bool {
-        let Some(pos) = self.pointer_pos else {
-            return false;
-        };
-        let Some((tab_id, _)) = self.pointer_target(ctx, pos) else {
-            return false;
-        };
-        self.flush_pointer();
+    pub fn on_session_scroll(&mut self, tab_id: TabId, event: &ScrollEvent) {
+        self.pointer_pos = Some(event.position);
+        if self.pointer_target(tab_id, event.position).is_none() {
+            return;
+        }
+        if let Some((tid, mpos)) = self.pending_move.take()
+            && let Some(tab) = self.tab_mut(tid)
+        {
+            tab.send_ops([Operation::MouseMove(mpos)]);
+        }
         let touchpad = self.touchpad_scrolling();
         if let Some(tab) = self.tab_mut(tab_id) {
-            let ops = tab.wheel.operations(delta, phase, Instant::now(), touchpad);
+            let ops =
+                tab.wheel
+                    .operations(event.delta, event.touch_phase, Instant::now(), touchpad);
             tab.send_ops(ops);
         }
-        true
     }
 
     fn touchpad_scrolling(&self) -> input::TouchpadScrolling {
-        let settings = &self.settings.settings;
+        let s = &self.settings.settings;
         input::TouchpadScrolling {
-            speed: f64::from(settings.touchpad_scroll_speed),
-            momentum: settings.touchpad_momentum,
+            speed: f64::from(s.touchpad_scroll_speed),
+            momentum: s.touchpad_momentum,
         }
     }
 
-    /// Continues touchpad scrolling that is gliding after the fingers lifted.
-    pub fn glide(&mut self, now: Instant) {
-        let touchpad = self.touchpad_scrolling();
-        for tab in &mut self.tabs {
-            if tab.wheel.next_step().is_some_and(|at| at <= now) {
-                let ops = tab.wheel.glide(now, touchpad);
-                tab.send_ops(ops);
+    fn any_input_focused(&self, window: &Window, cx: &App) -> bool {
+        if self.home.search_focused(window, cx) {
+            return true;
+        }
+        if let Some(ed) = &self.editor
+            && ed.any_input_focused(window, cx)
+        {
+            return true;
+        }
+        if let Some(Dialog::Credentials(dlg)) = &self.dialog
+            && (dlg.user_input.read(cx).focus_handle(cx).is_focused(window)
+                || dlg.domain_input.read(cx).focus_handle(cx).is_focused(window)
+                || dlg.password_input.read(cx).focus_handle(cx).is_focused(window))
+        {
+            return true;
+        }
+        if let Some(draft) = &self.credential_manager.draft
+            && (draft.name_input.read(cx).focus_handle(cx).is_focused(window)
+                || draft.user_input.read(cx).focus_handle(cx).is_focused(window)
+                || draft.domain_input.read(cx).focus_handle(cx).is_focused(window)
+                || draft.password_input.read(cx).focus_handle(cx).is_focused(window))
+        {
+            return true;
+        }
+        false
+    }
+
+    fn keyboard_session(&mut self, window: &Window, cx: &App) -> Option<&mut SessionTab> {
+        if self.dialog.is_some() || self.any_input_focused(window, cx) {
+            return None;
+        }
+        let tab = self.active_tab_mut()?;
+        (tab.is_live() && tab.cert_prompt.is_none()).then_some(tab)
+    }
+
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prev = self.prev_modifiers;
+        let next = event.modifiers;
+        let prev_caps = self.prev_capslock;
+        let next_caps = event.capslock.on;
+        self.prev_modifiers = next;
+        self.prev_capslock = next_caps;
+
+        let Some(session) = self.keyboard_session(window, cx) else {
+            return;
+        };
+        for (old, new, code) in [
+            (prev.control, next.control, codes::CONTROL_LEFT),
+            (prev.alt, next.alt, codes::ALT_LEFT),
+            (prev.shift, next.shift, codes::SHIFT_LEFT),
+            (prev.platform, next.platform, codes::SUPER_LEFT),
+        ] {
+            if old != new {
+                session.key(code, new, false);
             }
         }
+        if prev_caps != next_caps {
+            session.send_combo(&[codes::CAPS_LOCK]);
+        }
     }
 
-    /// When the next glide step is due.
-    pub fn next_glide_step(&self) -> Option<Instant> {
-        self.tabs
-            .iter()
-            .filter_map(|tab| tab.wheel.next_step())
-            .min()
-    }
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let mods = event.keystroke.modifiers;
 
-    /// While the pointer is over a remote desktop, UI repaints on mouse moves are only needed
-    /// near the top edge, where the session bar lives.
-    pub fn wants_pointer_repaints(&self) -> bool {
-        let (Some(pos), Some((tab_id, viewport))) = (self.pointer_pos, self.viewport) else {
-            return true;
+        // Global Ctrl+K focuses search on Home.
+        if self.active == ActiveTab::Home
+            && self.dialog.is_none()
+            && (mods.control || mods.platform)
+            && !mods.alt
+            && key.eq_ignore_ascii_case("k")
+        {
+            self.home.focus_search(window, cx);
+            cx.notify();
+            return;
+        }
+
+        // Escape dismisses open modal/drawer/editor or clears Home search.
+        if key == "escape" && !self.is_live_session_focused(window, cx) {
+            if let Some(dialog) = &self.dialog {
+                let busy = matches!(dialog, Dialog::Credentials(c) if c.busy);
+                if !busy {
+                    self.dialog = None;
+                    cx.notify();
+                    return;
+                }
+            } else if self.editor.is_some() && !self.any_input_focused(window, cx) {
+                self.editor = None;
+                cx.notify();
+                return;
+            } else if self.active == ActiveTab::Home && self.home.search_focused(window, cx) {
+                self.home.clear_search(window, cx);
+                cx.notify();
+                return;
+            }
+        }
+
+        // Home search list Up/Down navigation.
+        if self.active == ActiveTab::Home
+            && self.dialog.is_none()
+            && self.home.search_focused(window, cx)
+        {
+            if key == "down" {
+                self.home.move_selection(1);
+                cx.notify();
+                return;
+            } else if key == "up" {
+                self.home.move_selection(-1);
+                cx.notify();
+                return;
+            }
+        }
+
+        // Local RDP hotkeys (mstsc conventions: Ctrl+Alt+Enter/Home/End).
+        if mods.control && mods.alt && !event.is_held {
+            let hotkey = match key {
+                "enter" | "return" => Some(Hotkey::ToggleFullscreen),
+                "home" => Some(Hotkey::ShowSessionBar),
+                "end" => Some(Hotkey::SendCtrlAltDel),
+                _ => None,
+            };
+            if let Some(hotkey) = hotkey {
+                self.handle_hotkey(hotkey, window);
+                cx.notify();
+                return;
+            }
+        }
+
+        let Some(session) = self.keyboard_session(window, cx) else {
+            return;
         };
-        let bar_active = self.tab(tab_id).is_some_and(|t| {
-            t.bar.engaged || t.bar.edge_since.is_some() || t.bar.visible_until.is_some()
-        });
-        bar_active || pos.y <= viewport.rect.top() + session_view::EDGE_ZONE
+        if key.eq_ignore_ascii_case("pause") {
+            session.send_raw_input(input::pause_sequence());
+            return;
+        }
+        if let Some(scancode) = keymap::scancode(key) {
+            session.key(scancode, true, event.is_held);
+        }
     }
 
-    /// Whether system shortcuts should go to the remote computer right now. Never while the
-    /// session bar shows, so Ctrl+Alt+Home always gives the desktop its shortcuts back.
-    pub fn wants_shortcut_capture(&self) -> bool {
+    fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.keyboard_session(window, cx) else {
+            return;
+        };
+        if let Some(scancode) = keymap::scancode(event.keystroke.key.as_str()) {
+            session.key(scancode, false, false);
+        }
+    }
+
+    fn is_live_session_focused(&self, window: &Window, cx: &App) -> bool {
+        if self.dialog.is_some() || self.any_input_focused(window, cx) {
+            return false;
+        }
+        match self.active {
+            ActiveTab::Session(id) => self
+                .tab(id)
+                .is_some_and(|t| t.is_live() && t.cert_prompt.is_none()),
+            ActiveTab::Home => false,
+        }
+    }
+
+    fn wants_shortcut_capture(&self, window: &Window) -> bool {
         let ActiveTab::Session(id) = self.active else {
             return false;
         };
@@ -519,7 +809,7 @@ impl Ui {
             return false;
         };
         let enabled = match self.settings.settings.capture_shortcuts {
-            ShortcutCapture::Fullscreen => self.fullscreen,
+            ShortcutCapture::Fullscreen => window.is_fullscreen(),
             ShortcutCapture::Always => true,
             ShortcutCapture::Never => false,
         };
@@ -532,15 +822,7 @@ impl Ui {
             && !bar_showing
     }
 
-    pub fn remote_cursor(&self) -> Option<PointerUpdate> {
-        if !self.pointer_over_remote && self.pointer_grab.is_none() {
-            return None;
-        }
-        let (tab_id, _) = self.viewport?;
-        self.tab(tab_id).map(|t| t.cursor.clone())
-    }
-
-    pub fn release_all_input(&mut self) {
+    fn release_all_input(&mut self) {
         for tab in &mut self.tabs {
             tab.release_all();
         }
@@ -548,24 +830,19 @@ impl Ui {
         self.buttons_down = 0;
     }
 
-    pub fn hotkey(&mut self, hotkey: Hotkey) {
+    fn handle_hotkey(&mut self, hotkey: Hotkey, window: &mut Window) {
         match hotkey {
-            Hotkey::ToggleFullscreen => self
-                .requests
-                .push(WindowRequest::SetFullscreen(!self.fullscreen)),
+            Hotkey::ToggleFullscreen => window.toggle_fullscreen(),
             Hotkey::ShowSessionBar => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.release_all();
-                    tab.bar.visible_until =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
+                    tab.bar.visible_until = Some(Instant::now() + Duration::from_secs(4));
                 }
             }
             Hotkey::SendCtrlAltDel => {
                 if let Some(tab) = self.active_tab_mut()
                     && tab.is_live()
                 {
-                    // The local Ctrl+Alt are physically down; release them first so the
-                    // server sees a clean Ctrl+Alt+Del.
                     tab.release_all();
                     tab.send_ctrl_alt_del();
                 }
@@ -573,31 +850,177 @@ impl Ui {
         }
     }
 
-    // ── Connecting ────────────────────────────────────────────────────────────
-
-    /// Physical pixel size available for a session's desktop.
-    fn session_area_px(&self, ctx: &egui::Context) -> egui::Vec2 {
-        let area = self.session_area.unwrap_or_else(|| {
-            let mut r = ctx.content_rect();
-            if !self.fullscreen {
-                r.min.y += TAB_STRIP_HEIGHT;
-            }
-            r
-        });
-        area.size() * self.pixels_per_point
+    fn sync_session_focus(&mut self) {
+        let wanted = match self.active {
+            ActiveTab::Session(id) if self.window_focused => Some(id),
+            _ => None,
+        };
+        if wanted == self.focused_session {
+            return;
+        }
+        if let Some(old) = self.focused_session.and_then(|id| self.tab(id)) {
+            old.handle.send(crate::session::SessionCmd::Focus(false));
+        }
+        if let Some(new) = wanted.and_then(|id| self.tab(id)) {
+            new.handle.send(crate::session::SessionCmd::Focus(true));
+        }
+        self.focused_session = wanted;
     }
 
-    /// Connect to a profile: use the keyring password if one is saved, otherwise ask.
-    fn request_connect(&mut self, profile: HostProfile, saved: bool, tab: Option<TabId>) {
+    // ── Host, editor, dialog, credential & session actions ────────────────────
+
+    fn session_area_px(&self, window: &Window) -> (f32, f32) {
+        let scale = window.scale_factor();
+        if let Some((bounds, _)) = *self.viewport_slot.0.borrow() {
+            return (
+                f32::from(bounds.size.width) * scale,
+                f32::from(bounds.size.height) * scale,
+            );
+        }
+        let vp = window.viewport_size();
+        let h = if window.is_fullscreen() {
+            f32::from(vp.height)
+        } else {
+            (f32::from(vp.height) - TAB_STRIP_HEIGHT).max(200.0)
+        };
+        (f32::from(vp.width) * scale, h * scale)
+    }
+
+    pub fn connect_host_id(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profiles.get(id).cloned() {
+            self.request_connect(profile, true, None, window, cx);
+        }
+    }
+
+    pub fn quick_connect(
+        &mut self,
+        host: &str,
+        port: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (profile, saved) = self.profile_for(host, port);
+        self.request_connect(profile, saved, None, window, cx);
+    }
+
+    fn profile_for(&self, host: &str, port: u16) -> (HostProfile, bool) {
+        self.profiles
+            .hosts()
+            .iter()
+            .find(|h| h.address.eq_ignore_ascii_case(host) && h.port == port)
+            .map_or_else(
+                || (HostProfile::new(host, port), false),
+                |p| (p.clone(), true),
+            )
+    }
+
+    pub fn open_new_host_editor(
+        &mut self,
+        prefill: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut profile = HostProfile::new("", 3389);
+        if let Some((host, port)) = prefill.as_deref().and_then(parse_endpoint) {
+            profile.address = host.clone();
+            profile.name = host;
+            profile.port = port;
+        } else {
+            profile.name.clear();
+        }
+        self.editor = Some(editor::EditorState::new(profile, window, cx));
+        cx.notify();
+    }
+
+    pub fn edit_host_id(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profiles.get(id).cloned() {
+            self.editor = Some(editor::EditorState::edit(profile, window, cx));
+            cx.notify();
+        }
+    }
+
+    pub fn duplicate_host(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(mut profile) = self.profiles.get(id).cloned() {
+            profile.id = Uuid::new_v4();
+            profile.name = format!("{} copy", profile.display_name());
+            profile.save_password = false;
+            profile.last_connected = None;
+            self.editor = Some(editor::EditorState::new(profile, window, cx));
+            cx.notify();
+        }
+    }
+
+    pub fn prompt_delete_host(&mut self, id: Uuid) {
+        if let Some(profile) = self.profiles.get(id) {
+            self.dialog = Some(Dialog::ConfirmDelete {
+                id,
+                name: profile.display_name().to_owned(),
+            });
+        }
+    }
+
+    pub fn delete_host(&mut self, id: Uuid) {
+        self.dialog = None;
+        if let Some(removed) = self.profiles.remove(id) {
+            secrets::delete_password_in_background(removed.id);
+            self.previews.remove(removed.id);
+            self.watch_hosts();
+            self.toasts
+                .info(format!("Deleted {}", removed.display_name()));
+        }
+        if self.editor.as_ref().is_some_and(|e| e.profile_id() == id) {
+            self.editor = None;
+        }
+    }
+
+    pub fn save_editor(&mut self, connect: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let validated = self.editor.as_mut().and_then(|ed| ed.validate(cx));
+        let Some((profile, password)) = validated else {
+            cx.notify();
+            return;
+        };
+        match password {
+            editor::PasswordChange::Keep => {}
+            editor::PasswordChange::Set(password) => {
+                let request = self
+                    .secret_worker
+                    .submit(SecretOperation::Save(SecretId::Host(profile.id), password));
+                self.pending_secrets
+                    .insert(request, PendingSecret::HostWrite);
+            }
+            editor::PasswordChange::Forget => secrets::delete_password_in_background(profile.id),
+        }
+        self.profiles.upsert(profile.clone());
+        self.watch_hosts();
+        self.editor = None;
+        self.toasts
+            .info(format!("Saved {}", profile.display_name()));
+        if connect {
+            self.request_connect(profile, true, None, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn request_connect(
+        &mut self,
+        profile: HostProfile,
+        saved: bool,
+        tab: Option<TabId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (snapshot, target) = match self.credentials.connection(&profile, saved) {
             Ok(connection) => connection,
             Err(error) => {
-                self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
+                self.dialog = Some(Dialog::Credentials(Box::new(CredentialsDialog::new(
                     profile,
                     saved,
                     tab,
                     Some(error.to_string()),
-                )));
+                    window,
+                    cx,
+                ))));
+                cx.notify();
                 return;
             }
         };
@@ -612,13 +1035,70 @@ impl Ui {
                 },
             );
         } else {
-            self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
-                profile, saved, tab, None,
-            )));
+            self.dialog = Some(Dialog::Credentials(Box::new(CredentialsDialog::new(
+                profile, saved, tab, None, window, cx,
+            ))));
+            cx.notify();
         }
     }
 
-    fn handle_credential_action(&mut self, action: credentials::Action) {
+    pub fn submit_credentials_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Dialog::Credentials(dlg)) = &self.dialog else {
+            return;
+        };
+        if dlg.busy || !dlg.can_connect(&self.credentials) {
+            return;
+        }
+        let profile = dlg.profile.clone();
+        let saved = dlg.saved;
+        let tab = dlg.tab;
+        let password = dlg.password_value(cx);
+        let remember = dlg.remember;
+        let update_profile_password = dlg.update_profile_password;
+        let use_stored_password = dlg.use_stored_password && password.is_empty();
+
+        if use_stored_password && profile.credential_profile_id.is_some() {
+            if saved && let Some(mut stored) = self.profiles.get(profile.id).cloned() {
+                stored.credential_profile_id = profile.credential_profile_id;
+                self.profiles.upsert(stored);
+            }
+            self.dialog = None;
+            self.request_connect(profile, saved, tab, window, cx);
+        } else if update_profile_password && let Some(id) = profile.credential_profile_id {
+            let request = self.secret_worker.submit(SecretOperation::Save(
+                SecretId::Credential(id),
+                password.clone(),
+            ));
+            self.pending_secrets.insert(
+                request,
+                PendingSecret::UpdatePassword(SignIn {
+                    profile,
+                    saved,
+                    tab,
+                    password,
+                    remember,
+                }),
+            );
+            if let Some(Dialog::Credentials(state)) = &mut self.dialog {
+                state.set_busy(true);
+            }
+        } else {
+            self.finish_sign_in(
+                SignIn {
+                    profile,
+                    saved,
+                    tab,
+                    password,
+                    remember,
+                },
+                window,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    pub fn handle_credential_action(&mut self, action: credentials::Action) {
         if self.credential_manager.busy {
             return;
         }
@@ -647,7 +1127,7 @@ impl Ui {
         self.pending_secrets.insert(request, pending);
     }
 
-    fn poll_secrets(&mut self) {
+    fn poll_secrets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Some(completion) = self.secret_worker.try_recv() {
             let Some(pending) = self.pending_secrets.remove(&completion.request) else {
                 continue;
@@ -659,15 +1139,16 @@ impl Ui {
                     tab,
                 } => match completion.result {
                     Ok(Some(password)) => match self.credentials.resolve(&profile) {
-                        // A queued profile save may have completed while this lookup waited.
-                        Ok(snapshot) => self.launch(snapshot, saved, password, tab),
+                        Ok(snapshot) => self.launch(snapshot, saved, password, tab, window, cx),
                         Err(error) => {
-                            self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
+                            self.dialog = Some(Dialog::Credentials(Box::new(CredentialsDialog::new(
                                 profile,
                                 saved,
                                 tab,
                                 Some(error.to_string()),
-                            )));
+                                window,
+                                cx,
+                            ))));
                         }
                     },
                     result => {
@@ -678,12 +1159,14 @@ impl Ui {
                             _ => "No password is saved for this account. Enter one to continue."
                                 .to_owned(),
                         };
-                        self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
+                        self.dialog = Some(Dialog::Credentials(Box::new(CredentialsDialog::new(
                             profile,
                             saved,
                             tab,
                             Some(reason),
-                        )));
+                            window,
+                            cx,
+                        ))));
                     }
                 },
                 PendingSecret::SaveCredential(profile) => {
@@ -705,7 +1188,7 @@ impl Ui {
                     });
                     if result.is_ok() {
                         if let Some(editor) = &mut self.editor {
-                            editor.unassign_credentials(id);
+                            editor.unassign_credentials(id, window, cx);
                         }
                         self.toasts.info("Deleted credential profile");
                     } else if let Err(error) = &result {
@@ -717,7 +1200,7 @@ impl Ui {
                 PendingSecret::UpdatePassword(sign_in) => match completion.result {
                     Ok(_) => {
                         self.toasts.info("Updated profile password");
-                        self.finish_sign_in(sign_in);
+                        self.finish_sign_in(sign_in, window, cx);
                     }
                     Err(error) => {
                         let mut dialog = CredentialsDialog::new(
@@ -725,9 +1208,18 @@ impl Ui {
                             sign_in.saved,
                             sign_in.tab,
                             None,
+                            window,
+                            cx,
                         );
-                        dialog.password_save_failed(sign_in.password, format!("Couldn't update the profile password: {error}. Retry or uncheck Update profile password to use it once."));
-                        self.dialog = Some(Dialog::Credentials(dialog));
+                        dialog.password_save_failed(
+                            sign_in.password,
+                            format!(
+                                "Couldn't update the profile password: {error}. Retry or uncheck Update profile password to use it once."
+                            ),
+                            window,
+                            cx,
+                        );
+                        self.dialog = Some(Dialog::Credentials(Box::new(dialog)));
                     }
                 },
                 PendingSecret::HostWrite => {
@@ -740,7 +1232,7 @@ impl Ui {
         }
     }
 
-    fn finish_sign_in(&mut self, sign_in: SignIn) {
+    fn finish_sign_in(&mut self, sign_in: SignIn, window: &mut Window, cx: &mut Context<Self>) {
         let SignIn {
             profile,
             saved,
@@ -751,12 +1243,14 @@ impl Ui {
         let snapshot = match self.credentials.resolve(&profile) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
+                self.dialog = Some(Dialog::Credentials(Box::new(CredentialsDialog::new(
                     profile,
                     saved,
                     tab,
                     Some(error.to_string()),
-                )));
+                    window,
+                    cx,
+                ))));
                 return;
             }
         };
@@ -778,7 +1272,7 @@ impl Ui {
             self.profiles.upsert(stored);
         }
         self.dialog = None;
-        self.launch(snapshot, saved, password, tab);
+        self.launch(snapshot, saved, password, tab, window, cx);
     }
 
     fn launch(
@@ -787,20 +1281,19 @@ impl Ui {
         saved: bool,
         password: Zeroizing<String>,
         tab: Option<TabId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        let Some(ctx) = self.ctx_for_launch() else {
-            return;
-        };
         let desktop = SessionTab::desired_desktop(
             &profile,
-            self.session_area_px(&ctx),
-            self.pixels_per_point,
+            self.session_area_px(window),
+            window.scale_factor(),
         );
         let start_fullscreen = profile.display.start_fullscreen;
-        let cx = SessionContext {
+        let session_cx = SessionContext {
             hardware_video_decoding: self.settings.settings.hardware_video_decoding,
             gpu: self.gpu.clone(),
-            proxy: &self.proxy,
+            waker: &self.waker,
             known_hosts: &self.known_hosts,
         };
 
@@ -809,21 +1302,25 @@ impl Ui {
                 existing.profile = profile;
                 existing.saved = saved;
                 existing
-                    .restart(Some(password), desktop, &cx)
+                    .restart(Some(password), desktop, &session_cx)
                     .map(|()| existing.id)
             }
-            None => SessionTab::start(profile, saved, password, desktop, &cx).map(|new_tab| {
-                let id = new_tab.id;
-                self.tabs.push(new_tab);
-                id
-            }),
+            None => {
+                SessionTab::start(profile, saved, password, desktop, &session_cx).map(|new_tab| {
+                    let id = new_tab.id;
+                    self.tabs.push(new_tab);
+                    id
+                })
+            }
         };
 
         match result {
             Ok(id) => {
                 self.active = ActiveTab::Session(id);
-                if start_fullscreen && !self.fullscreen {
-                    self.requests.push(WindowRequest::SetFullscreen(true));
+                self.failure_details_open = false;
+                window.focus(&self.focus_handle, cx);
+                if start_fullscreen && !window.is_fullscreen() {
+                    window.toggle_fullscreen();
                 }
             }
             Err(e) => self
@@ -832,19 +1329,13 @@ impl Ui {
         }
     }
 
-    /// `launch` is called from both frame code and `poll`; it only needs the context for sizes.
-    fn ctx_for_launch(&self) -> Option<egui::Context> {
-        self.last_ctx.clone()
-    }
-
-    fn open_launch(&mut self, launch: LaunchRequest) {
+    fn open_launch(&mut self, launch: LaunchRequest, window: &mut Window, cx: &mut Context<Self>) {
         let target = launch.target.trim();
         let path = std::path::Path::new(target);
         let (mut profile, saved) = if path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("rdp"))
         {
-            // Like `mstsc file.rdp`: connect with the file's settings, without saving a host.
             match rdpfile::import_file(path) {
                 Ok(imported) => {
                     self.warn_unsupported(&imported.unsupported);
@@ -871,30 +1362,36 @@ impl Ui {
         {
             Ok(snapshot) => profile = snapshot,
             Err(error) => {
-                self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
+                self.dialog = Some(Dialog::Credentials(Box::new(CredentialsDialog::new(
                     profile,
                     saved,
                     None,
                     Some(error.to_string()),
-                )));
+                    window,
+                    cx,
+                ))));
                 return;
             }
         }
         match launch.password {
             Some(password) if !profile.username.is_empty() => {
-                self.launch(profile, saved, password, None)
+                self.launch(profile, saved, password, None, window, cx)
             }
-            _ => self.request_connect(profile, saved && !explicit_user, None),
+            _ => self.request_connect(profile, saved && !explicit_user, None, window, cx),
         }
     }
 
-    /// Loads a `.rdp` file into the host editor, so it can be reviewed and saved.
-    fn import_rdp_file(&mut self, path: &std::path::Path) {
+    fn import_rdp_file(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match rdpfile::import_file(path) {
             Ok(imported) => {
                 let name = imported.profile.display_name().to_owned();
                 self.warn_unsupported(&imported.unsupported);
-                self.editor = Some(editor::EditorState::new(imported.profile));
+                self.editor = Some(editor::EditorState::new(imported.profile, window, cx));
                 self.active = ActiveTab::Home;
                 self.toasts
                     .info(format!("Imported {name}. Review the settings, then save."));
@@ -914,24 +1411,6 @@ impl Ui {
         }
     }
 
-    /// The saved host with this address (so its settings and password apply), or a new one.
-    fn profile_for(&self, host: &str, port: u16) -> (HostProfile, bool) {
-        self.profiles
-            .hosts()
-            .iter()
-            .find(|h| h.address.eq_ignore_ascii_case(host) && h.port == port)
-            .map_or_else(
-                || (HostProfile::new(host, port), false),
-                |p| (p.clone(), true),
-            )
-    }
-
-    fn quick_connect(&mut self, host: &str, port: u16) {
-        let (profile, saved) = self.profile_for(host, port);
-        self.request_connect(profile, saved, None);
-    }
-
-    /// A last snapshot of a live session the user is leaving.
     fn capture_preview(&mut self, id: TabId) {
         if !self.settings.settings.desktop_previews {
             return;
@@ -946,7 +1425,19 @@ impl Ui {
         }
     }
 
-    fn close_tab(&mut self, id: TabId) {
+    pub fn disconnect_tab(&mut self, id: TabId) {
+        self.capture_preview(id);
+        if let Some(tab) = self.tab_mut(id) {
+            tab.disconnect();
+        }
+    }
+
+    pub fn minimize_tab(&mut self, id: TabId) {
+        self.capture_preview(id);
+        self.active = ActiveTab::Home;
+    }
+
+    pub fn close_tab(&mut self, id: TabId, window: &mut Window) {
         self.capture_preview(id);
         if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
             let mut tab = self.tabs.remove(index);
@@ -961,37 +1452,257 @@ impl Ui {
                 self.pointer_grab = None;
                 self.buttons_down = 0;
             }
+            if self.bar_menu_open == Some(id) {
+                self.bar_menu_open = None;
+            }
         }
-        if self.tabs.is_empty() && self.fullscreen {
-            self.requests.push(WindowRequest::SetFullscreen(false));
+        if self.tabs.is_empty() && window.is_fullscreen() {
+            window.toggle_fullscreen();
         }
     }
 
-    // ── Frame ─────────────────────────────────────────────────────────────────
-
-    pub fn show(&mut self, root: &mut egui::Ui, textures: &RemoteTextures) {
-        let ctx = &root.ctx().clone();
-        self.last_ctx = Some(ctx.clone());
-        self.pixels_per_point = ctx.pixels_per_point();
-        self.apply_theme(ctx);
-        let palette = Palette::of_ctx(ctx);
-
-        if self.surrender_focus {
-            self.surrender_focus = false;
-            if let Some(id) = ctx.memory(|m| m.focused()) {
-                ctx.memory_mut(|m| m.surrender_focus(id));
+    pub fn reconnect_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab(id) {
+            let profile = self
+                .profiles
+                .get(tab.profile.id)
+                .filter(|_| tab.saved)
+                .unwrap_or(&tab.profile)
+                .clone();
+            if profile.credential_profile_id.is_some()
+                || tab.profile.credential_profile_id.is_some()
+            {
+                let saved = tab.saved;
+                self.request_connect(profile, saved, Some(id), window, cx);
+                return;
             }
         }
-
-        // Wait a couple of frames so the window has its real size before we pick a desktop
-        // size; otherwise the server would be asked to resize right after connecting.
-        self.frames_shown += 1;
-        if self.frames_shown > 2
-            && let Some(launch) = self.pending_launch.take()
-        {
-            self.open_launch(launch);
+        let area = self.session_area_px(window);
+        let scale = window.scale_factor();
+        let session_cx = SessionContext {
+            hardware_video_decoding: self.settings.settings.hardware_video_decoding,
+            gpu: self.gpu.clone(),
+            waker: &self.waker,
+            known_hosts: &self.known_hosts,
+        };
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            let desktop = SessionTab::desired_desktop(&tab.profile, area, scale);
+            if let Err(e) = tab.restart(None, desktop, &session_cx) {
+                self.toasts.error(format!("Couldn't reconnect: {e}"));
+            }
         }
+        cx.notify();
+    }
 
+    pub fn retry_tab_now(&self, id: TabId) {
+        if let Some(tab) = self.tab(id) {
+            tab.retry_now();
+        }
+    }
+
+    pub fn change_tab_credentials(
+        &mut self,
+        id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tab(id) {
+            let failure = match &tab.phase {
+                Phase::Ended(Ended::Failed(f)) => Some(f.title.clone()),
+                _ => None,
+            };
+            let profile = self
+                .profiles
+                .get(tab.profile.id)
+                .filter(|_| tab.saved)
+                .unwrap_or(&tab.profile)
+                .clone();
+            let saved = tab.saved;
+            self.dialog = Some(Dialog::Credentials(Box::new(CredentialsDialog::new(
+                profile,
+                saved,
+                Some(id),
+                failure,
+                window,
+                cx,
+            ))));
+            cx.notify();
+        }
+    }
+
+    pub fn edit_tab_host(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab(id)
+            && tab.saved
+            && let Some(profile) = self.profiles.get(tab.profile.id).cloned()
+        {
+            self.editor = Some(editor::EditorState::edit(profile, window, cx));
+            self.active = ActiveTab::Home;
+            cx.notify();
+        }
+    }
+
+    pub fn answer_tab_certificate(&mut self, id: TabId, trust: bool) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.answer_certificate(trust);
+        }
+    }
+
+    pub fn send_tab_ctrl_alt_del(&mut self, id: TabId) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.send_ctrl_alt_del();
+        }
+    }
+
+    pub fn send_tab_keys(&mut self, id: TabId, keys: &[Scancode]) {
+        if let Some(tab) = self.tab_mut(id) {
+            tab.send_combo(keys);
+        }
+    }
+
+    // ── Top tab strip rendering ───────────────────────────────────────────────
+
+    fn render_tab_strip(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let home_selected = self.active == ActiveTab::Home;
+        let hover = p.hover;
+        let raised = p.raised;
+
+        let home_chip = div()
+            .id("tab-home")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(32.0))
+            .px(px(12.0))
+            .rounded(radius::ROW)
+            .bg(if home_selected {
+                p.surface
+            } else {
+                transparent_black()
+            })
+            .border_1()
+            .border_color(if home_selected {
+                p.hairline
+            } else {
+                transparent_black()
+            })
+            .text_size(size::BODY)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if home_selected { p.text } else { p.muted })
+            .cursor_pointer()
+            .when(!home_selected, |el| el.hover(move |s| s.bg(hover)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.active = ActiveTab::Home;
+                cx.notify();
+            }))
+            .child(icon_svg(
+                icons::SQUARES_FOUR,
+                px(15.0),
+                if home_selected { p.text } else { p.muted },
+            ))
+            .child("Hosts");
+
+        let session_chips = self.tabs.iter().map(|tab| {
+            let tab_id = tab.id;
+            let selected = self.active == ActiveTab::Session(tab_id);
+            let status = tab_status_color(tab, p);
+            let title = tab.title().to_owned();
+            let grp = gpui_kit::SharedString::from(format!("tab-chip-{}", tab_id.raw()));
+
+            div()
+                .id(("tab-session", tab_id.raw()))
+                .group(grp.clone())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .h(px(32.0))
+                .min_w(px(80.0))
+                .max_w(px(220.0))
+                .pl(px(12.0))
+                .pr(px(6.0))
+                .rounded(radius::ROW)
+                .bg(if selected {
+                    p.surface
+                } else {
+                    transparent_black()
+                })
+                .border_1()
+                .border_color(if selected {
+                    p.hairline
+                } else {
+                    transparent_black()
+                })
+                .text_size(size::BODY)
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if selected { p.text } else { p.muted })
+                .cursor_pointer()
+                .when(!selected, |el| el.hover(move |s| s.bg(hover)))
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _, window, cx| {
+                        this.close_tab(tab_id, window);
+                        cx.notify();
+                    }),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.active = ActiveTab::Session(tab_id);
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }))
+                // Status dot
+                .child(div().size(px(7.0)).flex_shrink_0().rounded_full().bg(status))
+                // Title
+                .child(div().flex_1().min_w_0().truncate().child(title))
+                // Close button
+                .child(
+                    div()
+                        .id(("tab-close", tab_id.raw()))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(20.0))
+                        .flex_shrink_0()
+                        .rounded(px(4.0))
+                        .when(!selected, |el| {
+                            el.invisible().group_hover(grp, |s| s.visible())
+                        })
+                        .hover(move |s| s.bg(raised))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab(tab_id, window);
+                            cx.notify();
+                        }))
+                        .child(icon_svg(icons::X, px(12.0), p.muted)),
+                )
+        });
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .w_full()
+            .h(px(TAB_STRIP_HEIGHT))
+            .flex_shrink_0()
+            .px(px(10.0))
+            .bg(p.canvas)
+            .child(home_chip)
+            .children(session_chips)
+    }
+}
+
+impl Render for RelayApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.frames_shown += 1;
+        self.textures.flush_dropped(window);
+        self.apply_theme(window, cx);
+        self.sync_session_focus();
+
+        let p = self.palette(window);
+
+        // Keep window title synced with active tab.
         let title = match self.active {
             ActiveTab::Session(id) => self.tab(id).map_or_else(
                 || APP_NAME.to_owned(),
@@ -1000,452 +1711,58 @@ impl Ui {
             ActiveTab::Home => APP_NAME.to_owned(),
         };
         if title != self.title {
-            self.requests.push(WindowRequest::SetTitle(title.clone()));
+            window.set_window_title(&title);
             self.title = title;
         }
 
-        let in_session = matches!(self.active, ActiveTab::Session(_));
-        let show_strip = !(self.fullscreen && in_session);
-
-        if show_strip {
-            egui::Panel::top("tab-strip")
-                .exact_size(TAB_STRIP_HEIGHT)
-                .show_separator_line(false)
-                .frame(
-                    egui::Frame::new()
-                        .fill(palette.canvas)
-                        .inner_margin(egui::Margin::symmetric(10, 6)),
-                )
-                .show(root, |ui| self.tab_strip(ui, &palette));
-        }
-
-        self.viewport = None;
-        self.filters.clear();
-
-        if self.active == ActiveTab::Home
-            && let Some(state) = &mut self.editor
-        {
-            let actions = editor::show(root, state, &self.profiles, &self.credentials);
-            for action in actions {
-                self.handle_editor_action(action);
-            }
-        }
-
-        egui::CentralPanel::no_frame().show(root, |ui| {
-            self.session_area = Some(ui.max_rect());
-            match self.active {
-                ActiveTab::Home => self.home_screen(ui),
-                ActiveTab::Session(id) => self.session_screen(ui, id, textures),
-            }
-        });
-
-        self.show_dialog(ctx);
-        self.toasts.show(ctx);
-        self.sync_session_focus();
-    }
-
-    pub fn set_window_focus(&mut self, focused: bool) {
-        self.window_focused = focused;
-        self.sync_session_focus();
-    }
-
-    /// Tells sessions when they gain or lose focus; the focused one keeps its clipboard in sync.
-    fn sync_session_focus(&mut self) {
-        let wanted = match self.active {
-            ActiveTab::Session(id) if self.window_focused => Some(id),
-            _ => None,
-        };
-        if wanted == self.focused_session {
-            return;
-        }
-        if let Some(old) = self.focused_session.and_then(|id| self.tab(id)) {
-            old.handle.send(crate::session::SessionCmd::Focus(false));
-        }
-        if let Some(new) = wanted.and_then(|id| self.tab(id)) {
-            new.handle.send(crate::session::SessionCmd::Focus(true));
-        }
-        self.focused_session = wanted;
-    }
-
-    fn tab_strip(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-
-            let home_selected = self.active == ActiveTab::Home;
-            if tab_chip(
-                ui,
-                palette,
-                home_selected,
-                None,
-                &format!("{}  Hosts", icon::SQUARES_FOUR),
-                false,
-            )
-            .clicked
+        // Dynamic resize for active live session.
+        if let ActiveTab::Session(id) = self.active {
+            let area_px = self.session_area_px(window);
+            let scale = window.scale_factor();
+            if let Some(tab) = self.tab_mut(id)
+                && tab.is_live()
             {
-                self.active = ActiveTab::Home;
+                let desired = SessionTab::desired_desktop(&tab.profile, area_px, scale);
+                tab.follow_size(desired);
             }
-
-            let mut close = None;
-            let mut select = None;
-            for tab in &self.tabs {
-                let selected = self.active == ActiveTab::Session(tab.id);
-                let status = tab_status_color(tab, palette);
-                let chip = tab_chip(ui, palette, selected, Some(status), tab.title(), true);
-                if chip.clicked {
-                    select = Some(tab.id);
-                }
-                if chip.close_clicked {
-                    close = Some(tab.id);
-                }
-            }
-            if let Some(id) = select {
-                self.active = ActiveTab::Session(id);
-            }
-            if let Some(id) = close {
-                self.close_tab(id);
-            }
-        });
-    }
-
-    fn home_screen(&mut self, ui: &mut egui::Ui) {
-        let view = self.settings.settings.host_view;
-        let actions = home::show(
-            ui,
-            &mut self.home,
-            &self.profiles,
-            &self.credentials,
-            &self.prober,
-            view,
-            &mut self.previews,
-        );
-        for action in actions {
-            self.handle_home_action(action);
         }
-    }
 
-    fn session_screen(&mut self, ui: &mut egui::Ui, id: TabId, textures: &RemoteTextures) {
-        let ppp = self.pixels_per_point;
-        let fullscreen = self.fullscreen;
-        let others: Vec<(TabId, String)> = self
-            .tabs
-            .iter()
-            .map(|t| (t.id, t.title().to_owned()))
-            .collect();
-        let area_px = ui.max_rect().size() * ppp;
-        let pointer = self.pointer_pos;
+        let in_session = matches!(self.active, ActiveTab::Session(_));
+        let show_strip = !(window.is_fullscreen() && in_session);
 
-        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
-            self.active = ActiveTab::Home;
-            return;
+        let main_view = match self.active {
+            ActiveTab::Home => home::render_home(self, &p, window, cx),
+            ActiveTab::Session(id) => session_view::render_session(self, id, &p, window, cx),
         };
 
-        if tab.is_live() {
-            let desired = SessionTab::desired_desktop(&tab.profile, area_px, ppp);
-            tab.follow_size(desired);
-        }
+        let dialog_layer = dialogs::render_dialog(self, &p, cx);
+        let toast_layer = self.toasts.render(&p);
 
-        let out = session_view::show(
-            ui,
-            tab,
-            textures,
-            session_view::ViewContext {
-                pixels_per_point: ppp,
-                fullscreen,
-                pointer,
-                tabs: &others,
-            },
-        );
-
-        if let Some(viewport) = out.viewport {
-            self.viewport = Some((id, viewport));
-        }
-        if let Some(filter) = out.filter {
-            self.filters.insert(tab.handle.id, filter);
-        }
-        for action in out.actions {
-            self.handle_session_action(id, action);
-        }
+        div()
+            .id("relay-root")
+            .track_focus(&self.focus_handle)
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(p.canvas)
+            .text_color(p.text)
+            .font_family(theme::FONT_SANS)
+            .text_size(size::BODY)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
+            .when(show_strip, |el| el.child(self.render_tab_strip(&p, cx)))
+            .child(main_view)
+            .when_some(dialog_layer, |el, dlg| el.child(dlg))
+            .when_some(toast_layer, |el, toast| el.child(toast))
     }
+}
 
-    fn handle_session_action(&mut self, id: TabId, action: session_view::Action) {
-        use session_view::Action;
-        match action {
-            Action::ToggleFullscreen => self
-                .requests
-                .push(WindowRequest::SetFullscreen(!self.fullscreen)),
-            Action::Disconnect => {
-                self.capture_preview(id);
-                if let Some(tab) = self.tab_mut(id) {
-                    tab.disconnect();
-                }
-            }
-            Action::CloseTab => self.close_tab(id),
-            Action::Reconnect => {
-                if let Some(tab) = self.tab(id) {
-                    let profile = self
-                        .profiles
-                        .get(tab.profile.id)
-                        .filter(|_| tab.saved)
-                        .unwrap_or(&tab.profile)
-                        .clone();
-                    if profile.credential_profile_id.is_some()
-                        || tab.profile.credential_profile_id.is_some()
-                    {
-                        let saved = tab.saved;
-                        self.request_connect(profile, saved, Some(id));
-                        return;
-                    }
-                }
-                let Some(ctx) = self.last_ctx.clone() else {
-                    return;
-                };
-                let area = self.session_area_px(&ctx);
-                let ppp = self.pixels_per_point;
-                let cx = SessionContext {
-                    hardware_video_decoding: self.settings.settings.hardware_video_decoding,
-                    gpu: self.gpu.clone(),
-                    proxy: &self.proxy,
-                    known_hosts: &self.known_hosts,
-                };
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
-                    let desktop = SessionTab::desired_desktop(&tab.profile, area, ppp);
-                    if let Err(e) = tab.restart(None, desktop, &cx) {
-                        self.toasts.error(format!("Couldn't reconnect: {e}"));
-                    }
-                }
-            }
-            Action::RetryNow => {
-                if let Some(tab) = self.tab(id) {
-                    tab.retry_now();
-                }
-            }
-            Action::ChangeCredentials => {
-                if let Some(tab) = self.tab(id) {
-                    let failure = match &tab.phase {
-                        Phase::Ended(Ended::Failed(f)) => Some(f.title.clone()),
-                        _ => None,
-                    };
-                    self.dialog = Some(Dialog::Credentials(CredentialsDialog::new(
-                        self.profiles
-                            .get(tab.profile.id)
-                            .filter(|_| tab.saved)
-                            .unwrap_or(&tab.profile)
-                            .clone(),
-                        tab.saved,
-                        Some(id),
-                        failure,
-                    )));
-                }
-            }
-            Action::EditHost => {
-                if let Some(tab) = self.tab(id)
-                    && tab.saved
-                    && let Some(profile) = self.profiles.get(tab.profile.id).cloned()
-                {
-                    self.editor = Some(editor::EditorState::edit(profile));
-                    self.active = ActiveTab::Home;
-                }
-            }
-            Action::TrustCertificate(trust) => {
-                if let Some(tab) = self.tab_mut(id) {
-                    tab.answer_certificate(trust);
-                }
-            }
-            Action::SendCtrlAltDel => {
-                if let Some(tab) = self.tab_mut(id) {
-                    tab.send_ctrl_alt_del();
-                }
-            }
-            Action::SendKeys(keys) => {
-                if let Some(tab) = self.tab_mut(id) {
-                    tab.send_combo(&keys);
-                }
-            }
-            Action::SwitchTo(other) => self.active = ActiveTab::Session(other),
-            Action::GoHome => self.active = ActiveTab::Home,
-            Action::Minimize => {
-                self.capture_preview(id);
-                self.active = ActiveTab::Home;
-            }
-        }
-    }
-
-    fn handle_home_action(&mut self, action: home::Action) {
-        use home::Action;
-        match action {
-            Action::Connect(id) => {
-                if let Some(profile) = self.profiles.get(id).cloned() {
-                    self.request_connect(profile, true, None);
-                }
-            }
-            Action::QuickConnect(host, port) => self.quick_connect(&host, port),
-            Action::New(prefill) => {
-                let mut profile = HostProfile::new("", 3389);
-                if let Some((host, port)) = prefill.as_deref().and_then(parse_endpoint) {
-                    profile.address = host.clone();
-                    profile.name = host;
-                    profile.port = port;
-                } else {
-                    profile.name.clear();
-                }
-                self.editor = Some(editor::EditorState::new(profile));
-            }
-            Action::Edit(id) => {
-                if let Some(profile) = self.profiles.get(id).cloned() {
-                    self.editor = Some(editor::EditorState::edit(profile));
-                }
-            }
-            Action::Duplicate(id) => {
-                if let Some(mut profile) = self.profiles.get(id).cloned() {
-                    profile.id = Uuid::new_v4();
-                    profile.name = format!("{} copy", profile.display_name());
-                    profile.save_password = false;
-                    profile.last_connected = None;
-                    self.editor = Some(editor::EditorState::new(profile));
-                }
-            }
-            Action::ToggleFavorite(id) => self.profiles.toggle_favorite(id),
-            Action::Delete(id) => {
-                if let Some(profile) = self.profiles.get(id) {
-                    self.dialog = Some(Dialog::ConfirmDelete {
-                        id,
-                        name: profile.display_name().to_owned(),
-                    });
-                }
-            }
-            Action::OpenSettings => {
-                self.dialog = Some(Dialog::Settings(dialogs::DrawerState::default()));
-            }
-            Action::OpenPasswords => {
-                self.dialog = Some(Dialog::Passwords(dialogs::DrawerState::default()));
-            }
-            Action::ImportRdpFile => self.picker.rdp_file(),
-            Action::SetHostView(view) => {
-                self.settings.settings.host_view = view;
-                self.settings.save();
-            }
-        }
-    }
-
-    fn handle_editor_action(&mut self, action: editor::Action) {
-        match action {
-            editor::Action::Cancel => self.editor = None,
-            editor::Action::PickFolder => self.picker.shared_folder(),
-            editor::Action::Save {
-                profile,
-                password,
-                connect,
-            } => {
-                match password {
-                    editor::PasswordChange::Keep => {}
-                    editor::PasswordChange::Set(password) => {
-                        let request = self
-                            .secret_worker
-                            .submit(SecretOperation::Save(SecretId::Host(profile.id), password));
-                        self.pending_secrets
-                            .insert(request, PendingSecret::HostWrite);
-                    }
-                    editor::PasswordChange::Forget => {
-                        secrets::delete_password_in_background(profile.id)
-                    }
-                }
-                self.profiles.upsert(profile.clone());
-                self.watch_hosts();
-                self.editor = None;
-                self.toasts
-                    .info(format!("Saved {}", profile.display_name()));
-                if connect {
-                    self.request_connect(profile, true, None);
-                }
-            }
-        }
-    }
-
-    fn show_dialog(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = &mut self.dialog else {
-            return;
-        };
-        let before = self.settings.settings.clone();
-        let outcome = dialogs::show(
-            ctx,
-            dialog,
-            &mut self.settings.settings,
-            &self.credentials,
-            self.profiles.hosts(),
-            &mut self.credential_manager,
-        );
-        if before.desktop_previews && !self.settings.settings.desktop_previews {
-            self.previews.clear();
-        }
-        // Persist edits even if the drawer is also dismissed in this frame.
-        if self.settings.settings != before {
-            self.settings.save();
-            self.applied_theme = None;
-            ctx.request_repaint();
-        }
-        match outcome {
-            dialogs::Outcome::Open => {}
-            dialogs::Outcome::Close => self.dialog = None,
-            dialogs::Outcome::Connect {
-                profile,
-                saved,
-                tab,
-                password,
-                remember,
-                update_profile_password,
-                use_stored_password,
-            } => {
-                if use_stored_password && profile.credential_profile_id.is_some() {
-                    // Remember the explicitly selected link before the asynchronous lookup.
-                    if saved && let Some(mut stored) = self.profiles.get(profile.id).cloned() {
-                        stored.credential_profile_id = profile.credential_profile_id;
-                        self.profiles.upsert(stored);
-                    }
-                    self.dialog = None;
-                    self.request_connect(profile, saved, tab);
-                } else if update_profile_password && let Some(id) = profile.credential_profile_id {
-                    let request = self.secret_worker.submit(SecretOperation::Save(
-                        SecretId::Credential(id),
-                        password.clone(),
-                    ));
-                    self.pending_secrets.insert(
-                        request,
-                        PendingSecret::UpdatePassword(SignIn {
-                            profile,
-                            saved,
-                            tab,
-                            password,
-                            remember,
-                        }),
-                    );
-                    // Keep the entered password in the dialog until the keyring acknowledges it.
-                    if let Some(Dialog::Credentials(state)) = &mut self.dialog {
-                        state.set_busy(true);
-                    }
-                } else {
-                    self.finish_sign_in(SignIn {
-                        profile,
-                        saved,
-                        tab,
-                        password,
-                        remember,
-                    });
-                }
-            }
-            dialogs::Outcome::Credential(action) => self.handle_credential_action(action),
-            dialogs::Outcome::Delete(id) => {
-                self.dialog = None;
-                if let Some(removed) = self.profiles.remove(id) {
-                    secrets::delete_password_in_background(removed.id);
-                    self.previews.remove(removed.id);
-                    self.watch_hosts();
-                    self.toasts
-                        .info(format!("Deleted {}", removed.display_name()));
-                }
-                if self.editor.as_ref().is_some_and(|e| e.profile_id() == id) {
-                    self.editor = None;
-                }
-            }
+impl Drop for RelayApp {
+    fn drop(&mut self) {
+        for tab in &mut self.tabs {
+            tab.disconnect();
         }
     }
 }
@@ -1460,101 +1777,7 @@ fn remember_assignment(stored: &mut HostProfile, selected: &HostProfile, remembe
     }
 }
 
-struct ChipResponse {
-    clicked: bool,
-    close_clicked: bool,
-}
-
-/// A tab in the tab strip: status dot, title, and a close button on session tabs.
-fn tab_chip(
-    ui: &mut egui::Ui,
-    palette: &Palette,
-    selected: bool,
-    status: Option<Color32>,
-    title: &str,
-    closable: bool,
-) -> ChipResponse {
-    let font = theme::font_medium(size::BODY);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(title.to_owned(), font, palette.text);
-    let dot = if status.is_some() { 14.0 } else { 0.0 };
-    let close = if closable { 22.0 } else { 0.0 };
-    let width = (galley.size().x + dot + close + 24.0).clamp(80.0, 220.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 32.0), Sense::click());
-
-    let hovered = response.hovered();
-    let fill = if selected {
-        palette.surface
-    } else if hovered {
-        palette.hover()
-    } else {
-        Color32::TRANSPARENT
-    };
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, CornerRadius::same(theme::radius::ROW), fill);
-    if selected {
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(theme::radius::ROW),
-            Stroke::new(1.0, palette.hairline),
-            egui::StrokeKind::Inside,
-        );
-    }
-
-    let mut x = rect.left() + 12.0;
-    if let Some(color) = status {
-        painter.circle_filled(egui::pos2(x + 3.0, rect.center().y), 3.5, color);
-        x += dot;
-    }
-    let text_color = if selected || hovered {
-        palette.text
-    } else {
-        palette.muted
-    };
-    let max_text = rect.right() - close - 10.0 - x;
-    painter
-        .with_clip_rect(egui::Rect::from_min_max(
-            egui::pos2(x, rect.top()),
-            egui::pos2(x + max_text, rect.bottom()),
-        ))
-        .galley_with_override_text_color(
-            egui::pos2(x, rect.center().y - galley.size().y / 2.0),
-            galley,
-            text_color,
-        );
-
-    let mut close_clicked = false;
-    if closable {
-        let close_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.right() - 16.0, rect.center().y),
-            vec2(20.0, 20.0),
-        );
-        let close_response = ui.interact(close_rect, response.id.with("close"), Sense::click());
-        if hovered || selected || close_response.hovered() {
-            if close_response.hovered() {
-                painter.rect_filled(close_rect, CornerRadius::same(4), palette.raised);
-            }
-            painter.text(
-                close_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                icon::X,
-                theme::font(12.0),
-                palette.muted,
-            );
-        }
-        close_clicked = close_response.clicked();
-        // Middle-click closes, like browser tabs.
-        close_clicked |= response.middle_clicked();
-    }
-
-    ChipResponse {
-        clicked: response.clicked() && !close_clicked,
-        close_clicked,
-    }
-}
-
-fn tab_status_color(tab: &SessionTab, palette: &Palette) -> Color32 {
+fn tab_status_color(tab: &SessionTab, palette: &Palette) -> Hsla {
     match &tab.phase {
         Phase::Live => widgets::Signal::Rtt(tab.current_rtt().unwrap_or_default()).color(palette),
         Phase::Connecting => palette.accent,

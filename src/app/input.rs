@@ -3,10 +3,10 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use gpui_kit::{Bounds, MouseButton, NavigationDirection, Pixels, Point, ScrollDelta, TouchPhase};
 use ironrdp_input::{MouseButton as RdpButton, MousePosition, Operation, WheelRotations};
 use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
 use smallvec::SmallVec;
-use winit::event::{MouseButton, MouseScrollDelta, TouchPhase};
 
 /// Rotation units for one wheel notch.
 const NOTCH: f64 = 120.0;
@@ -31,9 +31,8 @@ pub fn rdp_button(button: MouseButton) -> Option<RdpButton> {
         MouseButton::Left => Some(RdpButton::Left),
         MouseButton::Right => Some(RdpButton::Right),
         MouseButton::Middle => Some(RdpButton::Middle),
-        MouseButton::Back => Some(RdpButton::X1),
-        MouseButton::Forward => Some(RdpButton::X2),
-        MouseButton::Other(_) => None,
+        MouseButton::Navigate(NavigationDirection::Back) => Some(RdpButton::X1),
+        MouseButton::Navigate(NavigationDirection::Forward) => Some(RdpButton::X2),
     }
 }
 
@@ -78,7 +77,7 @@ struct Glide {
 impl WheelAccumulator {
     pub fn operations(
         &mut self,
-        delta: MouseScrollDelta,
+        delta: ScrollDelta,
         phase: TouchPhase,
         now: Instant,
         touchpad: TouchpadScrolling,
@@ -86,16 +85,18 @@ impl WheelAccumulator {
         // Any new scrolling takes over from a glide.
         self.glide = None;
         match delta {
-            MouseScrollDelta::LineDelta(x, y) => {
+            ScrollDelta::Lines(p) => {
                 self.recent.clear();
-                self.rotate(f64::from(x) * NOTCH, f64::from(y) * NOTCH)
+                self.rotate(f64::from(p.x) * NOTCH, f64::from(p.y) * NOTCH)
             }
-            MouseScrollDelta::PixelDelta(p) => {
+            ScrollDelta::Pixels(p) => {
+                let dx = f64::from(f32::from(p.x));
+                let dy = f64::from(f32::from(p.y));
                 if phase == TouchPhase::Started {
                     self.recent.clear();
                 }
-                if p.x != 0.0 || p.y != 0.0 {
-                    self.recent.push_back((now, p.x, p.y));
+                if dx != 0.0 || dy != 0.0 {
+                    self.recent.push_back((now, dx, dy));
                 }
                 while self
                     .recent
@@ -107,7 +108,7 @@ impl WheelAccumulator {
                 if phase == TouchPhase::Ended {
                     self.start_glide(now, touchpad);
                 }
-                self.pixels(p.x, p.y, touchpad.speed)
+                self.pixels(dx, dy, touchpad.speed)
             }
         }
     }
@@ -121,7 +122,6 @@ impl WheelAccumulator {
         if !touchpad.momentum || now.duration_since(*last) > MAX_REST {
             return;
         }
-        // The movement spans from just before the first event to now.
         let span = now.duration_since(*first).max(GLIDE_STEP).as_secs_f64();
         let (x, y) = recent
             .iter()
@@ -147,7 +147,6 @@ impl WheelAccumulator {
         };
         let elapsed = now.duration_since(glide.last).as_secs_f64();
         let decay = (-elapsed / GLIDE_DECAY).exp();
-        // The distance an exponentially slowing scroll covers in `elapsed`.
         let travel = GLIDE_DECAY * (1.0 - decay);
         let (dx, dy) = (glide.velocity.0 * travel, glide.velocity.1 * travel);
         glide.velocity = (glide.velocity.0 * decay, glide.velocity.1 * decay);
@@ -164,8 +163,8 @@ impl WheelAccumulator {
     }
 
     fn rotate(&mut self, dx: f64, dy: f64) -> SmallVec<[Operation; 4]> {
-        // winit: positive y scrolls content up (wheel away from the user), matching RDP.
-        // Horizontal is mirrored: positive x in winit moves content right, i.e. scrolls left.
+        // Positive y scrolls content up (wheel away from user), matching RDP.
+        // Horizontal is mirrored: positive x moves content right, i.e. scrolls left.
         self.vertical += dy;
         self.horizontal -= dx;
 
@@ -227,33 +226,38 @@ pub fn pause_sequence() -> SmallVec<[FastPathInputEvent; 2]> {
 /// Where the remote desktop is drawn, used to map pointer positions into remote pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RemoteViewport {
-    /// Image rectangle in egui points.
-    pub rect: egui::Rect,
+    /// Image rectangle in GPUI logical pixels.
+    pub rect: Bounds<Pixels>,
     pub remote_width: u16,
     pub remote_height: u16,
 }
 
 impl RemoteViewport {
-    /// Maps a position in points to remote pixels, clamped to the desktop.
-    pub fn to_remote(&self, pos: egui::Pos2) -> MousePosition {
-        let w = self.rect.width().max(1.0);
-        let h = self.rect.height().max(1.0);
-        let x = ((pos.x - self.rect.min.x) / w * f32::from(self.remote_width)).floor();
-        let y = ((pos.y - self.rect.min.y) / h * f32::from(self.remote_height)).floor();
+    /// Maps a position in window pixels to remote pixels, clamped to the desktop.
+    pub fn to_remote(self, pos: Point<Pixels>) -> MousePosition {
+        let w = f32::from(self.rect.size.width).max(1.0);
+        let h = f32::from(self.rect.size.height).max(1.0);
+        let x = ((f32::from(pos.x) - f32::from(self.rect.origin.x)) / w
+            * f32::from(self.remote_width))
+            .floor();
+        let y = ((f32::from(pos.y) - f32::from(self.rect.origin.y)) / h
+            * f32::from(self.remote_height))
+            .floor();
         MousePosition {
             x: x.clamp(0.0, f32::from(self.remote_width.saturating_sub(1))) as u16,
             y: y.clamp(0.0, f32::from(self.remote_height.saturating_sub(1))) as u16,
         }
     }
 
-    pub fn contains(&self, pos: egui::Pos2) -> bool {
-        self.rect.contains(pos)
+    pub fn contains(&self, pos: Point<Pixels>) -> bool {
+        self.rect.contains(&pos)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::{point, px, size};
 
     fn wheel_units(ops: &[Operation]) -> Vec<(bool, i16)> {
         ops.iter()
@@ -264,13 +268,17 @@ mod tests {
             .collect()
     }
 
-    fn scroll(acc: &mut WheelAccumulator, delta: MouseScrollDelta) -> SmallVec<[Operation; 4]> {
+    fn scroll(acc: &mut WheelAccumulator, delta: ScrollDelta) -> SmallVec<[Operation; 4]> {
         let touchpad = TouchpadScrolling::default();
         acc.operations(delta, TouchPhase::Moved, Instant::now(), touchpad)
     }
 
-    fn pixels(y: f64) -> MouseScrollDelta {
-        MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, y))
+    fn pixels(y: f32) -> ScrollDelta {
+        ScrollDelta::Pixels(point(px(0.0), px(y)))
+    }
+
+    fn lines(y: f32) -> ScrollDelta {
+        ScrollDelta::Lines(point(0.0, y))
     }
 
     fn total(ops: &[Operation]) -> i32 {
@@ -280,16 +288,16 @@ mod tests {
     #[test]
     fn line_scroll_is_one_notch() {
         let mut acc = WheelAccumulator::default();
-        let ops = scroll(&mut acc, MouseScrollDelta::LineDelta(0.0, 1.0));
+        let ops = scroll(&mut acc, lines(1.0));
         assert_eq!(wheel_units(&ops), vec![(true, 120)]);
-        let ops = scroll(&mut acc, MouseScrollDelta::LineDelta(0.0, -1.0));
+        let ops = scroll(&mut acc, lines(-1.0));
         assert_eq!(wheel_units(&ops), vec![(true, -120)]);
     }
 
     #[test]
     fn large_scrolls_are_split() {
         let mut acc = WheelAccumulator::default();
-        let ops = scroll(&mut acc, MouseScrollDelta::LineDelta(0.0, 3.0));
+        let ops = scroll(&mut acc, lines(3.0));
         assert_eq!(wheel_units(&ops), vec![(true, 255), (true, 105)]);
     }
 
@@ -327,7 +335,6 @@ mod tests {
             assert!(at - lift < Duration::from_secs(3), "the glide ends");
             steps.push(total(&acc.glide(at, touchpad)));
         }
-        // About 1,111 px/s for the time constant, 0.325 s, at 120 units per 50 px.
         let glided: i32 = steps.iter().sum();
         assert!((750..950).contains(&glided), "{glided}");
         assert!(
@@ -372,32 +379,32 @@ mod tests {
         };
         let mut acc = WheelAccumulator::default();
         let now = Instant::now();
-        let notch = MouseScrollDelta::LineDelta(0.0, 1.0);
+        let notch = lines(1.0);
         assert_eq!(
             total(&acc.operations(notch, TouchPhase::Moved, now, fast)),
             120
         );
-        let swipe = acc.operations(pixels(PIXELS_PER_NOTCH), TouchPhase::Moved, now, fast);
+        let swipe = acc.operations(pixels(PIXELS_PER_NOTCH as f32), TouchPhase::Moved, now, fast);
         assert_eq!(total(&swipe), 240);
     }
 
     #[test]
     fn viewport_maps_scaled_positions() {
         let vp = RemoteViewport {
-            rect: egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(960.0, 540.0)),
+            rect: Bounds::new(point(px(100.0), px(50.0)), size(px(960.0), px(540.0))),
             remote_width: 1920,
             remote_height: 1080,
         };
         assert_eq!(
-            vp.to_remote(egui::pos2(100.0, 50.0)),
+            vp.to_remote(point(px(100.0), px(50.0))),
             MousePosition { x: 0, y: 0 }
         );
         assert_eq!(
-            vp.to_remote(egui::pos2(580.0, 320.0)),
+            vp.to_remote(point(px(580.0), px(320.0))),
             MousePosition { x: 960, y: 540 }
         );
         assert_eq!(
-            vp.to_remote(egui::pos2(5000.0, -10.0)),
+            vp.to_remote(point(px(5000.0), px(-10.0))),
             MousePosition { x: 1919, y: 0 }
         );
     }
