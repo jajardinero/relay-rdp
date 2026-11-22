@@ -19,6 +19,8 @@ BuildRequires:  pkgconfig(libva)
 BuildRequires:  pkgconfig(libva-drm)
 BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  pkgconfig(xkbcommon)
+BuildRequires:  pkgconfig(xkbcommon-x11)
+BuildRequires:  pkgconfig(xcb)
 BuildRequires:  pkgconfig(alsa)
 BuildRequires:  pkgconfig(openssl)
 BuildRequires:  desktop-file-utils
@@ -26,7 +28,6 @@ BuildRequires:  findutils
 
 # These are loaded at runtime and cannot be found by automatic ELF dependency scanning.
 Requires:       libwayland-client%{?_isa}
-Requires:       libxkbcommon%{?_isa}
 Requires:       vulkan-loader%{?_isa}
 Requires:       libglvnd-egl%{?_isa}
 Requires:       libglvnd-glx%{?_isa}

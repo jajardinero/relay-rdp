@@ -56,7 +56,8 @@ relay_check_toolchain() {
     printf 'Rust %s or later is required; found %s.\n' "$_relay_min_rust" "$version" >&2
     exit 1
   }
-  pkg-config --exists libavcodec libavutil libva libva-drm wayland-client xkbcommon alsa openssl || {
+  pkg-config --exists libavcodec libavutil libva libva-drm wayland-client xkbcommon xkbcommon-x11 xcb \
+    alsa openssl || {
     printf 'Install the system development libraries listed in README.md before building.\n' >&2
     exit 1
   }

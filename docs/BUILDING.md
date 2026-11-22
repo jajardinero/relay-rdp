@@ -6,8 +6,9 @@ Back to the [README](../README.md).
 
 Use the Rust toolchain in `rust-toolchain.toml`, a C compiler, and `pkg-config`.
 Install the system libraries and development headers for FFmpeg (`libavcodec`
-and `libavutil`), VA-API (`libva` and `libva-drm`), Wayland, xkbcommon, ALSA,
-and OpenSSL.
+and `libavutil`), VA-API (`libva` and `libva-drm`), Wayland, xkbcommon (including
+`xkbcommon-x11`), `libxcb`, ALSA, and OpenSSL. GPUI links `libxcb` and
+`xkbcommon-x11` even though Relay runs on Wayland.
 The native decoder bridge compiles against the installed FFmpeg headers; it does
 not depend on handwritten Rust layouts for FFmpeg's versioned structures.
 
@@ -146,7 +147,7 @@ Install the native build dependencies:
 ```sh
 sudo apt install build-essential pkg-config dpkg-dev desktop-file-utils \
   libavcodec-dev libavutil-dev libva-dev libwayland-dev libxkbcommon-dev \
-  libasound2-dev libssl-dev
+  libxkbcommon-x11-dev libxcb1-dev libasound2-dev libssl-dev
 ```
 
 Provide Rust 1.95 or later (for example, a current stable rustup toolchain), then
@@ -177,7 +178,8 @@ Install the native build dependencies:
 ```sh
 sudo dnf install rust cargo gcc gcc-c++ rpm-build redhat-rpm-config pkgconf-pkg-config \
   desktop-file-utils libavcodec-free-devel libavutil-free-devel libva-devel \
-  wayland-devel libxkbcommon-devel alsa-lib-devel openssl-devel
+  wayland-devel libxkbcommon-devel libxkbcommon-x11-devel libxcb-devel alsa-lib-devel \
+  openssl-devel
 ```
 
 The Rust and Cargo packages must be version 1.95 or later. If you use a full
