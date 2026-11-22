@@ -180,7 +180,7 @@ Version 0.2.0, with the GPUI interface, is packaged for Arch Linux so far:
 | Distribution | Download | Install |
 | --- | --- | --- |
 | Arch Linux (x86_64) | [relay-0.2.0-1-x86_64.pkg.tar.zst](https://github.com/jajardinero/relay-rdp/releases/download/v0.2.0/relay-0.2.0-1-x86_64.pkg.tar.zst) | `sudo pacman -U relay-0.2.0-1-x86_64.pkg.tar.zst` |
-| Arch Linux ARM (aarch64) | [relay-0.2.0-1-aarch64.pkg.tar.zst](https://github.com/jajardinero/relay-rdp/releases/download/v0.2.0/relay-0.2.0-1-aarch64.pkg.tar.zst) | `sudo pacman -U relay-0.2.0-1-aarch64.pkg.tar.zst` |
+| Arch Linux ARM (aarch64) | [relay-0.2.0-1-aarch64.pkg.tar.xz](https://github.com/jajardinero/relay-rdp/releases/download/v0.2.0/relay-0.2.0-1-aarch64.pkg.tar.xz) | `sudo pacman -U relay-0.2.0-1-aarch64.pkg.tar.xz` |
 
 For other distributions, use [0.1.2](https://github.com/jajardinero/relay-rdp/releases/tag/v0.1.2),
 the last release with the egui interface (x86_64 only):

@@ -245,7 +245,7 @@ For version 0.2.0 on x86_64, verify and install with:
 sudo pacman -U dist/arch/relay-0.2.0-1-x86_64.pkg.tar.zst
 ```
 
-On aarch64 the package is `relay-0.2.0-1-aarch64.pkg.tar.zst`. To build it from
+On aarch64 the package is `relay-0.2.0-1-aarch64.pkg.tar.xz`. To build it from
 an x86_64 machine, run the builder in an Arch Linux ARM container under QEMU user
 emulation (`qemu-user-static` with its binfmt handler registered); expect the
 build to take many times longer than a native one.
