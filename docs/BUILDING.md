@@ -60,11 +60,13 @@ check descriptor cleanup across decoder resets, and exercise concurrent RDP
 connections, dynamic resizing, enabled/disabled preferences, unavailable hardware,
 and recovery after an injected hardware failure. A synthetic 1080p test also
 reports elapsed frame time and decoding-thread CPU time for both paths.
-GPU readback exists only in the test helpers, for pixel comparisons.
+The GPUI interface reads each displayed GPU frame back to system memory (see
+Current limitations in the README); the tests also read back, for pixel comparisons.
 
 ## Linux packages
 
-Local package builders are available for these distributions on x86_64:
+Local package builders are available for these distributions on x86_64. The Arch
+Linux builder also runs on aarch64 (Arch Linux ARM):
 
 | Distribution | Build command | Output |
 | --- | --- | --- |
@@ -131,8 +133,8 @@ versions. System certificate stores and desktop portals are used normally.
 
 ```sh
 (cd dist/appimage && sha256sum --check SHA256SUMS)
-chmod +x dist/appimage/Relay-0.1.2-x86_64.AppImage
-./dist/appimage/Relay-0.1.2-x86_64.AppImage
+chmod +x dist/appimage/Relay-0.2.0-x86_64.AppImage
+./dist/appimage/Relay-0.2.0-x86_64.AppImage
 ```
 
 On a system without usable FUSE support, run it with
@@ -156,7 +158,7 @@ build and install:
 ```sh
 scripts/package-deb.sh
 (cd dist/deb && sha256sum --check SHA256SUMS)
-sudo apt install ./dist/deb/relay_0.1.2-1_amd64.deb
+sudo apt install ./dist/deb/relay_0.2.0-1_amd64.deb
 ```
 
 The builder derives shared-library dependencies with `dpkg-shlibdeps`, including
@@ -190,7 +192,7 @@ packages. The spec uses `pkgconfig` requirements to accept either provider.
 ```sh
 scripts/package-fedora.sh
 (cd dist/fedora && sha256sum --check SHA256SUMS)
-sudo dnf install ./dist/fedora/relay-0.1.2-1.fc*.x86_64.rpm
+sudo dnf install ./dist/fedora/relay-0.2.0-1.fc*.x86_64.rpm
 ```
 
 RPM records the linked library ABIs automatically. Runtime-loaded libraries are
@@ -208,7 +210,8 @@ repository submission with all Cargo sources vendored for offline builders.
 
 ### Arch Linux
 
-From the project root, build a local x86_64 package with:
+From the project root, build a local package for this machine's architecture
+(x86_64, or aarch64 on Arch Linux ARM) with:
 
 ```sh
 scripts/package-arch.sh
@@ -235,12 +238,17 @@ PKGBUILD and source archive together to rebuild with `makepkg` on an Arch system
 with the listed dependencies installed. Build intermediates stay under
 `target/arch-package`. These generated directories are ignored by Git.
 
-For version 0.1.2, verify and install with:
+For version 0.2.0 on x86_64, verify and install with:
 
 ```sh
 (cd dist/arch && sha256sum --check SHA256SUMS)
-sudo pacman -U dist/arch/relay-0.1.2-1-x86_64.pkg.tar.zst
+sudo pacman -U dist/arch/relay-0.2.0-1-x86_64.pkg.tar.zst
 ```
+
+On aarch64 the package is `relay-0.2.0-1-aarch64.pkg.tar.zst`. To build it from
+an x86_64 machine, run the builder in an Arch Linux ARM container under QEMU user
+emulation (`qemu-user-static` with its binfmt handler registered); expect the
+build to take many times longer than a native one.
 
 The package installs `/usr/bin/relay` and a **Relay** application-menu entry with
 an SVG icon. It includes project, font, and vendored license notices, and uses

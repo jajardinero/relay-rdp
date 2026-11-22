@@ -11,7 +11,8 @@ for _relay_arg in "$@"; do
     -h|--help)
       printf 'Usage: %s [--offline] [--prepare-only]\n\n' "$0"
       printf '%s\n' \
-        'Build a local x86_64 Arch package in dist/arch, without installing it.' \
+        'Build a local Arch package (x86_64 or aarch64, matching this machine) in dist/arch,' \
+        'without installing it.' \
         '--offline       Use only dependencies already cached by Cargo.' \
         '--prepare-only  Generate the source archive, PKGBUILD, and .SRCINFO.'
       exit 0 ;;
@@ -28,7 +29,7 @@ for _relay_command in cargo rustc makepkg pacman pkg-config tar gzip sha256sum a
     exit 1
   }
 done
-[[ $(uname -m) == x86_64 ]] || { printf 'This package targets x86_64.\n' >&2; exit 1; }
+[[ $(uname -m) =~ ^(x86_64|aarch64)$ ]] || { printf 'This package targets x86_64 or aarch64.\n' >&2; exit 1; }
 [[ $EUID != 0 ]] || { printf 'Run makepkg as your normal user, not root.\n' >&2; exit 1; }
 
 # Read only the package section, not dependency or release-profile versions.

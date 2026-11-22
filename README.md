@@ -8,7 +8,7 @@ the UI framework of the Zed editor.
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org)
 [![GPUI](https://img.shields.io/badge/UI-GPUI-6a5acd)](https://gpui-kit.com)
 [![Wayland](https://img.shields.io/badge/Wayland-native-yellow?logo=wayland)](https://wayland.freedesktop.org)
-[![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-lightgrey?logo=linux)](#downloads)
+[![Platform](https://img.shields.io/badge/platform-Linux%20x86__64%20%7C%20aarch64-lightgrey?logo=linux)](#downloads)
 
 Relay connects to Windows desktops and servers over the Remote Desktop Protocol. Video is
 decoded on the GPU, network writes aren't held back, and everything an RDP frame draws goes to
@@ -174,7 +174,16 @@ cargo run --release --example test_server -- --port 3390
 
 ## Downloads
 
-Packages for x86_64 Linux are on the [Releases page](https://github.com/jajardinero/relay-rdp/releases/latest).
+Packages are on the [Releases page](https://github.com/jajardinero/relay-rdp/releases/latest).
+Version 0.2.0, with the GPUI interface, is packaged for Arch Linux so far:
+
+| Distribution | Download | Install |
+| --- | --- | --- |
+| Arch Linux (x86_64) | [relay-0.2.0-1-x86_64.pkg.tar.zst](https://github.com/jajardinero/relay-rdp/releases/download/v0.2.0/relay-0.2.0-1-x86_64.pkg.tar.zst) | `sudo pacman -U relay-0.2.0-1-x86_64.pkg.tar.zst` |
+| Arch Linux ARM (aarch64) | [relay-0.2.0-1-aarch64.pkg.tar.zst](https://github.com/jajardinero/relay-rdp/releases/download/v0.2.0/relay-0.2.0-1-aarch64.pkg.tar.zst) | `sudo pacman -U relay-0.2.0-1-aarch64.pkg.tar.zst` |
+
+For other distributions, use [0.1.2](https://github.com/jajardinero/relay-rdp/releases/tag/v0.1.2),
+the last release with the egui interface (x86_64 only):
 
 | Distribution | Download | Install |
 | --- | --- | --- |
@@ -182,7 +191,6 @@ Packages for x86_64 Linux are on the [Releases page](https://github.com/jajardin
 | Debian 13 | [relay_0.1.2-1_debian13_amd64.deb](https://github.com/jajardinero/relay-rdp/releases/download/v0.1.2/relay_0.1.2-1_debian13_amd64.deb) | `sudo apt install ./relay_0.1.2-1_debian13_amd64.deb` |
 | Ubuntu 24.04 | [relay_0.1.2-1_ubuntu24.04_amd64.deb](https://github.com/jajardinero/relay-rdp/releases/download/v0.1.2/relay_0.1.2-1_ubuntu24.04_amd64.deb) | `sudo apt install ./relay_0.1.2-1_ubuntu24.04_amd64.deb` |
 | Fedora 44 | [relay-0.1.2-1.fc44.x86_64.rpm](https://github.com/jajardinero/relay-rdp/releases/download/v0.1.2/relay-0.1.2-1.fc44.x86_64.rpm) | `sudo dnf install ./relay-0.1.2-1.fc44.x86_64.rpm` |
-| Arch Linux | [relay-0.1.2-1-x86_64.pkg.tar.zst](https://github.com/jajardinero/relay-rdp/releases/download/v0.1.2/relay-0.1.2-1-x86_64.pkg.tar.zst) | `sudo pacman -U relay-0.1.2-1-x86_64.pkg.tar.zst` |
 
 Check your download against the release's `SHA256SUMS`:
 
@@ -257,10 +265,12 @@ lines, and diagnosing servers that don't send H.264, see [docs/GRAPHICS.md](docs
 
 ## Current limitations
 
-Relay is young (0.1.x). Known gaps:
+Relay is young (0.2.x). Known gaps:
 
 - **Wayland only.** X11 sessions and XWayland aren't supported.
-- **x86_64 only.** No ARM builds yet.
+- **ARM builds are Arch Linux ARM only, and untested on hardware.** The aarch64 package is
+  built and its tests run under QEMU emulation; it hasn't been run on an ARM machine with a GPU.
+  Other distributions get x86_64 packages only.
 - **Every displayed frame is copied through system memory.** The interface draws on its own GPU
   device, so in a session drawn on the GPU (including H.264 through VA-API) each new picture is
   read back in full, converted on the CPU and uploaded again. Sessions drawn on the CPU upload the
