@@ -54,6 +54,7 @@ pub fn run(launch: Option<LaunchRequest>) -> anyhow::Result<()> {
         .run(move |cx| {
             gpui_kit::init(cx);
             crate::ui::theme::install_fonts(cx);
+            crate::ui::ssh::init(cx);
 
             let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
             let options = WindowOptions {

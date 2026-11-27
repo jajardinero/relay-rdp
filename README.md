@@ -171,6 +171,13 @@ cargo run --release --example test_server -- --port 3390
 - **TLS**: rustls first, then an OpenSSL retry for servers that need older cipher suites; an
   optional per-host legacy mode for Windows 7 and Server 2008 R2.
 - Tested with hosts from Windows Server 2008 to current Windows 10 and 11 family releases.
+- **SSH**: the rail's SSH section holds an SSH client, [RusSSH](https://github.com/jajardinero/rustSHH),
+  with its own hosts and groups, a keychain (generate or import keys), known hosts and terminal
+  settings. SSH sessions open in tabs next to RDP sessions, in a GPU-drawn terminal.
+  Ctrl+Shift+B opens the Appearance & session panel, Ctrl+= and Ctrl+- change the font size, and
+  Ctrl+Shift+W closes the session. SSH hosts and keys are stored under `~/.config/relay/ssh` and
+  `~/.local/share/relay/ssh`, and passwords in the system keyring under `relay-ssh`, separately
+  from the standalone RusSSH app.
 
 ## Downloads
 
@@ -301,7 +308,7 @@ FFmpeg (`libavcodec`, `libavutil`), VA-API (`libva`, `libva-drm`), Wayland, xkbc
 though Relay runs on Wayland.
 
 ```sh
-git clone https://github.com/jajardinero/relay-rdp.git
+git clone --recurse-submodules https://github.com/jajardinero/relay-rdp.git
 cd relay-rdp
 cargo build --release
 ./target/release/relay
@@ -313,6 +320,7 @@ dependency lists, and the test suite are described in [docs/BUILDING.md](docs/BU
 ## Built with
 
 - [IronRDP](https://github.com/Devolutions/IronRDP): the RDP protocol stack, in Rust
+- [RusSSH](https://github.com/jajardinero/rustSHH) (in `crates/russsh`), on [russh](https://github.com/Eugeny/russh) and [alacritty_terminal](https://github.com/alacritty/alacritty): the SSH section
 - [GPUI Kit](https://gpui-kit.com), on the Zed editor's [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui): interface and windowing
 - [wgpu](https://wgpu.rs) and Vulkan: GPU drawing of the remote desktop
 - [FFmpeg](https://ffmpeg.org) with VA-API, and [OpenH264](https://www.openh264.org): H.264 decoding

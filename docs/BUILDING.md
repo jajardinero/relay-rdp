@@ -12,7 +12,11 @@ and `libavutil`), VA-API (`libva` and `libva-drm`), Wayland, xkbcommon (includin
 The native decoder bridge compiles against the installed FFmpeg headers; it does
 not depend on handwritten Rust layouts for FFmpeg's versioned structures.
 
+The SSH section is the RusSSH crate, a git submodule in `crates/russsh`. Clone with
+`--recurse-submodules`, or fetch it in an existing checkout:
+
 ```sh
+git submodule update --init
 pkg-config --modversion libavcodec libavutil libva libva-drm
 cargo build --release
 ```

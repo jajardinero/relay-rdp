@@ -17,7 +17,7 @@ pub const APP_ID: &str = "relay";
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "A fast, reliable remote desktop client",
+    about = "A fast, reliable remote desktop (RDP) and SSH client",
     after_help = "Set RELAY_PASSWORD to sign in without being asked (for scripts)."
 )]
 struct Cli {
@@ -60,6 +60,11 @@ fn main() -> anyhow::Result<()> {
     // longer pick automatically and would panic on the first connection.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // The SSH vault lives under Relay's directories, apart from the standalone RusSSH app's.
+    if let Some(dirs) = store::paths::ssh_dirs() {
+        russsh::store::paths::init(dirs);
+    }
+
     let launch = cli.target.map(|target| ui::LaunchRequest {
         target,
         user: cli.user,
@@ -71,7 +76,9 @@ fn main() -> anyhow::Result<()> {
 /// Logs go to stderr and to a daily-rotated file under the XDG state directory.
 fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,relay=debug,wgpu_core=warn,wgpu_hal=warn,naga=warn")
+        EnvFilter::new(
+            "info,relay=debug,russsh=debug,russh=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn",
+        )
     });
 
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);

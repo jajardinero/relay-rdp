@@ -64,7 +64,7 @@ features = ["std"]
 version = "0.8"
 
 [dependencies.picky]
-version = "=7.0.0-rc.25"
+version = "=7.0.0-rc.26"
 
 [dependencies.picky-asn1-der]
 version = "0.5"

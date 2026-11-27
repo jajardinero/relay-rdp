@@ -29,6 +29,8 @@ pub enum Filter {
     All,
     Favorites,
     Group(String),
+    /// A page of the SSH section, drawn by the embedded RusSSH vault.
+    Ssh(russsh::ui::Page),
 }
 
 #[derive(Clone)]
@@ -158,6 +160,7 @@ impl HomeState {
                 Filter::All => true,
                 Filter::Favorites => h.favorite,
                 Filter::Group(g) => h.group.trim() == g,
+                Filter::Ssh(_) => true,
             })
             .filter(|h| query.is_empty() || matches_query(h, &query))
             .collect();
@@ -215,7 +218,19 @@ pub fn render_home(
     let view = this.settings.settings.host_view;
 
     let rail = render_rail(this, p, cx);
-    let main = render_main_column(this, &display_hosts, &sections, endpoint, view, p, window, cx);
+    let main = match this.home.filter {
+        Filter::Ssh(_) => super::ssh::render_page(this, window, cx),
+        _ => render_main_column(
+            this,
+            &display_hosts,
+            &sections,
+            endpoint,
+            view,
+            p,
+            window,
+            cx,
+        ),
+    };
 
     let editor = this.editor.as_ref().map(|ed| {
         super::editor::render_editor(ed, &this.profiles, &this.credentials, p, cx)
@@ -267,7 +282,7 @@ fn render_rail(this: &RelayApp, p: &Palette, cx: &mut Context<RelayApp>) -> AnyE
             Filter::All,
             icons::LIST,
             "All hosts",
-            hosts.len(),
+            Some(hosts.len()),
             p,
             cx,
         ))
@@ -277,7 +292,7 @@ fn render_rail(this: &RelayApp, p: &Palette, cx: &mut Context<RelayApp>) -> AnyE
             Filter::Favorites,
             icons::STAR,
             "Favorites",
-            favorites,
+            Some(favorites),
             p,
             cx,
         ));
@@ -299,12 +314,33 @@ fn render_rail(this: &RelayApp, p: &Palette, cx: &mut Context<RelayApp>) -> AnyE
                     Filter::Group(group.clone()),
                     icons::FOLDER,
                     &group,
-                    count,
+                    Some(count),
                     p,
                     cx,
                 )
             }));
     }
+
+    top = top
+        .child(
+            div()
+                .mt(px(14.0))
+                .mb(px(4.0))
+                .pl(px(10.0))
+                .child(widgets::section_label("SSH", p)),
+        )
+        .children(russsh::ui::Page::ALL.into_iter().map(|(page, label, _)| {
+            nav_item(
+                SharedString::from(format!("nav-ssh-{label}")),
+                &this.home.filter,
+                Filter::Ssh(page),
+                super::ssh::page_icon(page),
+                label,
+                None,
+                p,
+                cx,
+            )
+        }));
 
     let bottom = div()
         .flex()
@@ -392,7 +428,7 @@ fn nav_item(
     filter: Filter,
     icon_path: &'static str,
     label: &str,
-    count: usize,
+    count: Option<usize>,
     p: &Palette,
     cx: &mut Context<RelayApp>,
 ) -> AnyElement {
@@ -419,10 +455,13 @@ fn nav_item(
         .bg(fill)
         .cursor_pointer()
         .when(!selected, |el| el.hover(move |s| s.bg(hover)))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.home.filter = filter.clone();
-            this.home.selected = None;
-            cx.notify();
+        .on_click(cx.listener(move |this, _, window, cx| match &filter {
+            Filter::Ssh(page) => this.show_ssh_page(*page, window, cx),
+            _ => {
+                this.home.filter = filter.clone();
+                this.home.selected = None;
+                cx.notify();
+            }
         }))
         .child(icon_svg(icon_path, px(16.0), fg))
         .child(
@@ -435,12 +474,14 @@ fn nav_item(
                 .text_color(text_color)
                 .child(label.to_owned()),
         )
-        .child(
-            div()
-                .text_size(size::SMALL)
-                .text_color(p.muted)
-                .child(count.to_string()),
-        )
+        .when_some(count, |el, count| {
+            el.child(
+                div()
+                    .text_size(size::SMALL)
+                    .text_color(p.muted)
+                    .child(count.to_string()),
+            )
+        })
         .into_any_element()
 }
 
@@ -492,6 +533,7 @@ fn render_main_column(
         Filter::All => "All hosts".to_owned(),
         Filter::Favorites => "Favorites".to_owned(),
         Filter::Group(g) => g.clone(),
+        Filter::Ssh(_) => "SSH".to_owned(),
     };
 
     let header = div()

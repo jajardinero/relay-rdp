@@ -7,6 +7,7 @@ pub mod editor;
 pub mod home;
 pub mod previews;
 pub mod session_view;
+pub mod ssh;
 pub mod tab;
 pub mod theme;
 pub mod toasts;
@@ -17,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{
-    App, Context, FocusHandle, Focusable as _, FontWeight, Hsla, InteractiveElement, IntoElement,
-    KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, ParentElement,
+    App, Context, Entity, FocusHandle, Focusable as _, FontWeight, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, ParentElement,
     Pixels, Point, Render, ScrollEvent, StatefulInteractiveElement, Styled, Subscription, Window,
     div, prelude::FluentBuilder as _, px, transparent_black,
 };
@@ -61,6 +62,8 @@ pub enum Hotkey {
 pub enum ActiveTab {
     Home,
     Session(TabId),
+    /// An SSH session, shown by the embedded RusSSH vault ([`ssh`]).
+    Ssh(russsh::ui::TabId),
 }
 
 /// A connection requested on the command line.
@@ -105,6 +108,8 @@ pub struct RelayApp {
 
     pub(crate) tabs: Vec<SessionTab>,
     pub(crate) active: ActiveTab,
+    /// The SSH vault and its sessions.
+    pub(crate) ssh: Entity<russsh::ui::RusSsh>,
     pub(crate) home: home::HomeState,
     pub(crate) editor: Option<editor::EditorState>,
     pub(crate) dialog: Option<Dialog>,
@@ -197,7 +202,8 @@ impl RelayApp {
         })
         .detach();
 
-        let mut window_subs = Vec::new();
+        let (ssh, ssh_subs) = ssh::new_vault(window, cx);
+        let mut window_subs = Vec::from(ssh_subs);
         window_subs.push(cx.observe_window_activation(window, |this, window, cx| {
             let active = window.is_window_active();
             if !active {
@@ -227,6 +233,7 @@ impl RelayApp {
             textures: RemoteTextures::default(),
             tabs: Vec::new(),
             active: ActiveTab::Home,
+            ssh,
             home,
             editor: None,
             dialog: None,
@@ -319,8 +326,8 @@ impl RelayApp {
 
     fn active_tab_mut(&mut self) -> Option<&mut SessionTab> {
         match self.active {
-            ActiveTab::Home => None,
             ActiveTab::Session(id) => self.tab_mut(id),
+            ActiveTab::Home | ActiveTab::Ssh(_) => None,
         }
     }
 
@@ -702,11 +709,16 @@ impl RelayApp {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // An SSH session's terminal takes its keys through its own handlers.
+        if matches!(self.active, ActiveTab::Ssh(_)) {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let mods = event.keystroke.modifiers;
 
-        // Global Ctrl+K focuses search on Home.
+        // Global Ctrl+K focuses search on Home (the RDP host library; SSH pages have their own).
         if self.active == ActiveTab::Home
+            && !matches!(self.home.filter, home::Filter::Ssh(_))
             && self.dialog.is_none()
             && (mods.control || mods.platform)
             && !mods.alt
@@ -781,6 +793,9 @@ impl RelayApp {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.active, ActiveTab::Ssh(_)) {
+            return;
+        }
         let Some(session) = self.keyboard_session(window, cx) else {
             return;
         };
@@ -797,7 +812,7 @@ impl RelayApp {
             ActiveTab::Session(id) => self
                 .tab(id)
                 .is_some_and(|t| t.is_live() && t.cert_prompt.is_none()),
-            ActiveTab::Home => false,
+            ActiveTab::Home | ActiveTab::Ssh(_) => false,
         }
     }
 
@@ -1690,6 +1705,9 @@ impl RelayApp {
             .bg(p.canvas)
             .child(home_chip)
             .children(session_chips)
+            .children(ssh::render_chips(self, p, cx))
+            .child(div().flex_1())
+            .children(ssh::render_panel_toggle(self, p, cx))
     }
 }
 
@@ -1699,6 +1717,7 @@ impl Render for RelayApp {
         self.textures.flush_dropped(window);
         self.apply_theme(window, cx);
         self.sync_session_focus();
+        self.sync_ssh_active(window, cx);
 
         let p = self.palette(window);
 
@@ -1707,6 +1726,10 @@ impl Render for RelayApp {
             ActiveTab::Session(id) => self.tab(id).map_or_else(
                 || APP_NAME.to_owned(),
                 |t| format!("{} — {APP_NAME}", t.title()),
+            ),
+            ActiveTab::Ssh(id) => self.ssh_title(id, cx).map_or_else(
+                || APP_NAME.to_owned(),
+                |title| format!("{title} — {APP_NAME}"),
             ),
             ActiveTab::Home => APP_NAME.to_owned(),
         };
@@ -1733,6 +1756,8 @@ impl Render for RelayApp {
         let main_view = match self.active {
             ActiveTab::Home => home::render_home(self, &p, window, cx),
             ActiveTab::Session(id) => session_view::render_session(self, id, &p, window, cx),
+            ActiveTab::Ssh(_) => ssh::render_session(self, window, cx)
+                .unwrap_or_else(|| home::render_home(self, &p, window, cx)),
         };
 
         let dialog_layer = dialogs::render_dialog(self, &p, cx);

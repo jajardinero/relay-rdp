@@ -66,15 +66,20 @@ relay_check_toolchain() {
 }
 
 relay_source_archive() {
+  if [[ ! -f $_relay_root/crates/russsh/Cargo.toml ]]; then
+    printf 'crates/russsh is empty. Run: git submodule update --init\n' >&2
+    exit 1
+  fi
   mkdir -p -- "$_relay_output" "$_relay_work"
   _relay_archive="relay-$_relay_version.tar.gz"
   # Allowlist project sources; never include local config, Git metadata or build caches.
   tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
     --exclude=.git --exclude=.agents --exclude=.codex --exclude=.aws --exclude=target --exclude=__pycache__ \
+    --exclude=crates/russsh/dist \
     --transform="s|^|relay-$_relay_version/|" \
     -C "$_relay_root" -cf - \
     Cargo.toml Cargo.lock build.rs rust-toolchain.toml \
-    src assets examples vendor README.md LICENSE-MIT LICENSE-APACHE packaging scripts \
+    src assets examples crates vendor README.md LICENSE-MIT LICENSE-APACHE packaging scripts \
     | gzip -n > "$_relay_output/$_relay_archive"
 }
 
@@ -86,7 +91,7 @@ relay_cargo_sources_key() {
     # The caller sets _relay_source to its extracted build tree.
     # shellcheck disable=SC2154
     (cd -- "$_relay_source" && {
-      find src assets vendor -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
+      find src assets crates vendor -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
       sha256sum Cargo.toml Cargo.lock build.rs rust-toolchain.toml
     }) | sha256sum | awk '{print $1}'
   )
