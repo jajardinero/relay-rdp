@@ -3,7 +3,7 @@ name = "relay"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
-description = "A fast, reliable remote desktop (RDP) client for Linux"
+description = "A fast, reliable remote desktop (RDP) and SSH client for Linux"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -76,6 +76,9 @@ ironrdp-rdpfile = "0.1"
 ironrdp-propertyset = "0.1"
 rfd = "0.17"
 
+# SSH: RusSSH's vault, sessions and terminal (a git submodule, also built as its own app).
+russsh = { path = "crates/russsh" }
+
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
@@ -94,6 +97,10 @@ codegen-units = 1
 
 [dev-dependencies]
 async-trait = "0.1"
+gpui-pre = { version = "=0.3.12", features = ["test-support"] }
+russh = "0.65"
+russsh = { path = "crates/russsh", features = ["test-support"] }
+tempfile = "3"
 ironrdp-server = { version = "0.13", features = ["helper", "egfx"] }
 rcgen = "0.14.10"
 tokio = { version = "1", features = ["full"] }
@@ -102,6 +109,8 @@ tokio = { version = "1", features = ["full"] }
 # pipeline / H.264) and `connection_type` (the Quality preset) connector options, and the
 # message channel block sent only to servers that accept extended client data (Windows Server
 # 2008 resets the connection otherwise). Drop once an ironrdp-connector release includes them.
+# Also asks for picky =7.0.0-rc.26 (not rc.25), like the vendored sspi, so russh can share
+# the final RustCrypto curve crates.
 [patch.crates-io]
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 
@@ -119,3 +128,7 @@ sspi = { path = "vendor/sspi" }
 
 # Audio playback that never blocks the audio thread, with a jitter buffer (see RELAY-PATCH.md).
 ironrdp-rdpsnd-native = { path = "vendor/ironrdp-rdpsnd-native" }
+
+# SSH: russh 0.65.4 (with its security fixes) on the rsa/pkcs1/ssh-key release candidates that
+# picky and sspi pin (see RELAY-PATCH.md).
+russh = { path = "vendor/russh" }

@@ -66,6 +66,10 @@ pub mod icons {
     pub const CARET_DOWN: &str = "icons/chevron-down.svg";
     pub const RADIO_ON: &str = "icons/circle-dot.svg";
     pub const RADIO_OFF: &str = "icons/circle.svg";
+    pub const SERVER: &str = "icons/server.svg";
+    pub const KEY_ROUND: &str = "icons/key-round.svg";
+    pub const TERMINAL: &str = "icons/square-terminal.svg";
+    pub const PANEL_RIGHT: &str = "icons/panel-right.svg";
 }
 
 /// Renders an SVG icon at `size` in `color`.

@@ -37,6 +37,16 @@ pub fn previews_dir() -> Option<PathBuf> {
     data_dir().map(|d| d.join("previews"))
 }
 
+/// `~/.config/relay/ssh` and `~/.local/share/relay/ssh`: the SSH vault (hosts, keys, known
+/// hosts and terminal settings), kept apart from the standalone RusSSH app's.
+pub fn ssh_dirs() -> Option<russsh::store::paths::Dirs> {
+    Some(russsh::store::paths::Dirs {
+        config: config_dir()?.join("ssh"),
+        data: data_dir()?.join("ssh"),
+        logs: log_dir()?,
+    })
+}
+
 /// `~/.local/state/relay/logs`
 pub fn log_dir() -> Option<PathBuf> {
     if let Some(home) = override_dir() {
